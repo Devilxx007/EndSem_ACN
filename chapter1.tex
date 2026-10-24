@@ -1,0 +1,263 @@
+\section{Why RCP? The problem with iBGP (PDF pp. 1--2)}
+\subsection{Limitations of existing iBGP architectures}
+\begin{itemize}
+\item Routers in an Autonomous System (AS) must distribute information about reaching external destinations.
+\item The Internet's interdomain routing protocol is \key{BGP}; it is prone to protocol oscillation and forwarding loops, is sensitive to internal AS topology changes, and can be difficult for operators to manage.
+\item A \key{full-mesh iBGP} configuration has an iBGP session between every pair of routers. Each router must maintain sessions to all others, send BGP updates to every other router, store local copies of advertisements from each neighbour for each prefix, and have sessions reconfigured whenever a router is added. This does not scale.
+\item Simply upgrading processors and memory is costly; the installed router base lags behind the technology curve. Routers may not degrade gracefully at resource limits: crashes or persistent routing instability can result.
+\item \key{Route reflection} scales better by arranging iBGP hierarchically. A route reflector selects one BGP route per destination prefix and advertises it to clients. Adding a router requires sessions to its route reflector(s), reducing memory and connection overhead.
+\item The drawback is correctness: a route reflector does \emph{not necessarily} select the route its clients would have selected in a full mesh. Routers along one AS path can therefore receive different routes from different reflectors, causing inconsistencies, protocol oscillation, and persistent forwarding loops. Avoiding this may require a large number of reflectors and a consistent view of the internal topology.
+\end{itemize}
+\marginnote{A route reflector can have more than one client/router; the annotation emphasizes that reflectors can introduce inconsistent route choices. The highlighted resource-limit point is that router limitations can cause serious problems, not merely slower operation.}
+
+\subsection{RCP's central idea}
+\begin{itemize}
+\item A \key{Routing Control Platform (RCP)} collects external-destination routes and internal topology, then selects the BGP route for each router in an AS.
+\item RCP is \key{logically centralized} but separate from the IP forwarding plane. It performs route selection on behalf of routers and communicates selected routes using the \emph{unmodified iBGP protocol}; legacy routers need no implementation changes.
+\item RCP aims to combine the \key{correctness of full-mesh iBGP} with the \key{scalability of route reflectors}.
+\item It has iBGP sessions with each router, learns BGP routes, and sends a routing decision for each destination prefix. Unlike a route reflector, it can send a \emph{different route to each router}; each router can receive the route it would have selected in a full-mesh configuration. The number of iBGP sessions at each router is independent of network size.
+\item RCP may eventually exchange interdomain routing information with neighbouring domains while continuing to use iBGP internally.
+\end{itemize}
+\marginnote{Two design goals: (1) consistent route assignment even when RCP functionality is replicated/distributed for reliability; (2) fast response to link failures and external BGP changes, even with many routers and prefixes. A margin question asks why replicated RCPs should agree: the consistency argument is developed in Section 3.2.}
+
+\section{Routing inside an AS and BGP selection (PDF p. 3)}
+\subsection{Three protocols and their jobs}
+\begin{itemize}
+\item \key{eBGP}: exchanges reachability information with neighbouring ASes.
+\item \key{iBGP}: propagates BGP information inside the AS.
+\item \key{IGP} (e.g., OSPF or IS-IS): learns how to reach other routers within the AS. IGPs are typically link-state protocols with a configurable weight on each link.
+\item BGP is a \key{path-vector protocol}: each network adds its AS number to the path before propagating an announcement to the next domain.
+\item Each router combines routing-protocol information into a local forwarding table mapping each destination prefix to the next link in the path. In RCP, RCP assigns one best BGP route per prefix per router and distributes it with iBGP; the routers still merge BGP and IGP information to construct forwarding tables.
+\end{itemize}
+\marginnote{The handwritten cue asks which information builds the forwarding table: it is the combined BGP and IGP information, not BGP alone. Some BGP decision steps depend on route attributes.}
+
+\subsection{BGP decision process -- order matters}
+\begin{enumerate}
+\item Ignore the route if its egress router is unreachable.
+\item Highest local preference.
+\item Lowest AS-path length.
+\item Lowest origin type.
+\item Lowest MED, when comparing routes with the same next-hop AS.
+\item Prefer eBGP-learned over iBGP-learned.
+\item Lowest IGP path cost to the egress router (hot-potato / closest-egress choice).
+\item Lowest router ID of the BGP speaker.
+\end{enumerate}
+The decision process compares route attributes. In the simplest case, the shortest AS path wins, with router ID breaking a tie; other steps depend on attributes such as local preference, which comes from routing policy, and MED.
+\marginnote{Local preference comes from policy. The margin notes distinguish BGP-message attributes from IGP information: the route attributes are carried in BGP messages, while the IGP cost is used at step 6. Do not treat hot-potato routing as replacing the whole decision process; it is the IGP-cost tie-break stage.}
+
+\subsection{Hot-potato routing}
+\begin{itemize}
+\item Multiple routes may be equally good through the earlier BGP decision steps. The router then selects the \key{closest egress router by IGP path cost}; this is called \key{early-exit/hot-potato routing}.
+\item RCP needs a real-time view of IGP topology to select the closest egress router for every destination prefix on behalf of every router.
+\item One IGP topology change can alter BGP choices at many routers for many prefixes. For example, if link weight \(V\!-\!X\) increases from 1 to 3 in the paper's example, router \(Z\) may send traffic through egress \(Y\) rather than \(X\).
+\item These changes can cause large, unpredictable traffic shifts and long convergence delays because routers revisit BGP decisions across many prefixes. Delays of one to two minutes are reported as not uncommon.
+\item RCP must determine the influence of an IGP change on every router and every prefix. The paper views RCP as a route toward more flexible egress selection beyond hot-potato routing.
+\end{itemize}
+\marginnote{Handwritten cue: consider alternatives to relying so tightly on hot-potato routing; a small IGP change can produce a large traffic shift.}
+
+\section{RCP architecture and modules (PDF pp. 3--5)}
+\subsection{The three modules}
+\begin{enumerate}
+\item \key{IGP Viewer}: establishes IGP adjacencies and receives IGP topology information.
+\item \key{BGP Engine}: maintains iBGP sessions with routers, learns candidate BGP routes, and sends the RCS's selected route assignments to routers.
+\item \key{Route Control Server (RCS)}: combines IGP topology/path costs and BGP routes to compute the best BGP route for each router (or router group).
+\end{enumerate}
+\marginnote{Protocol distinction: IGP Viewer--router communication uses IGP adjacencies; BGP Engine--router communication uses iBGP sessions. The diagram also illustrates that RCP can control/obtain routing information from separate network partitions \(P_1,P_2\).}
+
+\subsection{IGP connectivity graph and partitions}
+Let the AS IGP graph be \(G=(R,E)\), where \(R\) is the set of routers and \(E\) is the set of IGP links.
+\begin{itemize}
+\item The IGP topology is typically connected, but link/router/interface failures may split it into connected components (partitions), \(G=\{P_1,P_2,\ldots,P_n\}\).
+\item \key{The RCS computes routes only for a partition for which it has complete IGP and BGP information}; it computes each partition independently.
+\item A BGP Engine need not be physically adjacent to every router. Since iBGP runs over TCP, it can establish and maintain sessions with any router reachable through the IGP topology.
+\end{itemize}
+\marginnote{The notes repeatedly stress: RCS works partition-wise; the system's guarantees are scoped to a partition for which the relevant information is complete.}
+
+\subsection{IGP Viewer}
+\begin{itemize}
+\item Monitors IGP topology and provides it to the RCS. It establishes IGP adjacencies to receive link-state advertisements (LSAs).
+\item To ensure the IGP Viewer never routes data packets, configure its links to routers with \key{large IGP weights}, so it is not an intermediate hop on any shortest path.
+\item OSPF and IS-IS reliably flood LSAs. Therefore, an IGP Viewer can receive LSAs from every router in a partition by having an adjacency to just one router in that partition.
+\item \key{Observation 1:} the IGP Viewer has the complete IGP topology for every partition to which it connects.
+\item It computes pairwise shortest paths for all routers and supplies path costs to the RCS. It need not supply every individual IGP edge weight: the RCS needs pairwise path costs to determine the closest egress for each router.
+\item The IGP Viewer can group routers that will select the same egress. Groups may follow IGP topology (e.g., OSPF areas) or be configured by the operator. Grouping reduces the number of independent route computations required by the RCS.
+\end{itemize}
+\marginnote{Flooding means a single-router adjacency per partition can be sufficient to receive LSAs. Grouping is an efficiency optimization: it reduces RCS route computations.}
+
+\subsection{BGP Engine and next hop}
+\begin{itemize}
+\item Maintains an iBGP session with every router in the AS. Sessions let RCP learn candidate routes and communicate routing decisions.
+\item IGP connectivity between two endpoints is assumed sufficient to establish a BGP session (persistent congestion or misconfiguration can violate this, but these cases are treated as anomalous). Routers may prioritize BGP packets to help deliver them during congestion.
+\item BGP updates contain a \key{next-hop} attribute. The BGP Engine can advertise routes whose next hop is another router in the network, so the BGP Engine itself need not forward data packets.
+\item The RCS can send a route with the next-hop attribute unchanged; routers then forward packets toward the egress router.
+\item A router sends BGP updates to the BGP Engine when it selects a new best route learned from a neighbouring AS. The BGP Engine sends an update only when a router's decision should change.
+\end{itemize}
+\marginnote{BGP runs over TCP. The handwritten note emphasizes that the BGP Engine does not need to forward user/data traffic; its role is control-plane communication and route dissemination.}
+
+\subsection{Route Control Server (RCS)}
+\begin{itemize}
+\item Receives IGP topology/path-cost information from the IGP Viewer and BGP routes from the BGP Engine; computes route assignments for router groups and returns them through the BGP Engine.
+\item It does not return a route if a router has already selected a route that is better than all candidate routes under the BGP decision process.
+\item \key{Observation 3:} an RCS can make routing decisions only for routers in a partition for which it has both IGP and BGP routing information.
+\item A reasonable strategy is to emulate full-mesh iBGP: execute the BGP decision process on behalf of each router. The RCS can do so because it knows (i) reachable egress routers from IGP topology, (ii) route attributes from BGP messages, (iii) whether a route is eBGP- or iBGP-learned for a particular router, (iv) IGP path costs, and (v) router IDs.
+\end{itemize}
+\marginnote{The red note asks how RCP can emulate full-mesh behaviour: it runs the ordinary BGP decision process per router using complete IGP/BGP inputs, instead of requiring each router to exchange routes with every other router.}
+
+\section{Correctness: route validity and path visibility (PDF pp. 5--7)}
+\subsection{Two route-validity invariants}
+The RCS must not assign routes that cause forwarding loops, blackholes, or other anomalies that prevent packets reaching their destinations. Two invariants are required:
+\begin{enumerate}
+\item \key{Same-egress invariant:} every router along the shortest IGP path from a router to its assigned egress must be assigned a route using that same egress.
+\item \key{Next-hop/partition invariant:} the IGP path to a route's next hop must traverse only routers in the same partition as that next hop.
+\end{enumerate}
+Why these hold when RCS emulates full-mesh iBGP:
+\begin{itemize}
+\item In a full mesh, each router selects the egress with the shortest IGP path. Routers along the shortest path to that egress also select that same closest egress; thus the first invariant holds.
+\item The RCS never assigns an egress router in another partition, so the second invariant holds.
+\end{itemize}
+\marginnote{Memory cue from the annotated figure: (1) ``Don't change the egress while walking toward the egress''; (2) ``Don't leave the partition while walking toward the BGP next hop.'' These are the two invariants in simple language.}
+
+\subsection{Path visibility and replication}
+\begin{itemize}
+\item \key{Path visibility:} every router should be able to exchange routes with at least one RCS and should receive some route to an external destination if one exists.
+\item Each partition must contain at least one IGP Viewer, one BGP Engine, and one RCS. Replication reduces the likelihood that a partition cannot reach any instance of one of these components.
+\item If RCS replicas assign routes to routers along the same IGP path, they must make consistent decisions to avoid loops. Route computation must be deterministic: the same IGP topology and BGP route inputs must always produce the same outcome.
+\item If a router is partitioned from RCP, the situation is no worse than being unable to receive routes from a route reflector; it may still route using eBGP-learned routes.
+\end{itemize}
+
+\subsection{Distributed RCP: transient versus persistent inconsistency}
+\begin{itemize}
+\item RCP modules should be replicated to tolerate network partitions and avoid a single point of failure. Replication can cause replicas to temporarily have different views of IGP topology or BGP routes.
+\item Such inconsistencies can be \key{transient} or \key{persistent}; if routers learn from different replicas, inconsistent assignments could cause routing loops.
+\item Replicas can receive BGP and IGP updates at different times, so they may temporarily make different decisions for the same routers. This is a transient convergence period.
+\item For an individual prefix, long transient periods are not the common case: BGP update traffic is fairly continuous overall, but updates for one destination as seen by one AS are bursty, with prolonged silence. Updates may arrive over seconds or minutes; over hours, external-destination routes are relatively stable.
+\item The analysis therefore focuses on consistency \emph{after the transient period has ended}. Any intra-AS routing protocol, including iBGP, can temporarily have inconsistent path assignments while BGP and IGP routes are changing continuously; comparing the transient behaviour of RCP and typical iBGP is left for future work.
+\end{itemize}
+\marginnote{Transient inconsistency during eBGP/IGP events is possible; the key claim is about persistent inconsistency in steady state, not that all replicas are identical at every instant.}
+
+\subsection{Proposition 1: no consistency protocol is required for steady-state correctness}
+\textbf{Proposition 1.} If multiple RCSes assign paths to routers in partition \(P_i\), each router in \(P_i\) receives the same route assignment from every RCS.
+
+\textbf{Proof sketch (simple proof highlighted in the margin):}
+\begin{enumerate}
+\item Two RCSes could differ only if they receive different inputs (different BGP routes or different IGP views).
+\item If both assign routes to a router in \(P_i\), Observation 1 implies both have IGP topology for all of \(P_i\).
+\item Observation 2 implies both have complete BGP routing information for that partition; Observation 3 says they can make assignments for all routers in it.
+\item Hence both replicas have the same complete IGP and BGP inputs. Deterministic route computation gives the same assignment to every router in \(P_i\).
+\end{enumerate}
+Therefore, a separate consistency protocol is unnecessary to prevent \emph{persistent} inconsistencies in steady state.
+\marginnote{The red annotations emphasize the simple proof: if two replicas make assignments in the same partition, they must have the same complete inputs, so they produce the same result. ``Protocol is not necessary'' refers to a separate consistency protocol.}
+
+\subsection{Important failure caveat: liveness versus correctness}
+A failure can violate Observation 2: IGP connectivity may exist between a BGP Engine and a router, while the iBGP session fails due to congestion, misconfiguration, or software failure. Two RCSes might then have BGP information from different subsets of routers. By design, neither assigns routes in that partition, even if together they collectively have all the information.
+\begin{itemize}
+\item This affects \key{liveness}: replicas may fail to assign routes even when they collectively have complete information.
+\item It does \emph{not} affect \key{correctness}: replicas never assign different routes to the same router.
+\end{itemize}
+\marginnote{Do not confuse the two: failure to assign a route is a liveness/availability problem; assigning conflicting routes is a correctness problem.}
+
+\section{RCS implementation and optimizations (PDF pp. 7--8)}
+\subsection{Data structures}
+\begin{itemize}
+\item Incoming BGP updates are stored in a global \key{RIB-In} (Routing Information Base). The RCS performs per-router route selection and stores selected routes in a \key{per-router RIB-Out}.
+\item RIB-In and RIB-Out are prefix-indexed tries. RIB-In keeps the list of routes learned for each prefix. Each BGP route's next-hop attribute uniquely identifies the egress router where it was learned.
+\item The RCS receives IGP path costs for router pairs and uses them in BGP decision steps 0 and 6. After computing an assignment, the RCS sends it to the BGP Engine, which sends the update to the router.
+\item IGP path-cost changes may require recomputation if step 6 selected the route and the cost to that selected egress changes. Efficiently identifying affected routes is important.
+\end{itemize}
+
+\subsection{Optimization 1: store one copy of each BGP route}
+\begin{itemize}
+\item Storing a separate copy of every route for every router and prefix would consume enormous memory.
+\item RCS stores each unique route only once in RIB-In. It implements per-router RIB-Outs as \key{shadow tables} containing pointers into RIB-In.
+\item On an update, RCS indexes RIB-In by prefix and adds, updates, or removes the relevant route using the next-hop attribute.
+\end{itemize}
+\marginnote{The annotated diagram is about pointer-based sharing: many per-router RIB-Out entries can point to one global RIB-In route, saving memory.}
+
+\subsection{Optimization 2: track routers using each route}
+\begin{itemize}
+\item Each route in RIB-In has back-pointers to the routers assigned that route.
+\item When a route is withdrawn, RCS identifies the affected routers through these pointers and reruns the decision process for each affected router/prefix using the remaining routes in RIB-In.
+\item This optimization works for withdrawals. It cannot be used in the same way for a new BGP announcement: when a new route arrives, RCS must recompute the assignment for every router because the new route may change the best choice.
+\end{itemize}
+
+\subsection{Optimization 3: rank egresses by IGP cost and use a ``using table''}
+\begin{itemize}
+\item For each router, RCS maintains an egress list sorted by IGP path cost to each egress.
+\item For each egress, RCS stores pointers to the prefixes/routes in RIB-Out currently using that egress; this is the \key{using table}.
+\item If router 1's IGP cost to egress \(eg1\) increases, move \(eg1\) down the sorted list until it reaches its correct position. Recompute only the prefixes that were using \(eg1\), not every prefix.
+\item If \(eg3\) becomes router 1's closest egress, move it to the top of the list and recompute only prefixes associated with egresses passed over during sorting (e.g., \(eg1\) and \(eg2\)), since those prefixes may now need assignment to \(eg3\).
+\end{itemize}
+\marginnote{Optimization point: a path-cost change should not force recomputation for every prefix. The using table identifies exactly which prefixes were using the affected egress.}
+
+\subsection{Optimization 4: group related routers}
+\begin{itemize}
+\item Rather than compute routes for every router separately, RCS can assign the same route for a prefix to a group of routers.
+\item Groups can be identified by the IGP Viewer or configured by the operator. RIB-Out and egress-list entries are then per group, reducing storage and CPU overhead.
+\item RCS keeps the list of routers in each group so the BGP Engine can send the route to every group member.
+\item There is a trade-off: grouping reduces overhead but reduces the flexibility to assign different routes to routers within the same group.
+\item In the prototype, Points-of-Presence (PoPs), corresponding to OSPF areas, are used as groups; each PoP is treated as one graph node for BGP route decisions.
+\end{itemize}
+\marginnote{Groups can follow IGP regions/OSPF areas or be manually configured by an operator. The notes flag the trade-off: efficiency improves, but route-assignment flexibility inside a group decreases.}
+
+\section{OSPF Viewer and area boundaries (PDF p. 9)}
+\subsection{Processing LSAs efficiently}
+\begin{itemize}
+\item The OSPF Viewer receives LSAs and maintains an up-to-date topology model.
+\item OSPF periodically refreshes LSAs even when the network is stable. The Viewer filters refresh LSAs because they require no RCS action.
+\item For a genuine change LSA, the Viewer runs shortest-path-first (SPF) calculations from each router's viewpoint. Instead of sending every path cost to RCS, it sends only costs that changed, as identified by the path-cost-change stage.
+\end{itemize}
+\marginnote{Only the changed path costs are sent to RCS; a refresh LSA does not mean the topology changed.}
+
+\subsection{OSPF hierarchy: Area 0, border routers, intra-area and summary LSAs}
+\begin{itemize}
+\item For scalability, an OSPF domain may be split into areas in a hub-and-spoke arrangement. \key{Area 0} is the backbone/hub and connects the non-zero, non-backbone areas (spokes). Each link belongs to exactly one area.
+\item Routers with links to multiple areas are \key{border routers}.
+\item A router learns the complete topology of the area(s) to which it belongs through \key{intra-area LSAs}. It does not learn the complete topology of remote areas; instead, \key{summary LSAs} give the total path cost from each border router to nodes in remote areas.
+\item OSPF area boundaries cannot be ignored during SPF. Even if a shorter path exists through another area, a path between routers in the same area must remain within that area.
+\item Thus, the OSPF Viewer performs SPF in \key{two stages}: (1) \emph{intra-area} calculations separately within each area using intra-area LSAs; (2) \emph{inter-area} calculations combine paths across areas.
+\item If the Viewer knows only some areas, it can calculate intra-area paths for visible areas and use summary LSAs from border routers to determine path costs to routers in non-visible areas during the inter-area stage.
+\end{itemize}
+\marginnote{Area boundaries are important. Diagram cue: intra-area LSAs describe local-area topology; summary LSAs expose inter-area path costs and help determine grouping. Area 0 is the hub, and the other areas are spokes.}
+
+\subsection{Using OSPF areas to reduce RCS work}
+The OSPF Viewer:
+\begin{enumerate}
+\item Provides path-cost information for all Area 0 routers, including border routers in non-zero areas.
+\item Forms one group for each non-zero area and supplies group membership.
+\end{enumerate}
+Because Area 0 summary LSAs provide the needed path costs, the Viewer need not have physical connections to non-zero areas. Summary LSAs also help determine router groups. Grouping is an internal RCP optimization and requires no protocol or configuration changes on routers.
+
+\section{BGP Engine implementation (PDF pp. 9--10)}
+\begin{itemize}
+\item The BGP Engine receives BGP messages from routers and sends them to the RCS; it also receives RCS instructions to send BGP routes to individual routers.
+\item The prototype modifies the Quagga software router so outbound routes are stored per router and route assignments come from the RCS rather than being computed locally.
+\item \key{Cache routes for efficient refreshes:} the BGP Engine caches RIB-In and RIB-Out. The RIB-In cache can provide a fresh route copy to a new/recovered RCS without affecting routers. The RIB-Out cache can resend assignments to operational routers after temporary loss of iBGP connectivity.
+\item The BGP Engine maintains a RIB-Out for each router and manages the low-level communication: BGP sessions, many TCP connections, and multiplexing update messages into a single stream to/from the RCS.
+\end{itemize}
+
+\section{Decoupling BGP decisions from IGP changes (PDF p. 13)}
+\begin{itemize}
+\item Although the prototype processes BGP updates quickly, processing internal topology changes is challenging. One event (e.g., a link failure) can change IGP costs for many router pairs and alter BGP assignments for many routers and prefixes. This coupling is inherent to hot-potato routing.
+\item Some commercial routers do not run the BGP decision process after every IGP event. Instead, they periodically scan the BGP routing table and revisit each destination prefix. Scanning once every 60 seconds can create long inconsistencies and persistent forwarding loops for tens of seconds; scanning more frequently increases router processing load.
+\item RCP's challenge is larger than a conventional router's because it computes routes for multiple routers. Software optimization helps, but does not remove the fundamental problem.
+\item The paper proposes moving beyond hot-potato routing: a small IGP event can cause an abrupt, large traffic shift, and RCP should help prevent such shifts except when needed to avoid congestion or delay.
+\item The experiment considers only OSPF path-cost changes affecting the availability of tunnel endpoints, ignoring changes that only affect internal topology. The idea is to react only to path-cost changes that matter to endpoint reachability.
+\item With filtered path-cost changes, the 90th-percentile decision time drops from 185 s to 0.059 s; for combined processing, it drops from 192 s to 0.158 s. Ignoring irrelevant path-cost changes substantially improves processing time.
+\item In a BGP-free core network, internal routers need not run BGP. Edge routers can still use IGP distances to choose among routes to the same destination. RCP need not treat tunnels as IGP links, but can rank tunnels to facilitate decisions.
+\item The results are promising but not conclusive; the authors note that longer-term convergence behaviour still needs to be understood.
+\end{itemize}
+
+\section{Fast final-revision checklist}
+\begin{itemize}
+\item \key{Full mesh:} correctness, but does not scale; sessions and update/storage overhead grow with router count.
+\item \key{Route reflector:} scalable, but can assign inconsistent routes and cause oscillations/forwarding loops.
+\item \key{RCP:} logically centralized control plane; unmodified iBGP; one route per router/prefix; can emulate full-mesh decisions.
+\item \key{Modules:} IGP Viewer (topology/path costs), BGP Engine (iBGP and update transport/cache), RCS (per-router/group route selection).
+\item \key{BGP step 6:} closest egress by IGP cost = hot-potato routing; IGP changes can affect many prefixes.
+\item \key{Correctness invariants:} keep the same egress while following the shortest path to it; do not cross partitions on the path to the BGP next hop.
+\item \key{Steady-state consistency:} no separate consistency protocol is required if replicas assign routes in the same partition, because they must have complete, identical inputs and deterministic computation.
+\item \key{Liveness vs correctness:} replicas may fail to assign routes during certain failures (liveness), but they will not assign different routes to the same router (correctness).
+\item \key{RCS optimizations:} one global route copy + shadow RIB-Out pointers; back-pointers for withdrawals; per-router egress rankings and using tables; router grouping.
+\item \key{OSPF:} refresh LSAs are filtered; only changed path costs are sent; Area 0 is backbone; intra-area LSAs expose local topology; summary LSAs give remote-area costs; SPF has intra-area and inter-area stages.
+\item \key{Decoupling:} filter irrelevant IGP path-cost changes to reduce recomputation and avoid abrupt traffic shifts.
+\end{itemize}
