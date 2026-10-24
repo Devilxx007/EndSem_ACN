@@ -1,0 +1,300 @@
+\chapter{Frenetic: A Network Programming Language}
+\paperinfo{N. Foster, R. Harrison, M. J. Freedman, C. Monsanto, J. Rexford, A. Story, D. Walker}{ICFP 2011}
+
+\begin{keybox}[Frenetic in one paragraph]
+Today \key{the languages used to program networks lack modern features}: \key{they are defined at the low level} of abstraction supplied by the switch hardware and give no support for modular programming. Frenetic is a high-level language for programming distributed collections of switches, embedded in Python. It provides (1) a \key{declarative query language for classifying and aggregating network traffic}, and (2) a \key{functional reactive combinator library for describing high-level packet-forwarding policies}. Its constructs are fully compositional, which \key{facilitates modular reasoning and enables code reuse}. This is made possible by Frenetic's \key{run-time system, which manages all the details of installing, uninstalling and querying low-level packet-processing rules on physical switches}.
+\end{keybox}
+
+\section{Motivation: limitations of OpenFlow/NOX}
+\key{The difficulty of changing closed, proprietary network components} has chilled innovation. OpenFlow and controllers like NOX make it \emph{possible} to build new network services, but \key{they do not make it easy}. \key{OpenFlow programmers must constantly grapple with several difficult challenges}:
+\begin{enumerate}
+\item \textbf{No modularity.} \key{Networks often perform multiple tasks, like routing, access control and traffic monitoring}, but \key{decoupling these tasks and implementing them independently in separate modules is effectively impossible}: rules (un)installed by one module interfere with overlapping rules of another.
+\item \textbf{Low-level interface.} \key{The OpenFlow/NOX interface is defined at a very low level of abstraction} (bit patterns, integer priorities). \key{Simple high-level concepts such as set difference require multiple rules and priorities to implement correctly}, and \key{more powerful ``wildcard'' rules are a limited hardware resource that programmers must manage by hand}.
+\item \textbf{Two-tiered programming.} \key{Controller programs only receive events for packets the switches do not know how to handle.} A rule installed for one purpose can stop a different callback from ever firing. So \key{writing OpenFlow programs becomes a difficult exercise in two-tiered programming}: programmers must reason simultaneously about the packets processed on switches and those processed on the controller.
+\item \textbf{Race conditions.} \key{Because a network of switches is a distributed system, it is susceptible to various kinds of race conditions.}
+\end{enumerate}
+\marginnote{Limitations of OpenFlow. Usually the first packet of each flow is sent to the controller, which installs rules to handle the remaining packets. What if the 2nd, 3rd, 4th packet arrives first (before the rule is installed)? Hence a race condition.}
+
+\section{Frenetic's design principles}
+\key{Frenetic is organized around two levels of abstraction}: (1) \key{a set of source-level operators for constructing and manipulating streams of network traffic}, and (2) \key{a run-time system that handles all the details of installing and uninstalling low-level rules on switches}. The operators borrow from declarative database query languages and functional reactive programming (FRP), and follow these principles:
+\begin{itemize}
+\item \key{Declarative design.} Consider \emph{what the programmer might want}, rather than \emph{how the hardware implements it}. Frenetic \key{provides intuitive, high-level primitives} even when the hardware does not support them directly.
+\item \key{Modular design.} Primitives have limited network-wide effects and semantics that can be stated independently of the context in which they are used --- so programs are built from reusable parts.
+\item \key{Single-tier programming.} \key{Programmers need not worry that installing packet-handling rules may prevent the controller from analysing other traffic.} Frenetic supports a \key{see-every-packet abstraction, which guarantees that every packet is available for analysis}, side-stepping the two-tiered model.
+\item \key{Race-free semantics.} \key{Because queries tell the run-time system what programmers want, the run-time can suppress superfluous packets that arrive at the controller due to network race conditions.} Automatic race detection and suppression simplify programming.
+\item \key{Cost control.} High-level features can hide their cost. \key{Frenetic gives programmers guidance about the costs of programming constructs}: \key{the query language is carefully defined so the core query logic can be executed on network switches}, keeping most packets in the fast path.
+\end{itemize}
+\marginnote{The source-level operators are a set of policies (circled ``a set of source-level operators'').}
+
+\section{Background: OpenFlow and NOX}
+\subsection{How an OpenFlow network works}
+In OpenFlow, \key{a centralized controller manages a distributed collection of switches}. \key{Packets flowing through the network may be processed by the centralized controller}, but that is orders of magnitude \key{slower than processing them on the switches}. So \key{a primary function of the controller is to configure the switches so that they process the vast majority of packets}, and \key{only a few packets from new or unexpected flows need to be handled on the controller}.
+\marginnote{Working of OpenFlow. Going to the controller is slow, hence the controller configures the switches.}
+
+\paperfig[0.48]{fr_fig1_ofsyntax}{OpenFlow syntax (rules, patterns, priorities, timeouts, actions). Prefixes \texttt{dl}, \texttt{nw}, \texttt{tp} denote data link (MAC), network (IP) and transport (TCP/UDP).}
+\textbf{Configuring a switch} means \key{installing entries in its flow table}: a \key{set of rules}. \key{A rule consists of}:
+\begin{itemize}
+\item \key{a pattern that identifies a set of packets};
+\item \key{an integer priority that disambiguates rules with overlapping patterns};
+\item \key{an optional integer timeout: the number of seconds until the rule expires};
+\item \key{a list of actions that specifies how packets should be processed}.
+\end{itemize}
+For each rule the \key{switch maintains counters} of the number and total size of packets processed. \key{A pattern is a list of pairs of header fields and integer values}, read as equality constraints: \texttt{\{nw\_src:10.0.0.1, tp\_dst:80\}} matches packets from 10.0.0.1 to port 80. Header fields not mentioned are unconstrained; such rules are \key{wildcard rules}.
+\marginnote{Data structure for configuring a switch: pattern + priority + timeout + action list (+ counters).}
+
+\textbf{When a packet arrives, the switch:}
+\begin{enumerate}
+\item \key{Selects a rule whose pattern matches the packet.} If there are \key{no matching rules, the switch sends the packet to the controller}. If several match, it picks the \emph{exact-match} rule (one matching every header field) if one exists, otherwise the \key{wildcard rule with highest priority}.
+\item \key{Updates the byte and packet counters of that rule.}
+\item \key{Applies the rule's actions to the packet in order, or drops the packet if the list is empty.}
+\end{enumerate}
+\textbf{Actions:} \key{\texttt{output(op)} forwards the packet on port \textit{op}}, which is \key{a physical port $n$ or one of the virtual ports \texttt{flood} or \texttt{controller}} (\texttt{flood} sends out of all ports except the ingress port). \key{\texttt{modify(h,n)} rewrites header field $h$ to $n$.} A list may mix both, e.g., \texttt{[modify(nw\_src,10.0.0.1), output(2), output(controller)]}.
+\marginnote{If a rule matches but its action list is empty, the packet is dropped. Actions execute in sequence.}
+
+\subsection{The NOX controller}
+\key{The controller manages the set of rules installed on the switches by reacting to network events.} \key{NOX} is a \key{simple operating system for networks} providing primitives for managing events and for talking to switches.
+\marginnote{The NOX controller manages the rules.}
+
+\begin{center}
+\begin{tabularx}{\linewidth}{@{}l X@{}}
+\toprule
+\textbf{NOX event} & \textbf{Triggered when} \\
+\midrule
+\texttt{packet\_in(switch, port, packet)} & a switch forwards a packet received on a physical port to the controller \\
+\texttt{stats\_in(switch, xid, pattern, packets, bytes)} & a switch returns packet/byte counters for a statistics request; \texttt{xid} identifies the request \\
+\texttt{flow\_removed(switch, pattern, packets, bytes)} & a rule's timeout expires and it is removed from the flow table (counters of the evicted rule are reported) \\
+\texttt{switch\_join(switch)} / \texttt{switch\_exit(switch)} & a switch joins / exits the network \\
+\texttt{port\_change(switch, port, up)} & the link on a given port goes up or down \\
+\midrule
+\textbf{NOX function} & \textbf{Effect} \\
+\midrule
+\texttt{install(switch, pattern, priority, timeout, actions)} & installs a rule in the switch's flow table \\
+\texttt{uninstall(switch, pattern)} & removes all rules contained in \texttt{pattern} \\
+\texttt{send(switch, packet, action)} & sends the packet to the switch and applies the action there \\
+\texttt{query\_stats(switch, pattern)} & requests statistics for all rules in \texttt{pattern}; returns an \texttt{xid} to match the asynchronous reply \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\paperfig[0.32]{fr_fig2_topology}{Simple topology used in the examples: one switch, internal hosts on port 1, the wide-area network on port 2.}
+\textbf{Example --- a repeater hub in NOX.} When the switch joins, install two permanent rules (\texttt{None} timeout) forwarding port 1 $\leftrightarrow$ port 2:
+\begin{lstlisting}[language=Python]
+def switch_join(switch):
+  repeater(switch)
+def repeater(switch):
+  pat1 = {in_port:1}
+  pat2 = {in_port:2}
+  install(switch,pat1,DEFAULT,None,[output(2)])
+  install(switch,pat2,DEFAULT,None,[output(1)])
+\end{lstlisting}
+
+\section{Analysis of OpenFlow/NOX difficulties}
+\subsection{Interactions between concurrent modules (no composition)}
+Goal: extend the repeater to also monitor incoming web traffic. A separate monitor installs a rule for web traffic and polls its counters every 30\,s:
+\begin{lstlisting}[language=Python]
+def monitor(switch):
+  pat = {in_port:2,tp_src:80}
+  install(switch,pat,DEFAULT,None,[])
+  query_stats(switch,pat)
+def stats_in(switch,xid,pattern,packets,bytes):
+  print bytes
+  sleep(30)
+  query_stats(switch,pattern)
+\end{lstlisting}
+Naively running \texttt{repeater(switch); monitor(switch)} does \emph{not} work: the two programs install \emph{overlapping} rules. A web packet from port 2 may match either rule. If the repeater rule is used, the monitoring counters are not updated; if the monitor rule is used, its empty action list drops the packet, breaking the repeater. The programmer must manually merge them:
+\begin{lstlisting}[language=Python]
+def repeater_monitor(switch):
+  pat1 = {in_port:1}
+  pat2 = {in_port:2}
+  pat2web = {in_port:2,tp_src:80}
+  install(switch,pat1,DEFAULT,None,[output(2)])
+  install(switch,pat2web,HIGH,None,[output(1)])
+  install(switch,pat2,DEFAULT,None,[output(1)])
+  query_stats(switch,pat2web)
+\end{lstlisting}
+The \texttt{pat2web} rule must copy the repeater's \texttt{output(1)} action and use \texttt{HIGH} priority to win over \texttt{pat2}. In general, \key{composing NOX programs requires careful, manual effort by the programmer to preserve the semantics of the original programs}. This makes reusable libraries and compositional reasoning nearly impossible.
+\marginnote{Very good example: we are trying to put 2 programs that have overlapping rules together, and they conflict with each other's work!! Programmer effort is more!}
+
+\subsection{Low-level programming interface}
+The \key{low-level nature of the programming interface}, \key{derived from the features of the switch hardware} rather than designed for ease of use, makes \key{programs complicated}. Example: monitor all incoming web traffic \emph{except} traffic to an internal server 10.0.0.9. That is a set \emph{difference}, but OpenFlow patterns only express positive constraints, so \key{to simulate the difference of two patterns we must install two overlapping rules} and use priorities:
+\begin{lstlisting}[language=Python]
+def repeater_monitor_noserver(switch):
+  pat1 = {in_port:1}
+  pat2 = {in_port:2}
+  pat2web = {in_port:2,tp_src:80}
+  pat2srv = {in_port:2,nw_dst:10.0.0.9,tp_src:80}
+  install(switch,pat1,DEFAULT,None,[output(2)])
+  install(switch,pat2srv,HIGH,None,[output(1)])
+  install(switch,pat2web,MEDIUM,None,[output(1)])
+  install(switch,pat2,DEFAULT,None,[output(1)])
+  query_stats(switch,pat2web)
+\end{lstlisting}
+\texttt{pat2srv} (HIGH) catches server traffic so that only other web traffic is counted by \texttt{pat2web}. Natural operations like negation, difference and union must be encoded with multiple rules and priorities, which is cumbersome and error-prone.
+
+\subsection{Two-tiered system architecture}
+The \key{two-tiered architecture used in NOX}, where a \key{controller program manages the network by installing and uninstalling switch-level rules}, forces the \key{programmer to specify the communication patterns between controller and switch} and \key{deal with tricky concurrency issues}. Example: monitor incoming traffic \emph{per destination host}. Hosts are not known in advance, so \key{the controller must dynamically install rules for the packets seen at run time}:
+\begin{lstlisting}[language=Python]
+def repeater_monitor_hosts(switch):
+  pat = {in_port:1}
+  install(switch,pat,DEFAULT,None,[output(2)])
+def packet_in(switch,inport,packet):
+  if inport == 2:
+    mac = dstmac(packet)
+    pat = {in_port:2,dl_dst:mac}
+    install(switch,pat,DEFAULT,None,[output(1)])
+    query_stats(switch,pat)
+\end{lstlisting}
+Initially no rule matches incoming traffic, so every packet from port 2 goes to the controller; \texttt{packet\_in} installs a rule per host so later packets stay on the switch. So a NOX program is really \emph{two} programs, one on the controller and one on the switch, each depending on the other: installing rules changes which packets the controller sees.
+\marginnote{Because we have no information about the hosts at the start.}
+
+\subsection{Network race conditions}
+A corollary of the two-tier model is that \key{programs are susceptible to subtle network race conditions}. The common idiom handles the first packet of a flow on the controller and installs a rule for the rest. But \key{if a new packet in the same flow arrives before the switch has installed the new rule, that packet is also sent to the controller}. Unless the controller code is idempotent for repeated packets of the same flow, it fails.
+\marginnote{The first packet is sent to the controller --- what if the 2nd/3rd/4th packet comes first (before the rule is in place)!}
+
+\section{The Frenetic language}
+\key{Frenetic is embedded in Python} and has \key{two integrated sublanguages}:
+\begin{enumerate}
+\item \key{a limited, high-level, declarative network query language}, and
+\item \key{a general-purpose, functional reactive network policy management library}.
+\end{enumerate}
+Its features: a \key{single-tier, ``see-every-packet'' abstraction}; \key{strong compositionality properties}; a \key{clear cost model}; and \key{simple, race-free semantics}.
+\marginnote{1) Query language. 2) Policy management. Facilities: single-tier, see-every-packet, compositional, cost model, race-free.}
+
+\subsection{The network query language}
+The \key{network query sublanguage lets programs \emph{read} the state of the network}. \key{To implement these reads efficiently, the run-time system changes the state of the network by installing a variety of low-level rules} on switches --- but from the programmer's viewpoint, reads have \emph{no observable effect} on network state. So queries compose perfectly with each other and with the policy library.
+\marginnote{(Read the network state.)}
+
+\textbf{Key design challenge:} a \key{balance between expressiveness, simplicity and control over cost}. \key{The cost of evaluating a query is the number of packets that must be diverted from the fast path and processed on the controller.} This matters because \key{a diverted packet's latency is orders of magnitude worse than in hardware}, and \key{if many packets are diverted, the switch--controller link becomes a bottleneck}. So the query language's expressiveness is deliberately limited to keep a simple cost model.
+\marginnote{Challenge!}
+
+\paperfig[0.48]{fr_fig3_querysyntax}{Frenetic query syntax. Clauses are combined with the infix operator \texttt{*}; every clause except \texttt{Select} is optional.}
+\textbf{Basic concepts.} \key{Frenetic queries filter the set of all packets using high-level patterns}, \key{subdivide it by grouping on one or more header fields}, \key{split it by arrival time or whenever a header field changes value}, limit the number of values returned, and aggregate by number or size of packets. \key{The result is an \emph{event stream}: a data structure representing an infinite, discrete, time-indexed stream of values.} The type $\alpha$\,\textsf{E} is events carrying values of type $\alpha$ (e.g., \texttt{packet E}).
+\marginnote{Similar to SQL.}
+\begin{itemize}
+\item \texttt{Select(a)} --- aggregates the results with method $a$: \texttt{packets} (the packets themselves), \texttt{counts} (number of packets) or \texttt{sizes} (sum of sizes). Required; it fixes the event type.
+\item \texttt{Where(fp)} --- \key{filters} to packets matching \emph{filter pattern} $fp$. Simple patterns test header fields (\texttt{inport\_fp(2)}, \texttt{srcport\_fp(80)}\ldots); complex ones use set operations: \texttt{and\_fp}, \texttt{or\_fp}, \texttt{diff\_fp}, \texttt{not\_fp}. These high-level patterns are compiled to OpenFlow patterns by Frenetic.
+\item \texttt{GroupBy([qh1,...])} --- subdivides into subsets by header fields; e.g., grouping by \texttt{srcip} and \texttt{srcport} gives \key{one subset for all packets with source IP 10.0.0.1 and TCP source port 80}, another for 10.0.0.2 and port 80, and so on.
+\item \texttt{SplitWhen([qh1,...])} --- like \texttt{GroupBy}, but whereas \key{\texttt{GroupBy} produces \emph{one} subset for \emph{all} packets with particular values, \texttt{SplitWhen} generates a new subset \emph{each time} the value of one of the fields changes}. For source IPs arriving as 10.0.0.1, 10.0.0.2, 10.0.0.1 it gives three subsets; for 10.0.0.1, 10.0.0.1, 10.0.0.2 only two.
+\item \texttt{Every(n)} --- partitions by time into $n$-second windows.
+\item \texttt{Limit(n)} --- limits each subset to $n$ packets (most commonly 1).
+\end{itemize}
+\marginnote{\texttt{Where} = matches filter patterns. \texttt{Select(a)} aggregates the results returned by the rest of the query using method $a$.}
+
+\textbf{Example query} --- total bytes of web traffic arriving on port 2, every 30 seconds; the result (an \texttt{int E}) is piped to a printer:
+\begin{lstlisting}[language=Python]
+def web_query():
+  return \
+    (Select(sizes) *
+     Where(inport_fp(2) & srcport_fp(80))) *
+     Every(30))
+def web_stats():
+  web_query() >> Print()
+\end{lstlisting}
+
+\textbf{Query composition.} \key{Extending the Frenetic program is simple}: to also monitor traffic per host every 60\,s, just add a query and combine the two with \texttt{Merge}, a combinator that turns a pair of events into an event of pairs of optional values:
+\begin{lstlisting}[language=Python]
+def host_query():
+  return (Select(sizes) *
+          Where(inport_fp(2)) *
+          GroupBy([dstmac]) *
+          Every(60))
+def all_stats():
+  Merge(host_query(),web_query()) >> Print()
+\end{lstlisting}
+\key{The programmer who writes this need not know the details of the individual queries}; neither can interfere with the other. Why? Queries only \emph{read} state, and \key{Frenetic supports a programming model in which every query can ``see every packet'' in the network}. Different query frequencies (60\,s vs.\ 30\,s) are just declared; in NOX this would need tedious bookkeeping.
+
+\textbf{Race-free semantics.} \key{One of the most basic network programs is a learning switch}, which \key{discovers the hosts connected to each port by recording the source MAC addresses} of incoming packets:
+\begin{lstlisting}[language=Python]
+def learning_query():
+  return (Select(packets) *
+          Where(true_fp()) *
+          GroupBy([srcmac]) *
+          SplitWhen([inport]) *
+          Limit(1))
+def connection_printer():
+  learning_query() >> Print()
+\end{lstlisting}
+This yields one packet per distinct source MAC, plus a new one if that MAC moves to another port. \key{Achieving the same effect in NOX is surprisingly tricky because of network race conditions}: while NOX installs a rule to suppress packets 2, 3, 4 from that MAC, they may already be on their way to the controller. Frenetic's run-time handles such races once and for all, invisibly, because it knows from the query what the programmer wants.
+
+\textbf{The query cost model.} \key{The cost of executing a Frenetic query is understood in terms of \emph{microflows}: sets of related packets that have identical header fields and arrive at the same switch.} E.g., for \texttt{web\_query}, (\texttt{in\_port 2, srcport 80, vlan 0, dl\_src 0, \ldots}) is one microflow, and the same with \texttt{vlan 1} is another.
+\begin{itemize}
+\item \key{The total number of microflows is enormous}, but \key{a single microflow may contain arbitrarily many packets}, and there are far fewer \key{\emph{inhabited} microflows} --- \key{flows for which the network actually witnesses a packet}.
+\item A \emph{statistics query} (\texttt{counts}/\texttt{sizes}) \key{diverts one packet per inhabited microflow to the controller}; then \key{the run-time installs a rule on the switch for the subsequent packets in that microflow}. Every 30\,s it gathers statistics by querying switch counters, not by diverting more packets. (Strictly, one packet ``modulo race conditions''.)
+\item \key{If multiple statistics queries are interested in the same microflow, the cost is shared}: at most one packet is diverted.
+\item \key{If the forwarding policy changes, the installed microflow rules must be uninstalled, since their actions may be wrong: the rules used to collect statistics on the switch are also used to perform forwarding.} So \key{when the policy changes, extra packets may be diverted as the network adapts}.
+\item \emph{Packet queries} (\texttt{Select(packets)}) are different: every returned packet must go to the controller, so a packet query without \texttt{Limit} is inherently expensive. With \texttt{Limit(1)} (as in the learning switch) the cost is similar to a statistics query.
+\end{itemize}
+\marginnote{Analyse the first packet of the microflow and install a rule on the switch for the subsequent packets of the microflow. Stats rule and forwarding rule are the same rule, so a change in forwarding means the rule needs to change.}
+
+\textbf{Deep packet inspection.} One just writes a query returning the packets (e.g., all web packets) and pipes them to an analyser. Unrestricted packet queries divert many packets, but that is a limit of OpenFlow hardware, not of Frenetic.
+
+\textbf{Summary of the query language.} \key{It supports a collection of orthogonal, high-level query operators.} \key{The run-time supports the abstraction that these operators read, but do not modify, network state}, so \key{queries compose seamlessly with one another}. \key{The run-time also suppresses superfluous packets caused by race conditions}, giving race-free semantics. And queries have a clear cost model based on the number of inhabited microflows, not packets.
+
+\subsection{The network policy management library}
+\key{Frenetic programmers manage the policy that governs packet forwarding} using a library for \key{functional reactive programming (FRP)}, inspired by Yampa and implemented like FlapJax.
+
+\textbf{Rules and policies.} \key{One basic operation is to construct packet-forwarding \emph{rules}}. \key{Rules are created with the \texttt{Rule} constructor, which takes a \emph{pattern} and a list of \emph{actions}.} Patterns are like query filter patterns but do not mention switches. Actions: \key{forwarding through port $p$ (\texttt{forward(p)})}, \key{flooding (\texttt{flood()})}, \key{sending to the controller (\texttt{controller()})}, and \key{modifying header field $f$ to $v$ (\texttt{modify(f,v)})}. \key{There is no explicit drop action: an empty list means drop packets.} A \emph{network policy} associates rules with switches; it is a Python dictionary from switches to lists of rules.
+\marginnote{Rule constructor.}
+
+\textbf{Events, event functions, listeners.} Programs control policies \emph{over time} by generating \emph{policy events} (infinite time-indexed streams, like query results).
+\begin{itemize}
+\item \emph{Primitive events}: \texttt{Seconds}, \texttt{SwitchJoin}, \texttt{SwitchExit}, \texttt{PortChange} (switch, port, up?).
+\item \emph{Event functions} ($\alpha\,\beta$ \textsf{EF}) transform events: \texttt{Lift(f)} applies an ordinary function to every value; \texttt{Merge} pairs two events; \texttt{Accum}, \texttt{Filter}, \texttt{ApplyFst}, \texttt{BlendLeft}, \ldots; networking-specific ones: \texttt{MakeForwardRules} (turns (switch, port, packet) triples into a forwarding policy) and \texttt{AddRules} (accumulates/merges policies over time).
+\item \emph{Listeners} consume events: \texttt{Print}, \texttt{Send} (send a packet to a switch and apply actions), and \texttt{Register} (installs a policy in the run-time system).
+\item \texttt{>>} is overloaded to compose events with event functions, event functions with each other, and events with listeners.
+\end{itemize}
+\paperfig[0.48]{fr_fig4_operators}{Selected Frenetic operators and their types: events, basic event functions, listeners, rules and policies.}
+
+\textbf{A first example --- the repeater in Frenetic:}
+\begin{lstlisting}[language=Python]
+rules = [Rule(inport_fp(1),[forward(2)]),
+         Rule(inport_fp(2),[forward(1)])]
+def repeater():
+  (SwitchJoin() >> Lift(lambda switch:{switch:rules}) >> Register())
+\end{lstlisting}
+When a switch joins, a lifted function builds a policy dictionary \{switch: rules\}, and \texttt{Register} installs it. It \emph{composes effortlessly} with monitoring: \texttt{repeater(); all\_stats()} --- no interleaving of monitoring and forwarding code as in NOX. Queries read but don't modify (so they don't disturb forwarding), and queries see every packet (so forwarding doesn't disturb them). The run-time manages the interaction between query rules and policy rules.
+
+\textbf{A parameterized load balancer.} Traffic from one source IP leaves through one output port; different IPs may use different ports.
+\paperfig[0.5]{fr_fig5_loadbalancer}{A parameterized load balancer: a query yields one packet per new source IP; \texttt{balancer} maps IPs to ports; library functions turn the result into a forwarding policy.}
+The \texttt{balancer} argument can be a hash (\texttt{Lift(hash\_ip\_to\_port)}), round robin (\texttt{Accum}), or a weighted balancer driven by a query of per-IP packet counts every \texttt{INTERVAL} seconds. In NOX this is hard, because the monitoring rules of the weighted balancer would interfere with the balancing rules.
+
+\textbf{Composing forwarding decisions.} A routine that computes a policy can be composed with routines that transform it, e.g., a security module that removes rules involving known bad source IPs (figure below). Frenetic's functional style makes such post-facto policy modifiers trivial; in NOX it is hard unless modules act on disjoint packets.
+\paperfig[0.5]{fr_fig6_secure}{Securing the weighted balancer: \texttt{BlendLeft} combines the latest bad-IP list with each policy, and \texttt{filter\_ips} deletes rules for those IPs.}
+
+\section{Frenetic implementation}
+\paperfig[0.26]{fr_fig7_arch}{Frenetic architecture: the program subscribes queries and registers policies with the run-time system, which drives switches through NOX.}
+Frenetic is a prototype \key{embedded combinator library in Python}, with three pieces: the language, the \key{run-time system}, and NOX (any controller would do as a back-end).
+
+\subsection{The run-time system}
+The run-time sits between the high-level program and NOX. It handles all bookkeeping of installing/uninstalling rules and generates the switch--controller communication patterns. It translates the registered high-level policy into switch-level rules \emph{reactively}, as traffic appears:
+\begin{enumerate}
+\item At start, every flow table is empty, so every packet goes to the controller's \texttt{packet\_in} handler.
+\item \texttt{packet\_in} first pushes the packet to every \emph{subscriber} (query) whose definition includes it, then walks the policy collecting the actions of all matching rules.
+\item If \emph{no} subscriber needs the packet, it \key{installs an exact-match switch rule} for this header so future packets of the microflow stay on the switch. If some subscriber \emph{does} need it, it sends the packet back to the switch and applies the actions there, \emph{without} installing a rule (a rule would hide future packets from the subscriber).
+\end{enumerate}
+In effect the run-time \emph{dynamically unfolds the high-level policy into switch-level rules}, moving work off the controller without interfering with any subscriber.
+
+\textbf{Statistics subscribers} use switch counters instead: a loop waits for each subscriber's window to expire, then requests counters from every installed rule whose pattern matches the query, recording the request ids. \texttt{stats\_in} adds up the asynchronous replies; when no requests are outstanding it pushes the totals onto the subscriber's event stream. When the policy changes, stale rules are uninstalled, and a \texttt{flow\_removed} handler adds the evicted rules' counters to the controller's totals so no statistics are lost. The real implementation also suppresses spurious packets caused by races between rule installation and packet arrival.
+\paperfig[0.42]{fr_fig8_runtime}{Pseudo-code of the run-time system's NOX handlers: \texttt{packet\_in}, \texttt{stats\_in}, and the statistics loop.}
+
+\subsection{FRP library and rule strategy}
+\begin{itemize}
+\item Classic FRP supports continuous \emph{behaviors} (pull-based). Frenetic deals almost only with \emph{discrete} events, so its FRP library is \key{push-based}, propagating values from inputs to outputs.
+\item The run-time uses \key{exact-match (microflow) rules}, like Ethane. They suit dynamic settings and use plentiful \key{SRAM}, unlike wildcard rules that need small, expensive, power-hungry \key{TCAMs}. Wildcards are more concise and suit static settings; a proactive, priority-based wildcard strategy is planned.
+\end{itemize}
+
+\textbf{Evaluation (in brief).} Compared with equivalent NOX programs (learning switch, web statistics, heavy hitters), Frenetic programs were much shorter and had comparable controller and total traffic.
+
+\section{Revision checklist}
+\begin{itemize}
+\item \textbf{OpenFlow/NOX problems:} no modular composition (overlapping rules), low-level interface (set difference needs priorities), two-tiered programming (controller only sees unhandled packets), race conditions (packets 2--4 reach the controller before the rule).
+\item \textbf{OpenFlow rule:} pattern + priority + timeout + action list; counters per rule; empty action list = drop; exact match beats wildcard, else highest priority.
+\item \textbf{NOX:} events \texttt{packet\_in}, \texttt{stats\_in}, \texttt{flow\_removed}, \texttt{switch\_join/exit}, \texttt{port\_change}; functions \texttt{install}, \texttt{uninstall}, \texttt{send}, \texttt{query\_stats}.
+\item \textbf{Frenetic = query language (read) + FRP policy library (write)} on top of a run-time system.
+\item \textbf{Principles:} declarative, modular, single-tier (see every packet), race-free, cost control.
+\item \textbf{Query clauses:} \texttt{Select} (packets/counts/sizes), \texttt{Where}, \texttt{GroupBy}, \texttt{SplitWhen}, \texttt{Every}, \texttt{Limit}; result is an event stream; composed with \texttt{Merge}.
+\item \textbf{GroupBy vs.\ SplitWhen:} one subset per value vs.\ a new subset every time the value changes.
+\item \textbf{Cost model:} cost = packets diverted to the controller; statistics query = one packet per inhabited microflow; shared across queries; policy change $\Rightarrow$ reinstall rules.
+\item \textbf{Policy library:} \texttt{Rule(pattern, actions)}; actions \texttt{forward}, \texttt{flood}, \texttt{controller}, \texttt{modify}; no explicit drop; policy = dict switch $\to$ rules; \texttt{Register} installs it.
+\item \textbf{Run-time:} reactive exact-match rules; install a rule only if no subscriber needs the packet; statistics via switch counters; \texttt{flow\_removed} keeps counters.
+\end{itemize}

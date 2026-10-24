@@ -1,235 +1,274 @@
-\section{P4: Programming Protocol-Independent Packet Processors}
+\chapter{P4: Programming Protocol-Independent Packet Processors}
+\paperinfo{P. Bosshart, D. Daly, G. Gibb, M. Izzard, N. McKeown, J. Rexford, C. Schlesinger, D. Talayco, A. Vahdat, G. Varghese, D. Walker}{ACM SIGCOMM CCR, Vol.\ 44 No.\ 3, July 2014}
 
-\textit{Pat Bosshart et al., ACM SIGCOMM Computer Communication Review, 2014. This chapter follows the annotated paper and concentrates on the highlighted concepts and the technical examples used to explain them.}
+\begin{keybox}[P4 in one paragraph]
+\key{P4 is a high-level language for programming protocol-independent packet processors.} It \key{works in conjunction with} SDN control protocols like \key{OpenFlow}. OpenFlow explicitly specifies the protocol headers it operates on, and this set has grown from 12 to 41 fields. P4 is a strawman proposal for \key{how OpenFlow should evolve}: the controller should \emph{tell the switch how to operate} (how to parse and process packets), instead of being constrained by a fixed switch design. Three goals: \key{reconfigurability}, \key{protocol independence}, \key{target independence}.
+\end{keybox}
 
-\subsection{Motivation: Why P4?}
+\section{Motivation}
+\begin{itemize}
+\item \key{Software-Defined Networking (SDN) gives operators programmatic control} over their networks. \key{In SDN, the control plane is physically separate from the forwarding plane, and one control plane controls multiple forwarding devices.} A common, open, vendor-agnostic interface (like OpenFlow) lets a control plane manage devices from different vendors.
+\item \key{OpenFlow started simple}, with a \key{single table of rules that could match packets on a dozen header fields} (MAC addresses, IP addresses, protocol, TCP/UDP ports\ldots). \key{Over the past five years the specification has grown increasingly more complicated}, with \key{many more header fields} and multiple stages of rule tables:
+\end{itemize}
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Version} & \textbf{Date} & \textbf{Header fields} \\
+\midrule
+OF 1.0 & Dec 2009 & 12 fields (Ethernet, TCP/IPv4) \\
+OF 1.1 & Feb 2011 & 15 fields (MPLS, inter-table metadata) \\
+OF 1.2 & Dec 2011 & 36 fields (ARP, ICMP, IPv6, etc.) \\
+OF 1.3 & Jun 2012 & 40 fields \\
+OF 1.4 & Oct 2013 & 41 fields \\
+\bottomrule
+\end{tabular}
+\end{center}
+\begin{itemize}
+\item New fields keep coming: data-centre operators want new encapsulations (NVGRE, VXLAN, STT) and resort to software switches that are easier to extend.
+\item \key{Rather than repeatedly extending the OpenFlow specification}, \key{future switches should support flexible mechanisms for parsing packets and matching header fields}, exposed through a common, open interface --- \key{a new ``OpenFlow 2.0'' API}. This would be simpler, more elegant and \key{more future-proof}.
+\item Recent chips show such flexibility is possible at terabit speeds, but \key{programming this new generation of switch chips is far from easy}: \key{each chip has its own low-level interface}, akin to microcode.
+\end{itemize}
 
-Software-Defined Networking (SDN) gives operators programmatic control over a network. Its key architectural separation is between the \textbf{control plane}, which decides how traffic should be handled, and the \textbf{forwarding/data plane}, which processes packets. A single control plane may manage multiple forwarding devices. A common, open, vendor-agnostic interface such as OpenFlow lets the controller manage devices from different vendors.
+\paperfig[0.48]{p4_fig1_config}{P4 is a language to \emph{configure} switches (parser and tables, via a compiler), while classic OpenFlow-style APIs \emph{populate} the tables at run time (installing and querying rules, via a rule translator).}
+Figure above: \key{P4 is used to configure a switch, telling it how packets are to be processed}, while \key{existing APIs (such as OpenFlow) are designed to populate the forwarding tables in fixed-function switches}. \key{P4 raises the level of abstraction} for programming the network and can serve as a general \key{interface between the controller and the switches}.
 
-The limitation of early OpenFlow is that it explicitly names the packet-header fields and actions that switches support. OpenFlow 1.0 began with 12 matchable header fields; later versions expanded the set to 15, 36, 40, and 41 fields. The specification therefore became more complex while still not giving operators a general way to introduce new header formats. New encapsulations such as NVGRE, VXLAN, and STT illustrate why a fixed list of supported protocols is limiting.
-
-The central idea of P4 is to let a programmer describe \emph{how a switch should parse and process packets}, rather than forcing the programmer to accept a fixed parser and fixed-function pipeline. P4 is a high-level language for programming protocol-independent packet processors and works alongside SDN control protocols such as OpenFlow. OpenFlow-like APIs can populate forwarding-table entries; P4 describes the packet-processing structure those tables belong to.
-
-\subsection{The three goals of P4}
-
+\section{The three goals of P4}
 \begin{enumerate}
-  \item \textbf{Reconfigurability in the field.} After a switch has been deployed, its packet parsing and processing should be redefinable. For example, the switch should be able to recognize a newly introduced header without requiring the design to have anticipated that header in advance.
-  \item \textbf{Protocol independence.} The switch should not be tied to particular packet formats. The controller/programmer should be able to specify a parser that extracts named, typed fields and a collection of typed match--action tables that operate on those fields.
-  \item \textbf{Target independence.} The programmer should describe the desired packet-processing behavior without depending on the underlying switch hardware. A compiler considers the target's capabilities when translating the P4 program into a target-specific configuration. The analogy in the paper is that a C programmer need not program directly for the internal details of a particular CPU.
+\item \key{Reconfigurability.} \key{The controller should be able to redefine the packet parsing and processing in the field}, i.e., programmers can change the way switches process packets once they are deployed.
+\item \key{Protocol independence.} \key{The switch should not be tied to specific packet formats} or network protocols. The controller should be able to \key{specify (i) a packet parser for extracting header fields with particular names and types, and (ii) a collection of typed match+action tables that process these headers}.
+\item \key{Target independence.} Just as a C programmer need not know the specifics of the CPU, the controller programmer should not need the details of the switch. \key{A compiler should take the switch's capabilities into account when turning a target-independent description (written in P4) into a target-dependent program} (used to configure the switch).
 \end{enumerate}
+The key challenge is a ``sweet spot'' balancing expressiveness against ease of implementation across many hardware and software switches.
 
-These goals require a balance between expressiveness and ease of implementation across different hardware and software switches. P4 is proposed as a ``sweet spot'': more flexible than fixed-function OpenFlow 1.0, but more constrained and easier to map to hardware than a fully general packet-processing environment such as Click.
-
-\subsection{OpenFlow's limitation and the need for a higher-level language}
-
-OpenFlow provides a common interface for populating forwarding tables, but its fixed parser and predefined match fields constrain which protocols the switch can recognize. Adding a new protocol repeatedly to the OpenFlow specification is not a scalable long-term approach. P4 instead allows the controller/programmer to describe the parser, the fields used by tables, and the processing/control flow between tables.
-
-The paper's comparison is important:
-\begin{itemize}
-  \item \textbf{OpenFlow 1.x:} a common interface, but a predetermined set of header fields and a small set of predefined actions.
-  \item \textbf{Click:} highly expressive and suitable for composing software packet-processing modules, but too unconstrained for easy inference of dependencies and mapping to dedicated hardware; it also does not directly provide the controller--switch table-population model described here.
-  \item \textbf{P4:} an imperative description of packet-processing logic designed to be translated into a table-dependency representation and then mapped to different switch targets.
-\end{itemize}
-
-\subsection{Abstract forwarding model}
-
-The abstract model processes an arriving packet through a \textbf{programmable parser} followed by multiple \textbf{match+action stages}. The stages may be arranged in series, in parallel, or as a combination of both. This generalizes the fixed sequence of stages assumed by the original OpenFlow model.
-
-The model distinguishes two operations:
-\begin{itemize}
-  \item \textbf{Configure:} program the parser, define the order/arrangement of match+action stages, and specify which header fields each stage processes. Configuration determines which protocols the switch supports and how it can process packets.
-  \item \textbf{Populate:} add or remove entries in the match+action tables already defined by configuration. Population determines the current policy applied to packets.
-\end{itemize}
-
-The paper treats configuration and population as separate phases and assumes that packet processing need not occur during configuration. However, implementations may support partial or full reconfiguration while continuing to forward packets, enabling upgrades without downtime. This configuration phase has little practical meaning for a fixed-function ASIC; in that case the compiler's task is mainly to check whether the chip can support the P4 program.
-
-\subsubsection{Parser}
-
-The parser examines packet headers, extracts their fields, and recognizes the sequence of headers. It therefore defines which protocols the switch can parse. The packet body is assumed to be buffered separately and is not available for matching in this model. The model does not assume any particular meaning for a header: once parsed, its fields are simply values on which match and action operations can work.
-
-\subsubsection{Ingress and egress match+action processing}
-
-After parsing, extracted fields are passed to match+action tables divided into ingress and egress processing.
-\begin{itemize}
-  \item \textbf{Ingress processing} can modify packet headers, select the egress port or ports, and select the output queue. Based on its result, a packet can be forwarded, replicated (for multicast, mirroring/span, or delivery to the control plane), dropped, or used to trigger flow control.
-  \item \textbf{Egress processing} can perform per-instance modifications to the packet header, such as changes that differ across multicast copies.
-\end{itemize}
-
-Action tables such as counters and policers can be associated with a flow to track state across packets. Queueing is modeled as in OpenFlow: an action maps a packet to a queue, while the queue's service discipline (for example, minimum rate or deficit round robin (DRR)) is chosen as part of switch configuration.
-
-\subsubsection{Metadata}
-
-Packets can carry \textbf{metadata} between processing stages. Metadata is treated like a packet-header field for matching and actions, but it need not change the parsed representation of the packet. Examples include:
-\begin{itemize}
-  \item ingress port;
-  \item transmit destination and queue;
-  \item a timestamp used for packet scheduling;
-  \item information passed from one table to another, such as a virtual-network identifier.
-\end{itemize}
-
-The paper also notes that action primitives could be extended for congestion-control protocols. For example, a switch could set the ECN bit under new conditions or implement a proprietary congestion-control mechanism with match+action tables; the detailed design of such primitives is outside the paper's scope.
-
-\subsection{Table dependencies and parallel execution}
-
-A packet-processing program must express dependencies between header fields and tables. A later table may depend on a field produced or modified by an earlier table, in which case those tables cannot safely execute in parallel. If two tables do not depend on each other's results, they may be eligible for parallel execution.
-
-For example, the paper states that an IP routing table and an ARP table require sequential execution because of a data dependency between them. These dependencies can be represented by a \textbf{Table Dependency Graph (TDG)}:
-\begin{itemize}
-  \item each TDG node corresponds to a match+action table;
-  \item edges represent dependencies induced by field inputs, actions, and control flow;
-  \item dependency analysis helps determine where tables can be placed in the target pipeline and which tables may run in parallel.
-\end{itemize}
-
-Most programmers naturally describe algorithms using imperative constructs rather than dependency graphs. P4 therefore lets programmers express control flow imperatively, then uses a compiler to derive the TDG for dependency analysis and hardware mapping.
-
-\subsection{Two-step compilation model}
-
-The proposed compilation process has two conceptual steps:
+\section{Abstract forwarding model}
+\paperfig[0.62]{p4_fig2_model}{The abstract forwarding model: a programmable parser, then ingress match+action stages, a buffer, and egress match+action stages. The switch configuration (parse graph, control program, table config, action set) is set by P4; the tables' forwarding rules are populated at run time.}
+In the abstract model, \key{switches forward packets via a programmable parser followed by multiple stages of match+action, arranged in series, parallel, or a combination of both}. Derived from OpenFlow, the model makes three generalizations:
 \begin{enumerate}
-  \item Translate the imperative P4 control program into an intermediate Table Dependency Graph (TDG), then analyze dependencies and opportunities for concurrency.
-  \item Map the TDG to a particular switch target, allocating its available resources and generating target-specific configuration.
+\item \key{OpenFlow assumes a fixed parser, whereas this model supports a programmable parser} so new headers can be defined.
+\item \key{OpenFlow assumes the match+action stages are in series, whereas here they can be in parallel or in series.}
+\item Actions are composed from protocol-independent primitives supported by the switch.
 \end{enumerate}
+The model generalizes packet processing across devices (Ethernet switches, load-balancers, routers) and technologies (fixed-function ASICs, NPUs, reconfigurable switches, software switches, FPGAs), so a common language can describe them and a compiler can map programs to each.
 
-The compiler thus separates the programmer's target-independent description from hardware-specific implementation decisions. The target may be a software switch, a multicore software switch, a network processor, a fixed-function switch ASIC, or a reconfigurable match-table pipeline.
+\subsection{Configure vs.\ populate}
+The \key{forwarding model is controlled by two types of operations: Configure and Populate}.
+\begin{itemize}
+\item \key{Configure} operations \key{program the parser, set the order of match+action stages, and specify the header fields processed by each stage}. Configuration \key{determines which protocols are supported and how the switch may process packets}.
+\item \key{Populate} operations \key{add (and remove) entries to the match+action tables that were specified during configuration}. Population \key{determines the policy applied} to packets at any given time.
+\end{itemize}
+The paper assumes the \key{switch need not process packets during configuration}, but expects \key{implementations to allow packet processing during partial or full reconfiguration, enabling upgrades with no downtime}; the model deliberately allows \key{reconfiguration that does not interrupt forwarding}. For fixed-function ASICs the configuration phase has little meaning: \key{the compiler's job is simply to check if the chip can support the P4 program}.
 
-\section{P4 language by example: the mTag design}
+\subsection{Parser, ingress and egress}
+\begin{itemize}
+\item Arriving packets are \key{first handled by the parser}. \key{The packet body is assumed to be buffered separately, and is unavailable for matching.} The \key{parser recognizes and extracts fields from the header}, which defines the protocols the switch supports. The model makes no assumption about what headers mean; \key{the parsed representation defines a collection of fields on which matching and actions operate}.
+\item The \key{extracted header fields are then passed to the match+action tables}, which are \key{divided between ingress and egress}. Both may modify the header.
+\item \key{Ingress match+action determines the egress port(s) and the queue} into which the packet is placed. \key{Based on ingress processing, the packet may be forwarded, replicated} (for multicast, span, or to the control plane), \key{dropped, or trigger flow control}.
+\item \key{Egress match+action performs per-instance modifications to the packet header} --- e.g., different for each multicast copy.
+\item Action tables (counters, policers, etc.) can be associated with a flow to track frame-to-frame state.
+\end{itemize}
 
+\subsection{Metadata and queueing}
+\begin{itemize}
+\item \key{Packets can carry additional information between stages, called \emph{metadata}}, treated just like packet-header fields. \key{Examples: the ingress port, the transmit destination and queue, a timestamp used for packet scheduling, and data passed from table to table that does not involve changing the parsed representation of the packet, such as a virtual network identifier.}
+\item Queueing works as in OpenFlow: \key{an action maps a packet to a queue, which is configured to receive a particular service discipline} (e.g., minimum rate, DRR), chosen as part of switch configuration.
+\item (Beyond scope:) primitives could be added for congestion control, e.g., setting the ECN bit under new conditions.
+\end{itemize}
+
+\section{Why a new language? Table dependencies}
+The language must say how the parser knows which header formats to expect (declare header types and legal header sequences) and how headers are processed (e.g., decrement and test TTL, add tunnel headers, compute checksums). This motivates an \emph{imperative control-flow program} over declared header types and a primitive set of actions.
+
+\textbf{Why not Click?} Click builds switches from modules of arbitrary C++. It is extremely expressive and good for CPU kernels, but \emph{insufficiently constrained}: it does not mirror the parse--match--action pipelines of hardware, is not designed for a controller--switch architecture with tables populated at run time by well-typed rules, and makes it hard to infer the dependencies that limit parallel execution.
+
+\paperfig[0.62]{p4_fig3_tdg}{Table dependency graph (TDG) for an L2/L3 switch: each node is a match+action table (its match fields and actions); edges show data and control dependencies (e.g., routing hit/miss).}
+\begin{itemize}
+\item \key{A packet-processing language must allow the programmer to express (implicitly or explicitly) any serial dependencies between header fields.} \key{Dependencies determine which tables can be executed in parallel.} For example, \key{sequential execution is required for an IP routing table and an ARP table} because of the data dependency between them.
+\item Dependencies are found by analysing \key{Table Dependency Graphs (TDGs)}; \key{these graphs describe the field inputs, actions and control flow between tables}. TDG nodes map directly to match+action tables, and dependency analysis tells where each table can sit in the pipeline.
+\item But programmers think imperatively, not in graphs. Hence a \key{two-step compilation process}: \key{at the highest level, programmers express packet processing} in an imperative language describing control flow (P4); \key{below this, a compiler translates the P4 representation to TDGs} for dependency analysis, and then maps the TDG to a specific target. P4 is designed \key{to make it easy to translate a P4 program into a TDG}.
+\end{itemize}
+\begin{keybox}[Sweet spot]
+P4 sits between the generality of Click (hard to infer dependencies and map to hardware) and the inflexibility of OpenFlow 1.0 (impossible to reconfigure protocol processing).
+\end{keybox}
+
+\section{P4 language by example: mTag}
 \subsection{Problem setting}
+An L2 data-centre network has top-of-rack (ToR) switches at the edge and a two-tier core. End-hosts are growing and \textbf{core L2 tables are overflowing}. MPLS would simplify the core, but a label-distribution protocol with multiple tags is daunting. PortLand needs MAC rewriting (breaking debugging tools) and new agents answering ARP.
 
-The motivating example is a Layer 2 network with top-of-rack (ToR) switches at the edge and a two-tier core. As the number of end hosts grows, the core's Layer 2 forwarding tables may overflow. MPLS could simplify core forwarding, but implementing a label-distribution protocol with multiple tags is considered daunting. PortLand is another option, but it requires rewriting MAC addresses—which may break existing network-debugging tools—and adding agents to respond to ARP requests.
+\textbf{mTag} combines PortLand's hierarchical routing with simple MPLS-like tags. Routes through the core are encoded in a \textbf{32-bit tag of four one-byte fields}; it can carry a ``source route'' or a destination locator (like PortLand's pseudo-MAC). \textbf{Each core switch examines only one byte} of the tag, chosen by its position in the hierarchy and the direction (up/down). The first ToR switch adds the tag (an end-host NIC could too).
 
-The paper proposes a small illustrative scheme called \textbf{mTag}, combining hierarchical routing similar to PortLand with simple MPLS-like tags. The example is intentionally simplified to explain P4, rather than to specify a complete production switch.
-
-\subsection{mTag representation and forwarding idea}
-
-The mTag is a 32-bit label consisting of four one-byte fields:
-\[
-\texttt{up1},\;\texttt{up2},\;\texttt{down1},\;\texttt{down2}.
-\]
-It can encode a source route or a destination locator (similar to PortLand's pseudo-MAC). Each core switch only needs to inspect one byte of the tag, chosen according to the switch's position in the hierarchy and the direction of travel (up or down). In the example, the first ToR switch adds the tag, although the end-host network interface card could add it instead.
-
-The purpose is to reduce the forwarding work required in the core: instead of looking up a full Layer 2 destination in a potentially large table, a core switch can forward using the relevant byte of the hierarchical tag.
-
-\subsection{The four main P4 program components}
-
-A P4 program describes four central components, together with the control program that connects their processing:
+\subsection{P4 concepts: the program components}
 \begin{itemize}
-  \item \textbf{Headers:} ordered fields, their widths, and constraints on field values.
-  \item \textbf{Parsers:} the valid headers and valid sequences of headers in a packet.
-  \item \textbf{Tables:} match+action tables, including the fields that may be matched and the actions that may be executed.
-  \item \textbf{Actions:} functions composed from protocol-independent primitive operations.
-  \item \textbf{Control program:} imperative logic that specifies the order in which tables are applied and the control flow between them.
+\item \key{Headers}: \key{a header definition describes the sequence and structure of a series of fields}, including field widths and constraints on values.
+\item \key{Parsers}: \key{a parser definition specifies how to identify headers} and valid header sequences in packets.
+\item \key{Tables}: \key{match+action tables} are the mechanism for processing; the program defines the fields a table may match and the actions it may execute.
+\item \key{Actions}: \key{P4 supports construction of complex actions from simpler protocol-independent primitives}; these are available inside tables.
+\item \key{Control programs}: \key{the control program determines the order of match+action tables applied to a packet} --- a simple imperative program describing control flow between tables.
 \end{itemize}
 
-\subsection{Header format declarations}
+\subsection{Header formats}
+Each header is an ordered list of field names with widths (optionally constrained). The mTag header is added without changing existing declarations; its field names show two aggregation layers in each direction.
+\begin{lstlisting}
+header ethernet {
+  fields {
+    dst_addr : 48;  // width in bits
+    src_addr : 48;
+    ethertype : 16;
+  }
+}
+header vlan {
+  fields { pcp : 3; cfi : 1; vid : 12; ethertype : 16; }
+}
+header mTag {
+  fields {
+    up1 : 8; up2 : 8; down1 : 8; down2 : 8;
+    ethertype : 16;
+  }
+}
+\end{lstlisting}
 
-A header is defined by an ordered list of field names and their bit widths. Optional annotations can impose constraints on values or on the maximum lengths of variable-sized fields. The paper gives Ethernet and VLAN as examples:
+\subsection{The packet parser}
+P4 assumes the switch can implement a \emph{state machine} that walks headers from start to finish, extracting field values; transitions are chosen by values in the current header. \key{Upon reaching a state for a new header, the state machine extracts the header using its specification and proceeds to identify its next transition.} \key{The extracted headers are forwarded to match+action processing in the back half of the pipeline.}
+\begin{lstlisting}
+parser start { ethernet; }
+parser ethernet {
+  switch(ethertype) {
+    case 0x8100: vlan;
+    case 0x9100: vlan;
+    case 0x800:  ipv4;
+    // Other cases
+  }
+}
+parser vlan {
+  switch(ethertype) {
+    case 0xaaaa: mTag;
+    case 0x800:  ipv4;
+  }
+}
+parser mTag {
+  switch(ethertype) { case 0x800: ipv4; }
+}
+\end{lstlisting}
+Parsing starts at \texttt{start} and ends at an explicit stop state or an unhandled case (possibly an error). This parser has four states; real parsers can have over a hundred.
+
+\subsection{Table specification}
+\key{The programmer describes how the defined header fields are to be matched} (\key{exact, ranges, or wildcards?}) and \key{what actions should be performed when a match occurs}. The edge switch matches the L2 destination and VLAN ID and selects an mTag to add:
+\begin{lstlisting}
+table mTag_table {
+  reads {
+    ethernet.dst_addr : exact;
+    vlan.vid : exact;
+  }
+  actions {
+    // At runtime, entries are programmed with params for the mTag action
+    add_mTag;
+  }
+  max_size : 20000;
+}
+\end{lstlisting}
+\texttt{reads} lists match fields and match types; \texttt{actions} lists possible actions; \texttt{max\_size} the number of entries. This lets the compiler decide how much memory, and which type (TCAM or SRAM), the table needs. Other tables used by the control program:
 \begin{itemize}
-  \item Ethernet: destination address (48 bits), source address (48 bits), and EtherType (16 bits).
-  \item VLAN: PCP (3 bits), CFI (1 bit), VLAN ID (12 bits), and EtherType (16 bits).
+\item \texttt{source\_check}: reads whether an mTag was parsed and \texttt{metadata.ingress\_port}; actions \texttt{fault\_to\_cpu} (inappropriate mTag), \texttt{strip\_mtag} (strip and record in metadata), or \texttt{pass}. One rule per port (\texttt{max\_size 64}).
+\item \texttt{local\_switching}: checks whether the destination is local; on a miss, go to the mTag table.
+\item \texttt{egress\_check}: verifies egress is resolved; does not retag packets received with a tag.
 \end{itemize}
 
-The mTag header can be added without changing the existing Ethernet/VLAN declarations. It contains four 8-bit fields (\texttt{up1}, \texttt{up2}, \texttt{down1}, \texttt{down2}) and a 16-bit EtherType. The field names communicate the two aggregation levels and the up/down forwarding directions.
+\subsection{Action specifications}
+P4 programs declare action functions built from primitives. P4 \textbf{assumes parallel execution of primitives within an action function} (switches that cannot may emulate this). Parameters (e.g., \texttt{up1}) are supplied by the matching table entry at run time.
+\begin{lstlisting}
+action add_mTag(up1, up2, down1, down2, egr_spec) {
+  add_header(mTag);
+  // Copy VLAN ethertype to mTag
+  copy_field(mTag.ethertype, vlan.ethertype);
+  // Set VLAN's ethertype to signal mTag
+  set_field(vlan.ethertype, 0xaaaa);
+  set_field(mTag.up1, up1);
+  set_field(mTag.up2, up2);
+  set_field(mTag.down1, down1);
+  set_field(mTag.down2, down2);
+  // Set the destination egress port as well
+  set_field(metadata.egress_spec, egr_spec);
+}
+\end{lstlisting}
+So the switch inserts the mTag after the VLAN tag, copies the VLAN EtherType into the mTag (to say what follows), and sets the VLAN EtherType to \texttt{0xaaaa} to signal an mTag. The inverse (strip) action is not shown.
 
-\subsection{Programmable packet parser}
-
-P4 assumes the target can implement a state machine that traverses packet headers, extracts field values, and selects the next state. The parser is expressed as transitions from one header to the next; a transition may be selected based on a field value in the current header.
-
-In the mTag example, parsing begins at the start state and extracts Ethernet. The Ethernet EtherType determines whether the next header is VLAN, IPv4, or another supported case. The VLAN EtherType can indicate mTag (\texttt{0xaaaa}) or IPv4 (\texttt{0x800}); after mTag, the EtherType can again indicate IPv4. Parsing ends at an explicit stop state or when an unhandled case is encountered (which may be treated as an error).
-
-The extracted headers are then passed to the match+action pipeline. The example parser has only four states, whereas real-world parsers can require many more; the paper notes that one previously described parser expands to over one hundred states.
-
-\subsection{Match+action table specification}
-
-The programmer specifies:
+\textbf{Primitive actions:}
 \begin{itemize}
-  \item which header fields a table reads;
-  \item the matching type for each field (for example, exact, range, or wildcard/ternary matching);
-  \item the actions that may be selected when an entry matches;
-  \item the maximum number of entries the table must support.
+\item \texttt{set\_field} --- set a header field to a value (masked sets supported);
+\item \texttt{copy\_field} --- copy one field to another;
+\item \texttt{add\_header} --- make a header instance (and all its fields) valid;
+\item \texttt{remove\_header} --- delete (``pop'') a header and its fields;
+\item \texttt{increment} --- increment or decrement a field;
+\item \texttt{checksum} --- compute a checksum over some header fields (e.g., IPv4).
 \end{itemize}
+Most switches will only allow header modifications consistent with the declared packet format.
 
-In the example, the edge switch matches the Layer 2 destination address and VLAN ID, then selects an mTag to insert. The table's \texttt{reads} attribute declares the match fields and their match types; its \texttt{actions} attribute declares the permitted actions; and \texttt{max\_size} states the required capacity. This information helps the compiler determine the amount and type of memory needed, such as TCAM or SRAM.
-
-The paper's example mTag table has a maximum size of 20,000 entries. Other tables are used to check the source port, perform local switching, and validate the egress state. The source-check table verifies that an mTag is seen only on appropriate ports connected to core switches; an inappropriate mTag can be sent to the CPU, while a valid one is stripped and recorded in metadata. The local-switching table checks whether the destination is a locally connected host; if it misses, processing proceeds to the mTag table. The egress-check table checks that egress resolution is valid and prevents inappropriate retagging.
-
-\subsection{Primitive and compound actions}
-
-P4 provides primitive actions from which more complex action functions are constructed. The paper expects primitives within an action function to execute in parallel; a switch that cannot do so may emulate the same semantics.
-
-The example \texttt{add\_mTag} action performs the following operations:
+\subsection{The control program}
+\key{Once tables and actions are defined, the only remaining task is to specify the flow of control from one table to the next}, using functions, conditionals and table references.
+\paperfig[0.55]{p4_fig4_mtag_flow}{Control flow for the mTag example on an edge switch.}
+\begin{lstlisting}
+control main() {
+  // Verify mTag state and port are consistent
+  table(source_check);
+  // If no error from source_check, continue
+  if (!defined(metadata.ingress_error)) {
+    // Attempt to switch to end hosts
+    table(local_switching);
+    if (!defined(metadata.egress_spec)) {
+      // Not a known local host; try mtagging
+      table(mTag_table);
+    }
+    // Check for unknown egress state or bad retagging with mTag
+    table(egress_check);
+  }
+}
+\end{lstlisting}
 \begin{enumerate}
-  \item Add an mTag header instance.
-  \item Copy the VLAN header's EtherType into the new mTag's EtherType so that the encapsulated protocol is preserved.
-  \item Set the VLAN EtherType to \texttt{0xaaaa}, marking that an mTag follows.
-  \item Write the runtime parameters into \texttt{up1}, \texttt{up2}, \texttt{down1}, and \texttt{down2}.
-  \item Set the metadata egress specification to the selected output port.
+\item \textbf{Source check:} verifies the packet is consistent with the ingress port (mTags should only appear on ports to core switches); strips an mTag and records in \emph{metadata} that the packet had one, so later tables avoid retagging.
+\item \textbf{Local switching:} a miss means the destination is not a locally connected host\ldots
+\item \ldots so the \textbf{mTag table} is applied to add the tag for the core.
+\item \textbf{Egress check:} handles both local and core forwarding; an unknown destination triggers a notification up the SDN control stack.
 \end{enumerate}
-
-The switch therefore inserts mTag after the VLAN header. The VLAN EtherType identifies the mTag, and the mTag EtherType records the protocol that follows it. The paper notes that the inverse operation—removing an mTag—and the table that invokes it on edge switches are not shown in full.
-
-The primitive actions listed are:
-\begin{itemize}
-  \item \textbf{set field:} assign a value to a header field; masked sets are supported;
-  \item \textbf{copy field:} copy one field into another;
-  \item \textbf{add header:} make a header instance and its fields valid;
-  \item \textbf{remove header:} pop a header and its fields from the packet;
-  \item \textbf{increment:} increment or decrement a field;
-  \item \textbf{checksum:} compute a checksum over selected header fields, such as an IPv4 checksum.
-\end{itemize}
-
-Switch implementations are expected to restrict action processing so that header modifications remain consistent with the declared packet format.
-
-\subsection{Control program and mTag processing sequence}
-
-The control program specifies the flow from one table to the next using functions, conditionals, and table references. The example's logical sequence is:
-\begin{enumerate}
-  \item \textbf{Source check:} check consistency between the received packet and ingress port. An mTag should appear only on a port connected to a core switch. If an mTag is present, strip it and record that fact in metadata.
-  \item \textbf{Local switching:} attempt to deliver the packet to a locally connected end host.
-  \item \textbf{mTag table:} if local switching does not resolve an egress port, select/apply an mTag for core forwarding.
-  \item \textbf{Egress check:} verify that the egress state is resolved and that the packet has not been incorrectly retagged. An unknown egress can trigger a notification to the SDN control stack.
-\end{enumerate}
-
-Metadata is important here: it records information such as whether the incoming packet carried an mTag and whether the ingress check found an error. Later tables can use this information to avoid retagging packets that should not be retagged.
 
 \section{Compiling a P4 program}
-
-The compiler maps the target-independent P4 description to the target switch's hardware or software, allocates resources, and generates device configuration. The compilation strategy differs according to the target's capabilities.
+For a network to run a P4 program, \key{we need a compiler to map the target-independent description onto the target switch's specific hardware or software platform}, allocating resources and generating device configuration.
 
 \subsection{Compiling packet parsers}
+For programmable parsers, \key{the compiler translates the parser description into a parsing state machine}; \key{for fixed parsers, the compiler merely verifies that the parser description is consistent with the target's parser}. Each state-table entry gives the current state, the value to match, and the next state:
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Current state} & \textbf{Lookup value} & \textbf{Next state} \\
+\midrule
+vlan & 0xaaaa & mTag \\
+vlan & 0x800 & ipv4 \\
+vlan & * & stop \\
+mTag & 0x800 & ipv4 \\
+mTag & * & stop \\
+\bottomrule
+\end{tabular}
+\end{center}
 
-For a switch with a programmable parser, the compiler translates the parser description into a parsing state machine. For a fixed-parser switch, the compiler checks whether the requested parser is consistent with the parser the target already implements. A parser state-table entry specifies the current state, the field value being matched, and the next state. For example, in the mTag parser, VLAN EtherType \texttt{0xaaaa} transitions to the mTag state, while EtherType \texttt{0x800} transitions to IPv4; other values can lead to a stop state.
-
-\subsection{Compiling control programs and table dependencies}
-
-An imperative control-flow program is convenient for describing the intended logical behavior, but does not explicitly expose all table dependencies or parallelization opportunities. The compiler analyzes the program, identifies dependencies, constructs a TDG, and then maps that graph to the target's resources. This is the same two-step process introduced earlier: P4 program $\rightarrow$ TDG and dependency analysis $\rightarrow$ target-specific configuration.
-
-The paper discusses several target cases:
+\subsection{Compiling control programs}
+The imperative control flow is convenient but does not expose dependencies or concurrency. So \key{the compiler analyses the control program to identify dependencies and look for opportunities to process header fields in parallel}, and \key{finally generates the target configuration for the switch}. It follows the \key{two-stage} process: \key{it first converts the P4 control program into an intermediate table dependency graph, which it analyses to determine dependencies between tables. A target-specific back-end then maps this graph onto the switch's specific resources.} Targets include software switches, multicore software switches, NPUs, fixed-function switches and RMT pipelines. How mTag maps to each:
 \begin{itemize}
-  \item \textbf{Software switches:} parsing, number of tables, and table configuration are controlled by software, so the compiler can map the mTag table graph directly to software tables. Table type information constrains table width, height, and matching criteria (exact, prefix, or wildcard); software data structures can optimize ternary or prefix matching.
-  \item \textbf{Hardware switches with RAM and TCAM:} RAM and hashing can implement efficient exact matching, such as the edge mTag table. A core table that matches only a subset of tag bits can be mapped to TCAM.
-  \item \textbf{Switches with parallel tables:} dependency analysis can place independent tables in parallel and dependent tables in series. In the example, local switching and the mTag table may execute in parallel until the action that sets the mTag is reached.
-  \item \textbf{Switches that apply actions at the end of the pipeline:} intermediate stages can record intended modifications in metadata, and the final stage performs the actual writes. Metadata can indicate whether the mTag should be added or removed.
-  \item \textbf{Switches with few physical tables:} the compiler can combine multiple logical P4 tables into fewer physical tables. For example, local switching and mTag lookup may be combined. When rules are installed at runtime, a rule translator can compose rules from the two logical tables into entries for one physical table.
+\item \textbf{Software switches:} full flexibility; the compiler maps the mTag table graph directly to switch tables, using table types to constrain widths, heights and match kind (exact/prefix/wildcard), possibly with software data structures for ternary/prefix matching.
+\item \textbf{Hardware with RAM and TCAM:} hashing in RAM for exact matching (the edge mTag table); the core mTag table, which matches a subset of tag bits, goes in TCAM.
+\item \textbf{Switches with parallel tables:} the compiler detects dependencies and places tables in parallel or series; \texttt{mTag\_table} and \texttt{local\_switching} can run in parallel up to the action that sets the mTag.
+\item \textbf{Switches that apply actions only at the end of the pipeline:} intermediate stages produce metadata used for the final writes (e.g., whether to add or remove the mTag).
+\item \textbf{Switches with few tables:} many P4 tables map onto fewer physical tables (e.g., merge local switching with the mTag table); at run time the compiler's \emph{rule translator} composes the rules of the two logical tables into rules for the single physical table.
 \end{itemize}
 
-These cases illustrate target independence: the P4 program states the desired behavior, while the compiler adapts the implementation to the resources and execution model of the chosen switch.
+\section{Conclusion}
+OpenFlow gives a single vendor-agnostic API, but targets fixed-function switches with a predetermined set of header fields and actions. P4 is a first step toward switches whose functionality is specified, and may be changed, in the field: the programmer decides how the forwarding plane processes packets, and a compiler turns the imperative program into a TDG mappable to many targets. It is a strawman for \textbf{OpenFlow 2.0}; congestion-control primitives, queuing disciplines and traffic monitoring remain undefined.
 
-\section{Conclusion and key distinctions}
-
-The paper presents P4 as a first-step proposal for more flexible switches and as a possible direction for an ``OpenFlow 2.0''-style interface. Its central argument is that a control plane should be able to describe how packets are parsed and processed, rather than being limited to a fixed set of header fields and predefined actions. A compiler can translate that description into a TDG, analyze dependencies, and map the result onto different switch targets, including optimized hardware.
-
-The authors explicitly describe the work as a strawman proposal intended to contribute to discussion. Several aspects remain undefined in the proposal, including congestion-control primitives, queueing disciplines, and traffic monitoring. The proposed approach is a configuration language plus compilers that generate low-level target-specific configurations.
-
-\subsection{Revision checklist}
-
+\section{Revision checklist}
 \begin{itemize}
-  \item \textbf{P4 is not simply a replacement for OpenFlow.} P4 describes/configures packet parsing and processing; an SDN control protocol such as OpenFlow can still populate the resulting forwarding tables.
-  \item \textbf{Configure versus populate:} configuration defines the parser and table structure; population installs/removes entries that determine current policy.
-  \item \textbf{Protocol independence versus target independence:} protocol independence allows new packet formats and named fields; target independence lets the same logical program be compiled for different hardware/software targets.
-  \item \textbf{Parser versus match+action tables:} the parser extracts fields and determines the recognized header sequence; tables match those fields and execute actions.
-  \item \textbf{Ingress versus egress:} ingress chooses forwarding/replication/drop/queue behavior; egress performs per-instance packet modifications.
-  \item \textbf{P4 control flow versus TDG:} the programmer writes imperative control logic; the compiler derives a graph of dependencies to expose safe parallelism and guide placement.
-  \item \textbf{mTag motivation:} hierarchical four-byte label fields let core switches forward using a relevant tag byte, reducing dependence on large Layer 2 destination tables.
-  \item \textbf{Why a compiler matters:} different targets have different parsers, memories, pipeline structures, table counts, and action timing; the compiler adapts one target-independent description to those constraints.
+\item \textbf{P4 vs.\ OpenFlow:} P4 \emph{configures} the switch (parser, tables, control flow); OpenFlow-style APIs \emph{populate} tables. P4 works with OpenFlow, not instead of it.
+\item \textbf{Goals:} reconfigurability (in the field), protocol independence (parser + typed tables), target independence (compiler).
+\item \textbf{Model vs.\ OpenFlow:} programmable (not fixed) parser; stages in series \emph{or parallel}; protocol-independent primitives.
+\item \textbf{Ingress} decides egress port(s) and queue (forward, replicate, drop, flow control); \textbf{egress} does per-instance header changes.
+\item \textbf{Metadata:} ingress port, destination/queue, timestamp, table-to-table data (e.g., virtual network ID).
+\item \textbf{TDG:} nodes = tables, edges = field/action/control dependencies; decides parallelism (routing $\rightarrow$ ARP must be sequential).
+\item \textbf{Program parts:} headers, parsers, tables (\texttt{reads}/\texttt{actions}/\texttt{max\_size}), actions (primitives in parallel), control program.
+\item \textbf{mTag:} 32-bit, four 1-byte fields; VLAN EtherType \texttt{0xaaaa} signals mTag; each core switch reads one byte.
+\item \textbf{Compiler:} parser $\rightarrow$ state machine (or check vs.\ fixed parser); control program $\rightarrow$ TDG $\rightarrow$ target back-end (RAM/TCAM placement, parallel tables, end-of-pipeline actions via metadata, table merging via rule translator).
 \end{itemize}

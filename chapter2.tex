@@ -1,337 +1,230 @@
-\section{A Clean-Slate 4D Approach to Network Control and Management}
+\chapter{A Clean Slate 4D Approach to Network Control and Management}
+\paperinfo{A. Greenberg, G. Hjalmtysson, D. A. Maltz, A. Myers, J. Rexford, G. Xie, H. Yan, J. Zhan, H. Zhang}{ACM SIGCOMM CCR, Vol.\ 35 No.\ 5, October 2005}
 
-\subsection{Motivation: Why Network Control Must Be Reconsidered}
+\begin{keybox}[4D in one paragraph]
+Today's networks are fragile because of the \key{complexity of the control and management planes}: decision logic is tangled up with the distributed protocols that coordinate routers. 4D is an \emph{extreme design point} that completely \key{separates an AS's decision logic from the protocols governing interaction among network elements}. Network-level objectives are specified in the \key{decision plane} and enforced by \key{direct configuration} of data-plane state; routers and switches simply forward packets at the behest of the decision plane and collect measurements for it. The name comes from its \key{four planes: decision, dissemination, discovery, data}. The packet format does not change.
+\end{keybox}
+\marginnote{4D's = the four planes: decision, dissemination, discovery, data.}
 
-Modern IP networks are fragile and difficult to manage. A small local event, such as a routing-protocol misconfiguration on one interface, can have a severe network-wide effect and trigger a cascading failure. Networks must also satisfy objectives that go beyond best-effort packet delivery, including traffic engineering, survivability, security, and policy enforcement.
-
-The authors identify a fundamental source of complexity: decision logic is intertwined with the distributed protocols that coordinate network elements. Routing protocols such as OSPF, IS-IS, and EIGRP determine both how routers learn topology and how they choose paths. Ethernet similarly embeds path computation in Spanning Tree Protocol. Management software then attempts to coax these protocols into satisfying higher-level goals, often through complicated device-specific configuration.
-
-The paper advocates a \emph{clean-slate} redesign: refactor network-control functionality while leaving the packet format unchanged. The authors present 4D as an intentionally extreme design point, not as a proven final solution. Its purpose is to expose the architectural trade-offs and research questions.
-
-\subsection{Limitations of Today's Control and Management}
-
-Today's network functionality is conventionally divided into:
+\section{Motivation: why rethink network control?}
 \begin{itemize}
-    \item \textbf{Data plane:} handles individual packets using configured forwarding and packet-processing state.
-    \item \textbf{Control plane:} runs distributed algorithms and protocols, such as routing protocols, to determine forwarding behavior.
-    \item \textbf{Management plane:} monitors the network and configures data-plane mechanisms and control-plane protocols.
+\item IP networks behave like unstable complex systems: a small local event (e.g., a misconfigured routing protocol on one interface) can cause a severe, network-wide cascading failure.
+\item ASes spend a lot of effort ``working around'' protocol constraints to meet goals for traffic engineering, survivability, security and policy.
+\item Root cause: the Internet bundles control logic and packet handling into each router. Routing protocols such as OSPF, IS-IS and EIGRP decide \emph{both} how routers learn the topology \emph{and} how they select paths. In Ethernet, path computation is embedded in Spanning Tree Protocol. Management software then tries to ``coax'' these protocols into meeting high-level goals.
+\item The authors argue for a \key{clean-slate} redesign of control and management, without changing the data-packet format (just as Ethernet evolved from shared medium to switched without changing its frames). 4D is presented as an extreme point to expose trade-offs, not as a proven best design.
 \end{itemize}
 
-This division has become much more complex than the original model of a single distributed algorithm maintaining forwarding tables. Data planes now support forwarding, tunneling, access control, address translation, and queuing. Several entities and routing processes may affect the state on a single device. Dependencies between these states are often not maintained automatically.
-
-Consequently, a configuration change in one place can break another function. The management plane must often replicate the state and logic of the control plane and infer how protocol behavior will change. It therefore operates indirectly and can become unsynchronized with real-time routing behavior.
-
-There is also a bootstrapping problem: packet delivery may not begin until routing protocols establish forwarding tables, while management access may itself depend on those routes. Operators therefore preconfigure routers extensively before deployment. Production configurations can contain hundreds of thousands of low-level commands, supported by ad hoc scripts and systems to validate, monitor, and update them. This creates a complex, failure-prone environment.
-
-\subsection{Examples of Fragility in Existing Networks}
-
-\subsubsection{Reachability control in enterprise networks}
-
-Consider an enterprise with two locations, A and B. Each location has a front office and a data centre. The policy permits front-office computers to communicate with front-office computers at the other location and with their local data centre, but prohibits access to the remote data centre.
-
-The policy is implemented using packet filters at data-centre entrances. Suppose interface \(i_{1.1}\) drops packets from the B-front-office subnet and interface \(i_{3.1}\) drops packets from the A-front-office subnet. Initially, routing and filtering jointly enforce the policy.
-
-Now a new high-capacity link is added between the data centres, for example to provide remote backup. Routing changes, and traffic from the A front office to the B data centre can travel
-\[
-R_2 \rightarrow R_1 \rightarrow R_3 \rightarrow \text{B data centre},
-\]
-bypassing the filter on \(i_{3.1}\). The security policy is violated even though the original filter has not changed.
-
-A typical repair is to copy the filter to interface \(i_{3.2}\). This closes the security hole, but creates another failure mode: if the direct front-office link \(R_2\)--\(R_4\) fails, A-front-office traffic to B's front office may take the alternate path through \(R_1\) and \(R_3\), only to be dropped by the new filter. Thus, a repair to security can unnecessarily break valid reachability.
-
-\textbf{Key lesson:} routing adapts automatically to topology changes, but packet filters and other state do not automatically adapt with it. Better filter placement or multidimensional filters may help in small networks, but finding and maintaining optimal placements becomes difficult as the network grows. Separate management tools continually trying to model routing behavior are liable to remain out of sync.
-
-The 4D approach instead permits an explicit \emph{reachability matrix} and automated, coordinated installation of forwarding-table entries and packet filters based on current network state.
-
-\subsubsection{Peering policy in transit networks}
-
-A routing policy may say that AS1 advertises a route to destination \(d\) to AS2 but does not advertise it to AS3, because AS1 does not agree to provide transit service to AS3 for \(d\). However, withholding a route announcement does not prevent AS3 from sending packets for \(d\) to AS1's border router. That router may have a valid route to \(d\) for legitimate AS2 traffic, so the packets can still be delivered.
-
-Enforcing the policy requires packet filters that drop packets for destinations not announced as reachable to the relevant peer. As routes and topology change, filters must change accordingly. These updates must be correctly ordered with BGP announcements: announcing reachability before removing a blocking filter can cause valid traffic to be dropped. Transit networks also handle many destinations, so filters consume limited forwarding resources. It may be preferable to place filters deeper in the network so that one filter can enforce policy for multiple ingress interfaces.
-
-Correct placement requires both complete routing-topology information and synchronization between filter updates and route announcements. The 4D architecture is intended to provide abstractions and primitives for coordinated, optimized filter placement.
-
-\subsection{Three Design Principles}
-
-\subsubsection{Network-level objectives}
-
-The network should be configured by specifying its desired performance, reliability, and policy goals, rather than by translating every goal manually into low-level commands on individual routers.
-
-Examples:
+\section{Control and management today}
+Today's functionality is split into three planes:
 \begin{itemize}
-    \item Traffic engineering: keep all links below \(70\%\) utilization, even under any single-link failure.
-    \item Reachability/security: do not allow hosts in subnet B to access accounting servers in subnet A.
+\item \key{Data plane}: handles individual data packets.
+\item \key{Control plane}: implements the distributed routing algorithms across the network elements.
+\item \key{Management plane}: monitors the network and configures the data-plane mechanisms and control-plane protocols.
+\end{itemize}
+The original IP control plane had one distributed algorithm maintaining one forwarding table. Today the \key{data plane needs to implement}, besides next-hop forwarding, \key{tunneling, access control, address translation and queuing}. These states are governed by many entities and configured through many interacting commands, and the dependencies between them are \emph{not} maintained automatically. A change in one part of the configuration can easily break another.
+
+\textbf{The bootstrapping catch-22.} \key{Packet delivery cannot start until the routing protocols create the forwarding tables}, and \key{the management plane cannot reach the control plane until the routing protocols are configured}. So routers need a large amount of configuration before deployment: production networks carry hundreds of thousands of lines of low-level configuration, supported by ad hoc scripts to validate, monitor and update them. The result is complex and failure-prone.
+
+\section{Examples of fragility}
+\subsection{Reachability control in an enterprise}
+\paperfig[0.55]{4d_fig1_enterprise}{Enterprise network with two locations, each with a front office (AF, BF) and a data centre (AD, BD). Link labels are IGP metrics.}
+\begin{itemize}
+\item Policy: front-office computers may talk to the other location's front office and to their \emph{local} data centre, but not to the \emph{remote} data centre. It is enforced with packet filters at the data-centre entrances: $i_{1.1}$ drops packets from the B front office, $i_{3.1}$ drops packets from the A front office. Initially routing and filtering together enforce the policy.
+\item A new high-capacity link is added between the two data centres (e.g., for backup). Routing now sends A-front-office traffic to the B data centre along $R_2\to R_1\to R_3$, \emph{bypassing} the filter on $i_{3.1}$. The policy is violated although no filter changed.
+\item The usual fix --- copy the filter to $i_{3.2}$ --- creates a new failure: if link $R_2$--$R_4$ fails, legitimate front-office-to-front-office traffic reroutes via $R_1$, $R_3$ and is dropped by the new filter.
+\end{itemize}
+\textbf{Lesson:} routing adapts automatically to topology changes, but packet filters (and other state) do not adapt with it. Management tools that keep trying to model routing behaviour fall out of sync. 4D instead lets an operator state a \key{reachability matrix} directly, and installs forwarding entries and filters together, in a coordinated way, from the current network state.
+
+\subsection{Peering policy in transit networks}
+\paperfig[0.4]{4d_fig2_peering}{ASes peering via eBGP. AS1 must place packet filters on its ingress links to stop AS3 from sending packets to destinations for which AS1 has not agreed to provide transit.}
+AS1 announces destination $d$ to AS2 but not to AS3 (no transit for AS3). Withholding the announcement does not stop AS3 from sending packets for $d$ anyway; AS1's border router has a valid route for $d$ and delivers them. Enforcing the policy needs packet filters on ingress links, which must change whenever routes change and be \emph{ordered} correctly with BGP announcements (announcing before removing a filter drops valid traffic). Filters also use scarce forwarding resources, so it may be better to place them deeper in the network. Correct placement needs both full topology information and synchronization with route announcements; 4D aims to provide the primitives for this.
+
+\section{The 4D architecture}
+4D proposes a \key{clean-slate repartitioning of functionality} --- an \key{extreme design point that completely separates the decision logic from the underlying protocols}.
+
+\subsection{Three design principles}
+\paragraph{Network-level objectives.} \key{Each network should be configured via specification of the requirements and goals for its performance}, stated independently of the network elements. Examples:
+\begin{itemize}
+\item Traffic engineering: ``keep all links below 70\% utilization, even under single-link failures.''
+\item Reachability policy: ``do not allow hosts in subnet B to access the accounting servers in subnet A.''
+\end{itemize}
+Today these must be translated by hand into low-level commands on individual routers, inviting semantic mistakes.
+
+\paragraph{Network-wide views.} Borrowed from databases: a network-wide view means \key{having assembled a coherent snapshot of the state of each network component}. It must be timely and accurate, \key{reflect the current state of the data plane}, and include information about each device (name, resource limits, physical attributes). Today's control plane was \emph{not} designed to provide this, forcing substantial retro-fitting. Providing the information for a complete, consistent network-wide view should be \key{one of the primary functions of the routers and switches}.
+\marginnote{Know about the data plane! Earlier applications used some \emph{jugaad} (workaround) to obtain this information.}
+
+\paragraph{Direct control.} The control and management system should have \key{both the ability and the sole responsibility for setting all the state in the data plane} that directs packet forwarding. \key{Decision logic should not be hardwired in protocols} distributed among routers; \key{only the output of the decision logic} should be sent to the network elements.
+\begin{itemize}
+\item Meeting network-level objectives is much easier with direct control over data-plane configuration.
+\item Because distributed control protocols are hard to extend for goals like traffic engineering or reachability control, today the \emph{management plane} implements these capabilities. With only indirect influence, it must \key{replicate the state and logic of the control plane} and perform a complex ``inversion'' of its behaviour. It would be far simpler if the management plane could just compute the forwarding tables and install them.
+\item For direct control to be meaningful it must be \emph{complete}: if other entities or commands can also change the same state, more machinery is needed to audit and correct it.
+\end{itemize}
+\marginnote{The state in the data plane is provided by the control and management planes. But this direct configuration (today) is not flexible; hence this configuration set-up is handled by the management plane!}
+
+\subsection{The four planes}
+\paperfig[0.42]{4d_fig3_arch}{The 4D architecture: network-level objectives enter at the decision plane, network-wide views flow up, and direct control flows down.}
+In 4D all control and management decisions are made in a logically centralized way by servers with complete control over the network elements. \key{Routers and switches only run network-discovery protocols and accept explicit instructions} that control the data plane, so devices become auto-configurable.
+
+\paragraph{Decision plane.} \key{Makes all decisions driving network control}: reachability, load balancing, access control, security and interface configuration. Replacing today's management plane, it operates \key{in real time on a network-wide view} of the topology, the traffic, and the capabilities and resource limits of the routers. It \key{uses algorithms to turn network-level objectives} (reachability matrix, load-balancing goals, survivability requirements) \key{directly into the packet-handling state} to be configured into the data plane (forwarding entries, packet filters, queuing parameters). It consists of several servers called \key{decision elements (DEs)}.
+\marginnote{The decision plane replaced the management plane!}
+
+\paragraph{Dissemination plane.} Provides a \key{robust and efficient communication substrate connecting routers/switches with decision elements}. Control information may traverse the same physical links as data packets, but \key{dissemination paths are maintained separately from data paths}, so they work without first establishing data-plane paths (today, control and management traffic rides on paths that routing must set up first). The dissemination plane \key{moves management information created by the decision plane to the data plane, and state identified by the discovery plane to the decision plane}, but \emph{does not create state itself}.
+\marginnote{Decision plane $\rightarrow$ data plane, and discovery plane $\rightarrow$ decision plane: the dissemination plane is the carrier in both directions.}
+
+\paragraph{Discovery plane.} Responsible for \key{discovering the physical components in the network and creating logical identifiers} for them. It defines the scope and persistence of identifiers and carries out \key{automatic discovery} of relationships:
+\begin{itemize}
+\item \textbf{box-level discovery} --- what interfaces are on this router? how many FIB entries can it hold?
+\item \textbf{neighbour discovery} --- what other routers does this interface connect to?
+\item \textbf{lower-layer link discovery} --- what is the capacity of the interface?
+\end{itemize}
+The decision plane uses this to build network-wide views. In today's IP networks the only automatic mechanism is neighbour discovery between two preconfigured, adjacent IP interfaces; everything else comes from configuration commands and external inventory databases.
+\marginnote{This information is used by the decision plane to construct network-wide views!}
+
+\paragraph{Data plane.} \key{Handles individual packets} based on \key{state that is output by the decision plane}. This state includes the \key{forwarding table, packet filters, link-scheduling weights, queue-management parameters, tunnels and network address translation} mappings. The data plane may also provide fine-grained support for \key{collecting measurements on behalf of the discovery plane}.
+\marginnote{The data plane may also support the discovery plane (measurements).}
+
+\paragraph{How the planes fit together.} The decision plane operates on a network-wide view of topology and traffic, built with the help of the discovery plane, to satisfy network-level objectives. It has direct control over the data plane, so there is no need to model and invert the actions of the control plane. \key{Pulling much of the control state and logic out of the routers} allows both simpler protocols (which no longer embed decision logic) and more powerful decision algorithms.
+
+\section{Advantages of 4D}
+\begin{itemize}
+\item \key{Separate networking logic from distributed-systems issues.} 4D cannot remove all distributed protocols (devices are spread out in space). Instead it \key{separates the logic that controls the network} (e.g., route computation) \key{from the protocols that move information around}. This counters the ``box-centric'' design that causes today's complexity, and lets existing distributed-systems techniques handle the generic problems.
+\item \key{Higher robustness.} Simplifying the state and logic and keeping state internally consistent reduces fragility. 4D \key{raises the level of abstraction}: administrators focus on \key{specifying network-level objectives rather than configuring} individual protocols and mechanisms.
+\item \key{Better security.} Security objectives are inherently network-level goals. E.g., the decision plane can secure the network perimeter by installing packet filters on all border routers. Managing objectives instead of per-router configs reduces security-breaking mistakes.
+\item \key{Accommodating heterogeneity.} The same 4D architecture can be applied to different environments with customized solutions: an ISP backbone may use several high-end servers in distributed locations; a data centre may use a few cheap PCs and still get traffic engineering with resilience beyond spanning tree or static VLANs.
+\item \key{Enabling innovation and network evolution.} Separating network control from the routers/switches and protocols is a significant enabler: the decision plane can incorporate new algorithms and abstractions without changing data packet formats or the dissemination/discovery protocols. New players (researchers, third-party developers) can contribute.
+\end{itemize}
+\marginnote{Abstraction is increased: network admins can focus on the objective now!}
+
+\section{Challenges for 4D}
+\begin{itemize}
+\item \key{Complexity apocalypse.} Today's architecture has enormous complexity, \key{distributed horizontally across network elements and vertically across many layers}. 4D must keep all existing functionality while \key{centralizing decision logic and adding new capabilities} (network-wide reachability policies, zero pre-configuration). Does it simplify the system, or just exchange one kind of complexity for another?
+\item \key{Stability failures.} The network is distributed in space, so \key{there are unavoidable delays in informing the decision elements of events}. Can a network-wide view be stable and accurate enough for global enterprise and transit networks?
+\item \key{Scalability.} Large networks have thousands of routers, tens of thousands of devices and hundreds of thousands of prefixes. \key{Can conventional servers manage so many devices and respond fast enough?} Will the \key{management information moved by the dissemination plane overwhelm the network's} ability to carry data?
+\item \key{Response time.} With speed-of-light delays and lots of management data, can the network restore data flow within an acceptable time after failures?
+\item \key{Security vulnerabilities.} \key{An attacker who compromises a decision element could control the entire network} --- comparable to breaking into today's management plane. Security rests on protecting the dissemination plane and the decision plane itself.
 \end{itemize}
 
-Expressing objectives directly reduces semantic mistakes that arise when operators translate high-level intent into protocol-specific settings.
-
-\subsubsection{Network-wide views}
-
-A network-wide view is a coherent snapshot of the state of every network component, borrowing the idea from databases. It should be timely and accurate and include topology, traffic, events, device names, resource limits, and physical attributes. It must reflect the actual data-plane state.
-
-Existing control protocols were not designed to provide this view, so operators retrofit measurement systems and databases. The authors argue that collecting the information needed for a complete and consistent network-wide view should be a primary responsibility of routers and switches.
-
-\textit{Handwritten revision cue:} understanding the data plane is important. Existing applications often have to be built to obtain this information, whereas the architecture should expose it systematically.
-
-\subsubsection{Direct control}
-
-The control/management system should have both the ability and the sole responsibility for setting all data-plane state that directs packet forwarding. Decision logic should not be hard-wired into protocols distributed among routers. Only the \emph{output} of that decision logic should be sent to network elements.
-
-Direct control makes it easier to satisfy network-level objectives. Today, because distributed control protocols are difficult to extend for goals such as traffic engineering and reachability control, the management plane implements these capabilities indirectly. It must reproduce control-plane state and logic and perform a complex inversion of their behavior. A simpler design would let the management system compute forwarding tables and install them directly.
-
-For direct control to be complete, multiple independent entities or configuration commands must not be able to change the same forwarding state without coordinated authority. Otherwise, further auditing and correction are needed to ensure objectives remain satisfied.
-
-\subsection{The 4D Architecture}
-
-4D is an extreme design point in which network-control decisions are made logically centrally by servers with control over the network elements. Routers and switches run discovery protocols and accept explicit instructions; they do not contain the network's decision logic.
-
-The four planes are as follows.
-
-\subsubsection{Decision plane}
-
-The decision plane makes all decisions that drive network control: reachability, load balancing, access control, security, and interface configuration. It operates in real time using a network-wide view of topology, traffic, device capabilities, and resource limits.
-
-It translates network-level objectives (such as a reachability matrix, load-balancing goals, or survivability requirements) into the state that must be installed in the data plane, including forwarding entries, packet filters, and queuing parameters. It consists of multiple servers called \emph{decision elements} (DEs) connected to the network.
-
-\textit{Handwritten cue:} decision plane \(\rightarrow\) makes decisions and generates data-plane state.
-
-\subsubsection{Dissemination plane}
-
-The dissemination plane provides robust, efficient communication between routers/switches and decision elements. It carries:
-\begin{itemize}
-    \item management information created by the decision plane to the data plane/network elements;
-    \item state discovered by the discovery plane back to the decision plane.
-\end{itemize}
-It transports information but does not create the state itself.
-
-Control information may use the same physical links as data packets, but dissemination paths are maintained separately from data paths. Therefore, management communication can operate without requiring the data plane to be configured or its routing paths to have converged. This contrasts with conventional networks, where control/management messages use paths that themselves depend on routing.
-
-\textit{Handwritten cue:} dissemination plane \(\rightarrow\) communicates decision updates to network elements and carries discovered state back; it does not decide the content of the updates.
-
-\subsubsection{Discovery plane}
-
-The discovery plane automatically discovers physical network components and creates logical identifiers for them. It defines the scope and persistence of identifiers and discovers relationships between components.
-
-Discovery includes:
-\begin{itemize}
-    \item \textbf{Box-level discovery:} what interfaces a router has and how many FIB entries it can hold.
-    \item \textbf{Neighbor discovery:} which other routers connect to a given interface.
-    \item \textbf{Lower-layer link discovery:} link characteristics such as interface capacity.
-\end{itemize}
-
-The decision plane uses this information to construct its network-wide view. In conventional IP networks, physical-device discovery and associations are often managed through configuration commands and external inventory databases; automatic discovery is largely limited to neighboring, preconfigured IP interfaces.
-
-\textit{Handwritten cue:} discovery plane \(\rightarrow\) discovers the network and its components/relationships.
-
-\subsubsection{Data plane}
-
-The data plane handles individual packets using state output by the decision plane. This state includes:
-\begin{itemize}
-    \item forwarding-table entries;
-    \item packet filters;
-    \item link-scheduling weights and queue-management parameters;
-    \item tunnels and network-address-translation mappings.
-\end{itemize}
-The data plane may also provide fine-grained measurement support to the discovery plane.
-
-\textit{Handwritten cue:} data plane \(\rightarrow\) forwards packets. It executes the configured state rather than making the network-level decisions.
-
-\subsubsection{How the planes work together}
-
-The decision plane uses network-level objectives and a network-wide view. The discovery plane collects information needed to build that view. The decision plane computes the required data-plane state and the dissemination plane communicates it to the routers/switches. The data plane then forwards packets according to that state and can provide measurements.
-
-This design embodies the three principles: network-level objectives, network-wide views, and direct control. Pulling control state and logic out of routers enables simpler protocols and more powerful decision algorithms.
-
-\subsection{Advantages of 4D}
-
-\begin{itemize}
-    \item \textbf{Separates networking logic from distributed-systems issues.} 4D does not eliminate distributed protocols, because devices remain physically distributed. It separates the logic that decides how the network should operate (e.g., route computation) from the protocols that transport information among devices. This permits existing distributed-systems techniques to address coordination and reliability.
-    \item \textbf{Higher robustness.} Simpler control state and logic, together with internally consistent state, can reduce fragility. Administrators specify network-level objectives instead of manually configuring interacting protocols on individual devices.
-    \item \textbf{Better security.} Security requirements are network-level goals. For example, the decision plane can install perimeter filters on all border routers. Managing the objective directly reduces configuration errors that could compromise security.
-    \item \textbf{Accommodates heterogeneous networks.} The same architecture can be adapted to different environments. An ISP backbone may use multiple high-end servers at geographically distributed sites; a data centre may use a few inexpensive PCs to enable capabilities such as resilient traffic engineering beyond spanning tree or static VLAN configuration.
-    \item \textbf{Enables innovation and evolution.} New algorithms and abstractions can be introduced in the decision plane without changing packet formats or the discovery/dissemination protocols. Researchers and third-party developers can contribute new control algorithms.
-\end{itemize}
-
-\subsection{Challenges and Risks of 4D}
-
-\begin{itemize}
-    \item \textbf{Complexity apocalypse.} Today's complexity is distributed horizontally across network elements and vertically across layers. 4D must preserve existing functionality while centralizing decisions and adding capabilities such as network-wide reachability policies and zero pre-configuration. It is an open question whether 4D simplifies the overall system or merely exchanges one type of complexity for another.
-    \item \textbf{Stability failures.} Since devices are distributed in space, information about events reaches decision elements with delay. It is unclear whether a sufficiently accurate and stable network-wide view can be maintained for global enterprise and transit networks.
-    \item \textbf{Scalability.} Large networks may contain thousands of routers/switches, tens of thousands of devices, and hundreds of thousands of destination prefixes. Can conventional servers manage this scale and respond quickly enough? Could dissemination traffic overwhelm the network's data-carrying capacity?
-    \item \textbf{Response time.} Propagation delays and the volume of management information may prevent the system from restoring traffic flow quickly enough after failures.
-    \item \textbf{Security vulnerabilities.} Compromise of a decision element could provide control over the entire network. Security depends heavily on protecting both the decision plane and the dissemination channels between decision elements and network devices.
-\end{itemize}
-
-\subsection{Relationship Between 4D and the Routing Control Platform (RCP)}
-
-RCP is a backwards-compatible system that gives transit-network operators more control over BGP routing decisions within an AS. The authors regard RCP as one specific point inside the broader 4D design space, emphasizing scalability and deployability with conventional routers.
-
+\section{4D and the Routing Control Platform (RCP)}
+RCP (Chapter~1) is a backwards-compatible system that gives transit-network operators more control over BGP decisions in their AS. The authors see \key{RCP as an implementation of a specific point inside the 4D design space}, chosen for scalability and deployability with conventional routers.
 \begin{center}
-\begin{tabular}{|p{0.22\linewidth}|p{0.68\linewidth}|}
-\hline
+\begin{tabularx}{0.9\linewidth}{@{}l X@{}}
+\toprule
 \textbf{4D plane} & \textbf{RCP implementation} \\
-\hline
-Decision & Routing Control Servers decide which BGP routes routers should use. \\
-\hline
-Dissemination & iBGP sessions distribute the selected BGP routes to routers. \\
-\hline
-Discovery & RCP observes OSPF link-state advertisements and learns external BGP routes through iBGP sessions with operational routers. \\
-\hline
+\midrule
+Decision & Routing Control Servers decide which BGP routes routers should use. They need no coordination protocol because of the properties of the underlying discovery plane. \\
+Dissemination & iBGP sessions tell the routers which BGP routes to use. \\
+Discovery & RCP snoops on the flooding of OSPF LSAs and learns external BGP routes via the iBGP sessions with operational routers. \\
 Data & Conventional routers forward packets using their forwarding tables. \\
-\hline
-\end{tabular}
+\bottomrule
+\end{tabularx}
 \end{center}
+\marginnote{Decision $\rightarrow$ RCS; Dissemination $\rightarrow$ iBGP sessions; Discovery $\rightarrow$ LSAs; Data $\rightarrow$ routers forward!}
 
-RCP's decision elements do not need a coordination protocol because of properties of its underlying discovery plane. However, RCP focuses on BGP route selection, which is only one part of the state used to direct packets. The 4D paper considers coordinated control of a much broader set of data-plane mechanisms, including FIB entries, packet filters, NAT, tunnels, packet scheduling, and buffer management.
-
-The papers also differ in their starting assumptions. RCP assumes routers are already correctly configured with substantial state, including IP addresses and an IGP. 4D investigates zero pre-configuration and clean-slate identifiers and relationships. It also aims to cover multiple network technologies, including Ethernet (with or without VLANs), IPv4, and IPv6 (with or without MPLS).
-
-\subsection{Research Agenda: Decision Plane}
-
-The decision plane must directly control the data plane using a network-wide view and network-level objectives. Research must develop algorithms that satisfy those objectives, react to events in real time, exploit network structure, and coordinate replicated decision elements.
-
-To avoid a single point of failure, decision algorithms should run on multiple servers at different network locations. This creates coordination questions. Administrative boundaries and scalability also motivate separate decision planes for different ASes or institutions, which must exchange information when needed.
-
-\subsubsection{Algorithms for network-level objectives}
-
-The decision plane converts network-wide views and objectives into directives for the data plane. An ambitious goal is a language or notation for specifying these objectives directly.
-
-\paragraph{Traffic engineering.}
-Given a network topology and traffic matrix, compute a forwarding graph---a forwarding-table entry for each destination prefix at each router---that minimizes an objective such as maximum link utilization. Existing approaches often optimize OSPF weights and BGP policies, which only indirectly determine forwarding-table entries. Direct control may enable the system to move beyond computationally intractable optimization problems created by today's routing protocols.
-
-\paragraph{Reachability policies.}
-Given a topology, traffic matrix, and reachability matrix, compute a forwarding graph and packet filters that minimize an objective while satisfying reachability constraints. In the simplest approach, filters could be placed on every edge link while forwarding tables permit all endpoint pairs to communicate. In practice, routers have limited filter capacity, changing the optimization problem substantially.
-
-\paragraph{Planned maintenance.}
-Given a topology, traffic matrix, and planned equipment shutdown, compute a sequence of forwarding-graph changes that avoids the routers and links undergoing maintenance. The same sequence can be reversed to reintroduce equipment afterward. Each step should avoid forwarding anomalies such as loops and blackholes, as well as link congestion. The goal is to perform maintenance without disrupting applications sensitive to transient packet loss, such as VoIP and online gaming.
-
-\paragraph{Leveraging network structure.}
-Knowledge of the topology can reduce algorithmic complexity. Reachability constraints may be easier to enforce in tree-shaped access networks. A backbone may be modelled at a coarser level using Points-of-Presence (PoPs) instead of individual routers, reducing computational overhead.
-
-\paragraph{Specifying objectives.}
-The decision plane must satisfy multiple constraints and optimize several objectives simultaneously. A configuration language should be evaluated for both complexity and expressiveness: it should be simpler than configuring individual routers while still expressing the network-level objectives found in real networks.
-
-\paragraph{Choosing the right timescales.}
-The decision plane must react in real time to equipment failures and routing messages from neighboring domains without necessarily invoking a complex optimization algorithm. The research challenge is to identify abstractions that enable fast responses to unplanned events while retaining network-wide optimization for longer-term goals.
-
-\subsubsection{Coordination between decision elements}
-
-Multiple decision elements should connect at different locations to avoid a single point of failure, but their actions must not destabilize the network. The paper describes the following approaches.
-
-\paragraph{Distributed election.}
-Decision elements run a standard leader-election algorithm; only the elected leader sends instructions to the data plane. This prevents conflicting directives and avoids requiring routers to choose among competing states. Its disadvantages are additional complexity and overhead, plus recovery delay when the leader fails.
-
-\paragraph{Independent decision elements.}
-Decision elements operate without explicit coordination. Each runs its algorithm and contacts network elements using information from the dissemination plane. Network elements resolve competing commands using static priorities and/or a timeout mechanism.
-
-Advantages:
+\textbf{Differences between RCP and 4D:}
 \begin{itemize}
-    \item faster failover;
-    \item no explicit coordination protocol among decision elements.
+\item \emph{Scope of decisions:} RCP focuses on BGP decision logic; 4D asks how a wide variety of network objectives can be expressed, and what coordination protocols are needed.
+\item \emph{Scope of state:} \key{RCP only considers BGP routes}, a single part of the data-plane state. 4D asks how to control \key{all} data-plane forwarding mechanisms (FIB entries, packet filters, NATs, tunnels, packet scheduling, buffer management) in a coordinated way.
+\item \emph{Starting assumptions:} \key{RCP assumes routers are already correctly configured} with significant state (IP addresses, an IGP). 4D examines how \key{zero pre-configuration} can be achieved and how a clean-slate design of device identifiers and their relationships simplifies control.
+\item \emph{Technologies:} 4D also targets Ethernet (with or without VLANs), IPv4 and IPv6 (with or without MPLS).
 \end{itemize}
-Costs and assumptions:
+
+\section{Research agenda: decision plane}
+The decision plane is responsible for \key{direct control over the data plane}, based on a network-wide view and subject to network-level objectives. To \key{avoid a single point of failure}, decision-plane algorithms should \key{run on multiple servers spread throughout the network}, which raises the question of whether and \key{how to coordinate the replicated decision elements (DEs)}. Administrative boundaries and scale also lead to separate decision planes for different ASes or institutions that must exchange information.
+
+\subsection{Algorithms satisfying network-level objectives}
+The decision plane \key{converts network-wide views and network-level objectives into directives for the data plane}. The ambitious goal is \key{a language or notation for expressing network-level objectives}. Research problems:
 \begin{itemize}
-    \item more control traffic;
-    \item stronger assumptions about consistency of information from the dissemination plane.
+\item \key{Traffic engineering:} given a topology and traffic matrix, compute a \key{forwarding graph} (a forwarding-table entry for each destination prefix at each router) minimizing an objective such as maximum link utilization. Today the output is a set of OSPF weights and BGP policies that only \emph{indirectly} set forwarding entries; direct control may escape the resulting intractable optimization problems.
+\item \key{Reachability policies:} given topology, traffic matrix and a \key{reachability matrix}, compute a forwarding graph \emph{and packet filters} minimizing an objective while satisfying the reachability constraints. Simplest case: filters on every edge link; but routers have limited filter capacity, which changes the problem.
+\item \key{Planned maintenance:} given topology, traffic matrix and a planned shutdown of equipment, compute a \key{sequence of changes to the forwarding graph} that avoids the routers and links under maintenance (apply in reverse to bring them back). Each step must avoid forwarding anomalies (loops, blackholes) and congestion, so loss-sensitive applications such as VoIP and online gaming are not disrupted.
+\item \key{Leveraging network structure:} topology knowledge can simplify algorithms --- reachability is easier in tree-like access networks; a backbone can be modelled at PoP granularity instead of per router.
+\item \key{Specifying network-level objectives:} a configuration language for the decision plane should be judged on \emph{complexity} (simpler than configuring routers) and \emph{expressiveness} (able to state real objectives).
+\item \key{Choosing the right timescales:} the decision plane \key{must react in real time} to events such as equipment failures and routing messages from neighbouring domains, \key{without invoking a complex optimization algorithm}. The challenge is to find abstractions that allow fast reactions while keeping network-wide optimization for longer-term goals.
 \end{itemize}
-Early studies in BGP routing suggest this approach is viable, but its applicability to other forms of network state requires further investigation.
 
-Hybrid approaches are also possible: each network element accepts instructions from a subset of decision elements and uses priorities/timeouts to resolve conflicts.
+\subsection{Coordination between decision elements}
+Multiple DEs at different locations avoid a single point of failure, but must not destabilize the network.
+\marginnote{Different replicas of DE $\rightarrow$ coordinate.}
+\begin{itemize}
+\item \key{Distributed election:} DEs run a standard leader-election algorithm and \key{only the elected leader sends instructions to the data plane}. This avoids inconsistent directives from different DEs and spares routers from deciding which state to use. Cost: \key{additional complexity and overhead, and delay} for the network to recover when the leader fails.
+\item \key{Independent DEs:} DEs \key{operate independently} without explicit coordination; \key{each DE executes decision algorithms} and contacts network elements using only information from the dissemination plane. \key{A network element resolves commands from different DEs using static priorities and/or a timeout mechanism.}
+\begin{itemize}
+\item Pros: \key{faster failover}; no DE-to-DE coordination protocol.
+\item Cons: \key{more control traffic} and \key{stronger assumptions about the consistency of the information} from the dissemination plane. Early BGP studies (i.e., RCP) suggest it is viable; other kinds of state need study.
+\end{itemize}
+\item \key{Hybrid:} each network element accepts instructions from a small subset of DEs, using priorities and timeouts to resolve conflicts.
+\end{itemize}
 
-\textit{Handwritten revision cue:} independent DEs avoid coordination between DEs; the network element itself resolves commands. Remember the trade-off: faster failover, but more control traffic and stronger consistency assumptions.
+\subsection{Introducing hierarchy in the decision plane}
+\begin{itemize}
+\item \textbf{One institution, large network:} today's scaling tools are multiple ASes, OSPF areas, and prefix aggregation at area/AS boundaries, but routing protocols lack abstractions such as routing complexes/central offices, PoPs, geographic regions, and router roles (access, hub, backbone, peering). Research: use these abstractions to find \key{effective ways to divide responsibility across DEs and coordinate their actions}.
+\item \textbf{Multiple institutions:} \key{the decision plane for one network will need to communicate with the decision planes in other institutions} (customer, peer, provider ASes). Their DEs might \key{exchange interdomain routing information directly, or coordinate in other ways} (traffic engineering, troubleshooting). But neighbouring ASes may be \key{business competitors reluctant to share information}.
+\end{itemize}
 
-\subsubsection{Introducing hierarchy into the decision plane}
+\section{Research agenda: dissemination plane}
+Goal: a \key{dissemination plane that provides robust communication paths between DEs and routers/switches}, exposing an interface that lets DEs innovate independently above and routers evolve independently below --- ideally a single dissemination plane for both Ethernet and IP.
 
-In the simplest arrangement, every decision element has a complete network view and decides on behalf of every router. Large networks may instead require hierarchical control.
-
-\paragraph{One institution managing a large network.}
-Current scaling methods include dividing the topology into ASes, grouping nearby routers into OSPF areas, and aggregating prefixes at area and AS boundaries. However, conventional routing protocols lack useful abstractions such as routing complexes/central offices, PoPs, geographic regions, and router roles (access, hub, backbone, peering). Research can explore how these abstractions divide responsibility among decision elements and help coordinate their actions.
-
-\paragraph{Different institutions managing different networks.}
-A decision plane must eventually communicate with decision planes in customer, peer, and provider ASes. Neighboring ASes may be business competitors and reluctant to share information, so inter-domain coordination must account for limited trust and cooperation.
-
-\subsection{Research Agenda: Dissemination Plane}
-
-The dissemination plane must provide robust communication between decision elements and routers/switches. Its interface should allow independent innovation in decision elements and independent evolution of network devices. The authors aim for a dissemination plane usable across Ethernet and IP networks.
-
-\subsubsection{Connecting decision elements to network elements}
-
-Management information must be delivered even when data-plane paths have not been established or have not converged. The proposal uses separate protocols and forwarding tables for management traffic.
-
-Benefits of separate dissemination paths:
+\subsection{Connecting decision elements with routers/switches}
+Management information must flow \key{without requiring successful establishment or convergence of data-plane paths}. The proposal uses separate protocols and forwarding tables for management information. Advantages:
 \begin{enumerate}
-    \item Unlike data paths, which must optimize multiple goals such as traffic engineering and security, dissemination paths can focus on robust connectivity under failures.
-    \item Management information can be exchanged before the data channel is operational or converged.
-    \item Dissemination paths are independent of data-plane technology and policy.
-    \item Management traffic can use data links and additional physical links dedicated to management robustness, such as modem lines or supervisory channels on SONET/optical links.
+\item \key{Unlike data paths}, which must be optimized for many objectives (traffic engineering, security), \key{dissemination paths can be optimized solely for robustness of connectivity under failures}.
+\item \key{Management information can be communicated before the data channel is up} or has converged.
+\item Dissemination paths are \key{agnostic to data-plane} technology and policy.
+\item Management information can be \key{carried across data links as well as any extra physical links} built for management robustness (modem lines, SONET/optical supervisory channels).
 \end{enumerate}
+\marginnote{Dissemination paths have different objectives (robustness only). ``Agnostic'' = they do not care about the data plane.}
 
-\paragraph{Three classes of dissemination solutions.}
+\textbf{Three classes of solutions:}
 \begin{itemize}
-    \item \textbf{Flooding:} robustly multicasts information from routers/switches to all decision elements. It scales well with the number of decision elements but poorly with the number of network devices.
-    \item \textbf{Spanning-tree protocols:} scale well with both decision elements and network devices, but have poor reconvergence properties.
-    \item \textbf{Source routing:} beacons can help establish routes from each network element to decision elements, or decision elements can use their network-wide views to choose source routes that load-balance dissemination traffic.
+\item \key{Flooding}: robustly multicasts data from all routers to all DEs. \key{Scales well with the number of DEs but poorly with the number of routers/switches.}
+\item \key{Spanning-tree protocols}: \key{scale well with both} DEs and routers, but have \key{poor reconvergence} properties.
+\item \key{Source routing}: \key{beacons can help create source routes from each router/switch to the DEs}, or DEs can use their network-wide views to choose source routes that load-balance dissemination traffic.
 \end{itemize}
 
-\subsubsection{Achieving direct control: update semantics}
-
-Choosing transport and session-layer semantics is crucial. Dissemination packets may be lost, but retransmitting every lost packet may not be the best response. Instead, decision elements might compute new state updates for the reachable routers so that traffic avoids devices that can no longer be reached by the decision plane.
-
-Most decision instructions update state on multiple devices. Possible update semantics form a spectrum:
+\subsection{Achieving direct control: update semantics}
 \begin{itemize}
-    \item \textbf{Independent application:} each router applies an update as soon as it receives it.
-    \item \textbf{Network-wide timed commit:} all updates are applied at a specified time.
-    \item \textbf{Distributed transactional commit:} updates are coordinated with stronger all-or-nothing semantics.
+\item Choosing the \key{right transport and session-layer semantics} is critical. \key{Packets carrying management information may be lost, but retransmission may not be the best policy}; it may be better for DEs to \key{calculate new state updates for the remaining reachable routers}, so data packets avoid the elements the decision plane can no longer reach.
+\item Most decisions update several routers. Semantics range from weak to strong: \emph{independent application} (each router applies an update when it arrives) $\rightarrow$ \emph{network-wide commit at a particular time} $\rightarrow$ \emph{full transactional distributed commit}. Optimizations: group related updates into one ``transaction''; allow several DEs to update overlapping sets of routers.
+\item Another idea: \key{exploit good time synchronization} (NTP or GPS at each router or PoP) \key{to instruct routers/switches to change from one configuration to another at a specific time}, giving \key{infinitesimal convergence delay}.
 \end{itemize}
-Potential optimizations include grouping related updates into a single session transaction and allowing multiple decision elements to update overlapping sets of routers.
+\marginnote{At a specific time, change configuration.}
 
-With good time synchronization, such as NTP or GPS at each router or PoP, routers could be instructed to switch configurations at a specific time. This could make the effective convergence delay extremely small by coordinating when the new state takes effect.
+\section{Research agenda: discovery plane}
+Today, \key{information about devices, their identities and their relationships is encoded in static configuration files} on the devices and/or in management databases. These must match physical reality: swapped cables connect interfaces configured for different IP subnets, and \key{interfaces connected by ATM or Frame Relay must be configured with the correct circuit ID used by the lower layer, or they cannot exchange packets}. Keeping inventory, configs and reality consistent is a major headache. A discovery plane should discover identities and relationships automatically.
 
-\textit{Handwritten revision cue:} the purpose of the dissemination plane is robust delivery of management/control information, not ordinary data forwarding. Its paths must not depend on the data plane already working.
+\subsection{Supporting decision-plane algorithms}
+\key{Design discovery services that support the decision-plane algorithms}: \key{study the set of physical and logical entities and the relationships that need to be managed}, and how their persistence should be defined. Example: an interface relates to a hardware port, a layer-2 logical port, an SNMP index, an optical circuit\ldots If a card is moved to another router and replaced, traffic statistics should stay with the logical interface while failure history moves with the card --- hard today, but important for predicting card replacement, traffic engineering and capacity planning.
 
-\subsection{Research Agenda: Discovery Plane}
-
-A network-wide view requires knowing all devices and their physical and logical relationships. Today, identities and relationships are often encoded in device configuration files and management databases. These must match physical reality: for example, incorrectly swapped cables can connect interfaces configured for different IP subnets. Similarly, IP interfaces connected through ATM or Frame Relay require the correct lower-layer circuit identifiers.
-
-Keeping inventory databases, configuration files, and actual connectivity consistent is a major operational problem. A discovery plane should automatically discover device identities, components, and relationships.
-
-\subsubsection{Supporting decision-plane algorithms}
-
-Discovery services should expose the entities and relationships required by decision algorithms and define the persistence properties of identifiers and relationships.
-
-For example, a router interface may be associated with a hardware port, a Layer-2 logical port, an SNMP polling index, an optical circuit, and other entities. Existing systems often track utilization and failure rates by interface-card identity. If a card is moved to another router and a new card replaces it, the system must distinguish which historical data belongs to the physical card and which belongs to the logical interface or traffic relationship. Correctly preserving these semantics is important for transient-failure tracking, hardware replacement decisions, traffic engineering, and capacity planning.
-
-\subsubsection{Bootstrapping with zero pre-configuration beyond a secure key}
-
-Conventional networks require extensive configuration before a device can communicate. 4D proposes automatic bootstrapping if each network element has only a credential installed through a flashcard or USB key.
-
-The sequence is:
+\subsection{Bootstrapping with zero pre-configuration beyond a secure key}
+In contrast to today's networks, which need extensive configuration before a router can communicate, a 4D network can \key{bootstrap automatically, assuming only that each network element has a credential installed} via a flashcard or USB key:
 \begin{enumerate}
-    \item On boot, the router/switch automatically generates an identity.
-    \item It discovers its physical components and attributes.
-    \item It discovers neighbors by exchanging identifiers and credentials.
-    \item Adjacent devices continue discovery only if their credentials are compatible, establishing the network boundary.
-    \item Once neighbor discovery completes, the device participates in the dissemination plane and reports its components, attributes, and relationships to the decision plane.
+\item On booting, the router/switch \key{automatically generates an identity} and \key{discovers all its physical components} and attributes.
+\item It \key{discovers its neighbours by exchanging identifiers and credentials} with them.
+\item \key{Two adjacent devices continue discovery only if they have compatible credentials}; credentials thus establish the boundary of the network.
+\item \key{Once neighbour discovery completes, the device can participate in the dissemination plane}, sending information about its components, attributes and relationships to the decision plane.
 \end{enumerate}
+Identities and relationships are thus discovered from physical relationships or assigned by policy, instead of through manual, open-loop configuration.
+\marginnote{Starting with a pre-loaded configuration (only a credential/key).}
 
-Thus, identities and relationships are discovered from physical relationships or assigned according to policy rather than being established through a manual, open-loop configuration process.
+\subsection{Supporting cross-layer auto-discovery}
+Two switches may be linked through a lower-layer network such as SONET. Two options: a \key{peer-to-peer} architecture (directly connected devices exchange discovery information within and across layers, e.g., L3 routers and L1 SONET ADMs) or an \key{overlay} architecture (discovery only between adjacent devices at the same logical layer, with a generic interface between layers). Ethernet and SONET are good candidates to study.
 
-\subsubsection{Cross-layer auto-discovery}
-
-Two switches may be connected indirectly through a lower-layer network such as SONET. The paper identifies two possible approaches:
+\section{Research agenda: data plane}
+In 4D the data plane is under the \emph{direct} control of the decision plane, unlike today where its configuration is split between the control plane (forwarding table) and the management plane (ACLs, scheduling weights, queue management). The data plane's capabilities directly affect how simple and flexible the decision logic can be.
 \begin{itemize}
-    \item \textbf{Peer-to-peer architecture:} directly connected devices exchange discovery information within and across network layers, such as Layer-3 routers and Layer-1 SONET ADMs.
-    \item \textbf{Overlay architecture:} discovery occurs only between adjacent devices at the same logical layer.
+\item \key{Packet-forwarding paradigms.} Networks forward packets using \key{the longest-prefix match paradigm} (IPv4/IPv6), \key{exact-match forwarding} (Ethernet), or \key{label switching} (MPLS, ATM, Frame Relay). \key{A forwarding-table entry may send traffic to a single outgoing link, or to multiple links with equal splitting or more general weighted splitting.} This matters to the decision plane: with weighted splitting it can use multi-commodity-flow algorithms (traffic infinitely divisible); with a single next hop per destination it must build a sink tree per prefix, needing more complex algorithms.
+\item \key{Advanced data-plane features.} The data plane could provide \key{an integrated mechanism combining packet forwarding, filtering and transformation} (e.g., forwarding on the \key{five-tuple} of source/destination addresses, port numbers and protocol, with efficient \key{policy-based routing}), giving the decision plane control over reachability through one mechanism. To address \key{concerns about 4D's response time}, \key{the data plane could use preconfigured tunnels for immediate local reaction to failures}, or \key{keep a table saying how to adapt forwarding after a particular link or path fails}, so it can react \key{before receiving further instructions from the decision plane}. It can also keep fine-grained counters or configurable packet sampling to help build an accurate traffic view.
 \end{itemize}
 
-\subsection{Revision Summary}
-
+\section{Revision summary}
 \begin{itemize}
-    \item The central problem is that decision logic is embedded in distributed protocols, while management software attempts to enforce high-level goals indirectly.
-    \item The three principles are \textbf{network-level objectives}, \textbf{network-wide views}, and \textbf{direct control}.
-    \item The four planes are \textbf{Decision} (decides), \textbf{Dissemination} (communicates state and instructions), \textbf{Discovery} (learns devices and relationships), and \textbf{Data} (forwards packets using installed state).
-    \item 4D may improve robustness, security, heterogeneity support, and innovation, but raises open questions about complexity, stability, scalability, response time, and security.
-    \item RCP is a narrower example: it controls BGP route selection and uses iBGP for dissemination, whereas 4D aims to coordinate all relevant forwarding mechanisms and support zero pre-configuration.
-    \item Independent decision elements improve failover and remove explicit DE-to-DE coordination, but require more control traffic and stronger assumptions about dissemination-plane consistency.
-    \item A separate dissemination plane can remain usable even before data-plane paths converge; discovery provides the information needed for a coherent network-wide view.
+\item \textbf{Problem:} decision logic embedded in distributed protocols; management software enforces goals indirectly and must invert control-plane behaviour; bootstrapping catch-22.
+\item \textbf{Principles:} network-level objectives, network-wide views, direct control.
+\item \textbf{Planes:} Decision (decides, real time, network-wide view, DEs) --- Dissemination (carries state both ways, paths separate from data paths, creates no state) --- Discovery (finds components, creates identifiers, box/neighbour/link discovery) --- Data (forwards using decision-plane state, provides measurements).
+\item \textbf{Pros:} separates logic from distributed-systems issues, robustness, security, heterogeneity, innovation. \textbf{Cons:} complexity apocalypse, stability, scalability, response time, security of DEs.
+\item \textbf{RCP} is one point in the 4D space: RCS = decision, iBGP = dissemination, OSPF LSAs + iBGP = discovery, routers = data. RCP only handles BGP routes and assumes pre-configured routers.
+\item \textbf{DE coordination:} leader election (consistent, but complex and slow failover) vs.\ independent DEs (fast failover, no DE coordination; more control traffic, stronger consistency assumptions) vs.\ hybrid.
+\item \textbf{Dissemination:} flooding (good in \#DEs, bad in \#routers), spanning tree (scales both, poor reconvergence), source routing (beacons); time-synchronized commits.
+\item \textbf{Discovery:} zero pre-configuration beyond a credential; compatible credentials define the network boundary.
+\item \textbf{Data plane:} LPM / exact match / label switching; weighted splitting; integrated forward+filter+transform; preconfigured backup tunnels for fast local reaction.
 \end{itemize}

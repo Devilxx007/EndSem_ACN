@@ -1,206 +1,173 @@
-\section{OpenFlow: Enabling Innovation in Campus Networks}
-\label{sec:openflow}
+\chapter{OpenFlow: Enabling Innovation in Campus Networks}\label{sec:openflow}
+\paperinfo{N. McKeown, T. Anderson, H. Balakrishnan, G. Parulkar, L. Peterson, J. Rexford, S. Shenker, J. Turner}{ACM SIGCOMM CCR, Vol.\ 38 No.\ 2, April 2008}
 
-\subsection{Motivation: Why Programmable Networks Are Needed}
+\begin{keybox}[OpenFlow in one paragraph]
+\key{OpenFlow is based on an Ethernet switch, with an internal flow table and a standardized interface to add and remove flow entries.} The goal is for vendors to add OpenFlow to switches deployed in college campus backbones and wiring closets, so researchers can \key{run experiments} on real networks at line rate, while \key{vendors do not need to expose the internal workings of their switches}. It is a pragmatic compromise between full programmability and what vendors will accept.
+\end{keybox}
 
-Networks are critical infrastructure, but the large installed base of equipment and protocols makes it difficult to test new networking ideas in realistic environments. Researchers often cannot run experimental routing protocols or alternatives to IP at scale while carrying real production traffic. As a result, promising ideas may remain untested, and network infrastructure is often described as \emph{ossified}.
-
-Large programmable-network testbeds such as GENI aim to let researchers control isolated \emph{slices} of resources across a network, including links, packet-processing elements, end hosts, campus networks, wireless networks, and sensor networks. Virtualization would allow multiple experimental networks to operate simultaneously. However, nationwide testbeds are ambitious, expensive, and take time to deploy. The paper therefore asks a more immediate question: how can researchers experiment in existing campus networks without disrupting the people who depend on them?
-
-The central challenge is to give researchers control over selected traffic while allowing ordinary production traffic to continue using the vendor's normal, tested networking behaviour.
-
-\subsection{Why Existing Approaches Are Insufficient}
-
-\paragraph{Commercial equipment is too closed.}
-Commercial switches and routers generally expose narrow standardized interfaces, mainly packet forwarding, while hiding their internal flexibility. Implementations differ between vendors, so there is no common platform on which researchers can experiment. Vendors are reluctant to expose internal interfaces because their products depend on carefully tuned, potentially fragile protocols and algorithms; experiments could destabilize networks. Open platforms could also lower barriers for competitors.
-
-\paragraph{General-purpose PCs lack performance and port density.}
-A PC with multiple network interfaces and an operating system can route packets, run open-source routing protocols, and be modified to process packets in many ways (for example, with Click). However, a campus wiring-closet switch may need more than 100 ports and process traffic above 100 Gbit/s, whereas a typical PC in the paper's context struggles to exceed 1 Gbit/s. The performance gap was expected to widen. Thus, software flexibility alone is insufficient for a wiring closet.
-
-\paragraph{Specialized research platforms have deployment limitations.}
-The Supercharged PlanetLab Platform uses network processors and can process packets from many interfaces at line rate, but is expensive and aimed at large switching centres. NetFPGA is a low-cost, user-programmable FPGA PCI card, but its four Gigabit Ethernet ports are insufficient for a wiring closet. In the paper's comparison, commercial solutions are too closed and inflexible, while research solutions lack sufficient performance or fanout, or are too expensive.
-
-\paragraph{The proposed compromise.}
-Rather than demanding completely open and virtualized commercial platforms, OpenFlow exposes a carefully chosen, common subset of switch capabilities through a standard interface. The design goals are:
+\section{The need for programmable networks}
 \begin{itemize}
-  \item support a broad range of research;
-  \item isolate experimental traffic from production traffic;
-  \item remain compatible with high-performance, low-cost implementations; and
-  \item respect vendors' need to keep the internal implementation of their products closed.
+\item The huge installed base of equipment and protocols, and reluctance to experiment on production traffic, mean that \key{today there is almost no practical way to experiment with new network protocols} (new routing protocols, alternatives to IP) in realistic settings. \key{New ideas go untried and untested}, hence the belief that the network infrastructure has \key{``ossified''}.
+\item \key{GENI} is a proposed \key{nationwide research facility for experimenting with new network architectures and distributed systems}. Such programmable networks need \key{programmable switches and routers} that, using virtualization, process packets for several isolated experimental networks at once. In GENI a \key{researcher is allocated a \emph{slice} of resources across the whole network}: a portion of network links, packet-processing elements (e.g., routers) and end-hosts.
+\item But the plans for nationwide facilities are \key{ambitious (and costly), and will take years to deploy}. The paper asks a shorter-term question: \emph{as researchers, how can we run experiments in our campus networks?}
+\item Goal: \key{propose a new switch feature that extends programmability into the wiring closet of college campuses}.
 \end{itemize}
-The key compromise is to expose enough programmability for useful experiments without exposing arbitrary control of the switch internals or requiring vendors to redesign their hardware.
+\marginnote{Ossified = anything new is difficult to introduce.}
 
-\subsection{The OpenFlow Switch: Core Idea and Components}
-
-Modern Ethernet switches and routers commonly contain flow tables, often implemented using Ternary Content-Addressable Memories (TCAMs), to support functions such as firewalls, Network Address Translation (NAT), Quality of Service (QoS), and statistics collection. Although the tables differ between vendors, the paper identifies a common set of matching and action capabilities that can be exposed through a uniform protocol.
-
-An OpenFlow switch has three principal components:
-\begin{enumerate}
-  \item \textbf{Flow Table:} stores flow entries and the action to apply to packets matching each entry.
-  \item \textbf{Secure Channel:} connects the switch to a remote control process called the \emph{controller}, carrying commands and packets between them.
-  \item \textbf{OpenFlow Protocol:} provides the standardized interface through which the controller adds, removes, and manages flow entries in the switch.
-\end{enumerate}
-The architecture shown in Figure 1 of the paper places the controller outside the switch and uses the secure channel and OpenFlow protocol to control the flow table. Researchers program the switch through the standard interface instead of writing vendor-specific software for its internals.
-
-\subsubsection{Two kinds of OpenFlow switch}
-
+\section{Why existing options do not work}
 \begin{itemize}
-  \item \textbf{Dedicated OpenFlow switch:} a simple datapath device that forwards packets between ports according to instructions from a remote controller. It does not provide the ordinary Layer 2 and Layer 3 processing pipeline described for commercial switches.
-  \item \textbf{OpenFlow-enabled commercial switch/router:} an existing commercial device enhanced with a flow table interface, secure channel, and OpenFlow protocol. The flow table can reuse existing hardware such as a TCAM; the secure-channel software and protocol can run on the device's existing operating system and processor.
+\item \key{Commercial switches/routers} (approach \emph{not} taken: persuading vendors to open up). They \key{do not provide an open software platform}, let alone a way to \key{virtualize their hardware or software}. External interfaces are narrow (just packet forwarding) and all internal flexibility is hidden. \key{Internals differ from vendor to vendor}, so there is no standard platform, and \key{vendors are nervous about opening interfaces inside their boxes}: they have tuned fragile distributed protocols for years, fear experiments will crash networks, and open platforms lower the barrier for competitors.
+\item \key{PC-based software routers.} \key{The simplest example is a PC with several network interfaces and an OS}; all OSes route packets, and the OS can be modified to \key{process packets in almost any manner} (e.g., with Click). The \key{problem is performance}: \key{a PC supports neither the number of ports needed for a wiring closet (100+) nor the packet-processing performance} (wiring-closet switches process over 100\,Gb/s; a PC struggles to exceed 1\,Gb/s, and the gap is widening).
+\item \key{Specialized hardware for line-rate processing} is \key{not quite suitable for college wiring closets}:
+\begin{itemize}
+\item The ATCA-based \key{Supercharged PlanetLab Platform} (a virtualized programmable router with network processors) is \key{promising long-term, but targets large switching centres and is too expensive} for wide deployment in wiring closets.
+\item \key{NetFPGA} is a \key{low-cost PCI card with a user-programmable FPGA for processing packets and four Gigabit Ethernet ports} --- \key{limited to just four network interfaces}, insufficient for a wiring closet.
+\end{itemize}
+\end{itemize}
+\textbf{Conclusion:} \key{commercial solutions are too closed} and inflexible; research solutions have too little performance or fanout, or are too expensive.
+\marginnote{We are not taking the help of outside vendors (to open their platforms). Discussing currently available solutions. Specialized routers: not widespread-able --- costly! \textbf{FPGA} = Field-Programmable Gate Array: it can be reprogrammed by the customer after manufacturing. \textbf{PCI cards}: plug into the motherboard and provide additional functionality.}
+
+\textbf{A compromise.} Rather than full generality, seek a degree of switch flexibility that is:
+\begin{itemize}
+\item amenable to \key{high-performance and low-cost implementations};
+\item capable of \key{supporting a broad range of research};
+\item assured to \key{isolate experimental traffic from production traffic};
+\item \key{consistent with vendors' need for closed platforms}.
 \end{itemize}
 
-A flow is defined by the capabilities of the implementation. It could mean a TCP connection, all packets from a particular MAC or IP address, all packets with a given VLAN tag, all packets arriving at a particular switch port, or packets matching a non-standard header. Thus, a flow is not necessarily identical to a TCP connection: it can be defined more broadly or narrowly through the chosen header fields and wildcarding.
+\section{The OpenFlow switch}
+\subsection{Basic idea}
+\begin{itemize}
+\item \key{Exploit the fact that most modern Ethernet switches and routers contain flow tables} (typically built from TCAMs) that run at line rate to \key{implement firewalls, NAT, QoS, and to collect statistics}.
+\item \key{Each vendor's flow table is different}, but there is a \key{common set of functions that run in many switches and routers}. OpenFlow exploits this common set.
+\item OpenFlow \key{provides an open protocol to program the flow table in different switches and routers}. A network administrator can \key{partition traffic into production and research flows}. \key{Researchers control their own flows} --- choosing the routes their packets follow and the processing they receive --- so they can try new routing protocols, security models, addressing schemes, even alternatives to IP. \key{On the same network, the production traffic is isolated and processed the same way as today.}
+\item The datapath of an OpenFlow switch is a \key{flow table, with an action associated with each flow entry}. The set of actions is extensible, but a minimum set is required of all switches. High performance at low cost means forgoing arbitrary per-packet handling in favour of a limited but useful set of actions.
+\end{itemize}
+\marginnote{An Ethernet switch works at Layer 2; a flow table works at specific L2/L3/L4 fields --- similar to a routing table but more flexible and more detailed, i.e., cross-layer (it works across layers). Actions can be extended!}
 
-\subsection{Flow Entries, Header Matching, and Actions}
-
-Each flow-table entry contains three fields:
+\subsection{Three parts of an OpenFlow switch}
+\paperfig[0.48]{of_fig1_switch}{Idealized OpenFlow switch. The Flow Table is controlled by a remote controller via the Secure Channel using the OpenFlow Protocol (over SSL). The Secure Channel is software (sw); the Flow Table is hardware (hw).}
+An OpenFlow switch consists of at least three parts:
 \begin{enumerate}
-  \item a packet-header pattern defining which packets belong to the flow;
-  \item an action specifying what to do with matching packets; and
-  \item statistics, including packet and byte counts and the time since the last matching packet, which can help identify and remove inactive entries.
+\item A \key{Flow Table}, with \key{an action associated with each flow entry}, to tell the switch how to process the flow.
+\item A \key{Secure Channel} that connects the switch to a remote control process (the \key{controller}), allowing commands and packets to be sent between them.
+\item The \key{OpenFlow Protocol}, \key{an open and standard way for a controller to communicate with a switch}. Because of this standard interface, \key{entries in the Flow Table can be defined externally}, and researchers need not program the switch itself.
+\end{enumerate}
+\marginnote{Secure Channel = communication between switch and controller.}
+
+\subsection{Two kinds of OpenFlow switch}
+\begin{itemize}
+\item \key{Dedicated OpenFlow switch}: a dumb \key{datapath element that forwards packets between ports}, as defined by a remote control process. It does not support normal Layer 2/Layer 3 processing.
+\item \key{OpenFlow-enabled switch}: a commercial switch, router or access point enhanced with the Flow Table, Secure Channel and OpenFlow Protocol. The Flow Table typically \emph{reuses existing hardware} such as a TCAM, and the Secure Channel and protocol are ported to the switch's operating system.
+\end{itemize}
+
+\textbf{What is a flow?} Flows are defined broadly, limited only by the Flow Table implementation. \key{A flow could be a TCP connection, all packets from a particular MAC or IP address, all packets with the same VLAN tag, or all packets from the same switch port}. For non-IPv4 experiments, a flow could be all packets matching a specific (non-standard) header.
+
+\section{Flow entries and actions}
+\subsection{Fields of a flow entry}
+\key{An entry in the Flow Table has three fields}:
+\begin{enumerate}
+\item a \key{packet header} that defines the flow;
+\item the \key{action}, which defines how the packets should be processed;
+\item \key{statistics}, which \key{track the number of packets and bytes for each flow, and the time since the last packet matched} (to help remove inactive flows).
 \end{enumerate}
 
-\subsubsection{Type 0 header format}
-
-The first-generation \emph{Type 0} switch matches a 10-tuple of fields from the packet headers:
+\subsection{The Type 0 header: a 10-tuple}
+In \key{first-generation ``Type 0'' switches}, the flow header is the 10-tuple below.
 \begin{center}
-\begin{tabular}{ll}
+\begin{tabular}{|c|c|ccc|ccc|cc|}
 \hline
-\textbf{Layer / field} & \textbf{Matched fields} \\
-\hline
-Ingress & Switch port \\
-VLAN & VLAN ID \\
-Ethernet & Source MAC address, destination MAC address, EtherType \\
-IP & Source IP address, destination IP address, IP protocol \\
-Transport & TCP/UDP source port, TCP/UDP destination port \\
+In & VLAN & \multicolumn{3}{c|}{Ethernet} & \multicolumn{3}{c|}{IP} & \multicolumn{2}{c|}{TCP} \\
+Port & ID & SA & DA & Type & SA & DA & Proto & Src & Dst \\
 \hline
 \end{tabular}
 \end{center}
-A TCP flow can be specified using all ten fields, while an IP flow need not include the transport ports. Any field can be a wildcard. Wildcards allow flow aggregation: for example, matching only a VLAN ID can apply one entry to all traffic on that VLAN rather than requiring a separate entry for every individual connection.
+A TCP flow can be specified using all ten fields; an IP flow might leave out the transport ports. Each field can be a \key{wildcard}, allowing aggregation: e.g., a flow that specifies only the VLAN ID applies to all traffic on that VLAN.
+\marginnote{10-tuple flow header. Some flows use all the entries while some don't (wildcards).}
 
-\subsubsection{The three required basic actions}
-
-Every dedicated OpenFlow switch must support these three actions:
+\subsection{The three basic actions (dedicated switch)}
 \begin{enumerate}
-  \item \textbf{Forward to a port or ports.} This directs packets through the network. The intended implementation is line-rate forwarding on most switches.
-  \item \textbf{Encapsulate and forward to the controller.} The packet is carried through the secure channel to the controller. This is typically useful for the first packet of a new flow, so the controller can decide whether to install a flow entry. It can also be used to send every packet to the controller, although that sacrifices performance.
-  \item \textbf{Drop.} Matching packets are discarded. Uses include enforcing security policy, curbing denial-of-service traffic, and suppressing unnecessary broadcast-discovery traffic from end hosts.
+\item \key{Forward this flow's packets to a given port (or ports).} Routes packets through the network; expected at line rate.
+\item \key{Encapsulate and forward this flow's packets to a controller.} The packet goes over the \key{Secure Channel}. Typically \key{used for the first packet in a new flow, so the controller can decide whether the flow should be added to the Flow Table}. Some experiments send \emph{all} packets to the controller.
+\item \key{Drop this flow's packets.} \key{Used for security}, to curb \key{denial-of-service attacks}, or to reduce spurious broadcast discovery traffic from end-hosts.
 \end{enumerate}
+\marginnote{3 simple actions!}
 
-The paper emphasizes that the action set is intentionally limited. Arbitrary handling of every packet would make high-performance, low-cost hardware difficult. OpenFlow therefore specifies a minimum useful set, while permitting implementations to support additional actions.
-
-\paragraph{Additional features and Type 1.}
-Possible extra capabilities include rewriting packet-header fields (for example, for NAT or address obfuscation) and assigning packets to priority classes. A flow table may also match arbitrary header fields to support experiments with non-IP protocols. The paper proposes that a further collection of such capabilities could be standardized as a \emph{Type 1} switch. Type 0 refers to the baseline set of header fields and four basic actions when production-traffic isolation is included in the switch specification.
-
-\subsection{Isolating Research Traffic from Production Traffic}
-
-OpenFlow is intended to permit experiments on an existing network without interrupting ordinary users. An OpenFlow-enabled commercial switch must keep experimental packets (processed using the flow table) separate from production packets (processed by the normal Layer 2/Layer 3 pipeline). The paper describes two alternatives:
+\subsection{OpenFlow-enabled switches: isolating experimental traffic}
+To win administrators' confidence, \key{OpenFlow-enabled switches must isolate experimental traffic} (processed by the Flow Table) from production traffic (processed by the normal L2/L3 pipeline). Two ways:
 \begin{enumerate}
-  \item add an action that sends a flow through the switch's normal processing pipeline; or
-  \item reserve separate VLAN sets for experimental traffic and production traffic.
+\item \key{Add a fourth action}: \key{forward this flow's packets through the switch's normal processing pipeline}.
+\item \key{Define separate sets of VLANs for experimental and production traffic}.
 \end{enumerate}
-Every OpenFlow-enabled switch must support at least one of these approaches; some support both. The purpose is not to replace the production pipeline, but to give experiments controlled access to selected traffic while the rest of the network behaves as before.
+Every OpenFlow-enabled switch must support one approach; some support both. All Flow Tables in a network can be managed by the same controller, but the \key{OpenFlow Protocol allows a switch to be controlled by two or more controllers for increased performance or robustness}.
+\marginnote{VLAN = the concept of grouping: although hosts are on the same physical network, VLANs divide them into separate logical networks (here: experimental vs.\ production). More than one controller is possible.}
 
-\subsection{Controllers and Control of Flows}
-
-A controller adds and removes flow entries on behalf of an experiment. A simple static controller could run on a PC and establish a fixed set of flows connecting test machines for the duration of an experiment. In that case, the flows behave much like VLANs by providing a way to isolate experimental traffic. In this sense, OpenFlow generalizes VLAN-based isolation.
-
-More sophisticated controllers can change entries as an experiment proceeds and support multiple researchers with separate accounts and permissions. A controller can identify which flows belong to a researcher and deliver packets for those flows to a user-level program, which decides whether to install new flow entries. One switch may be controlled by two or more controllers for performance or robustness, though coordination and consistency then become important design questions.
-
-The controller is therefore the programmable decision point, while the switch flow table performs the packet handling specified by the installed entries. The controller need not process every packet: it can make a decision when a flow begins and install an entry so subsequent packets are handled directly in the datapath.
-
-\subsubsection{Controller performance and reliability}
-
-The paper raises several questions about a controller that dynamically changes flow entries: can it process new flows and program switches quickly enough, and what happens if the controller fails? Preliminary results from the Ethane context suggested that a controller running on a low-cost desktop PC could process more than 10,000 new flows per second, considered sufficient for a large college campus in the reported setting. The achievable rate depends on how much computation an experiment requires for each flow.
-
-Scalability and redundancy may be improved by making a controller and its experiments stateless, allowing load balancing across multiple independent devices. This is a design direction rather than a guarantee that every controller workload is automatically scalable.
-
-\subsection{Using OpenFlow: Amy-OSPF Example}
-
-Suppose a researcher, Amy, wants to test a new routing protocol called \emph{Amy-OSPF} as a replacement for OSPF, without changing end-host software. Amy's protocol runs in a controller and chooses routes for application flows entering the OpenFlow network from her own desktop.
-
-The process is:
-\begin{enumerate}
-  \item Define a flow that matches traffic entering the switch through the port connected to Amy's PC.
-  \item Install an entry that encapsulates and forwards the matching packets to the controller.
-  \item When packets for a new application flow arrive, the controller runs Amy-OSPF to choose a path through the switches.
-  \item The controller installs a corresponding flow entry in each switch along that path.
-  \item Subsequent packets match the installed entries and are forwarded by the flow tables, typically at line rate, without needing a controller decision for every packet.
-\end{enumerate}
-This example illustrates the key division of labour: the researcher implements routing logic in software at the controller, while the switches enforce the resulting path through flow-table entries. Because Amy's experiment is limited to her own traffic, it need not change how other users' packets are routed.
-
-\subsection{Safety Properties for Experiments in Production Networks}
-
-The paper identifies two requirements for allowing experiments alongside ordinary users:
-\begin{enumerate}
-  \item Packets belonging to users other than the researcher must be routed using a standard, tested routing protocol running in the switch/router from the commercial vendor.
-  \item The researcher must only be able to add flow entries for their own traffic, or for traffic that the network administrator has explicitly allowed them to control.
-\end{enumerate}
-
-\paragraph{How Property 1 is achieved.}
-The OpenFlow-enabled switch can set the default action for packets not belonging to the experiment to the normal processing pipeline. The researcher's packets can instead be forwarded directly according to the experimental flow entries.
-
-\paragraph{How Property 2 is achieved.}
-This is primarily the controller's responsibility. The controller should provide permissions or other restrictions so that a researcher cannot manipulate flow entries outside the traffic they are authorized to control. The paper leaves the exact permission mechanism open because it depends on the controller implementation. It mentions NOX, developed as a follow-on to Ethane, and extending GENI management software as possible controller directions.
-
-\subsection{Example Applications}
-
-\subsubsection{Network management and access control: Ethane}
-
-OpenFlow can be viewed as a generalization of the datapath switch used by Ethane. Ethane uses a central controller to enforce network-wide policies by making admission-control and routing decisions for each new flow. Example policies include allowing guests to use HTTP only through a web proxy, or preventing VoIP phones from communicating with laptops.
-
-The controller associates packets with their senders by maintaining bindings between names and addresses. It effectively takes responsibility for functions associated with DNS and DHCP, authenticates users as they join, and tracks the switch port or access point to which each user is connected. An extension could direct selected flows to a researcher's controller process for specialized processing.
-
-\subsubsection{VLAN-like isolated networks}
-
-OpenFlow can give users isolated networks similar to VLANs. A static approach declares flow entries specifying which ports can be accessed by traffic with a particular VLAN ID. Traffic associated with a user (identified, for example, by switch port or MAC address) can be tagged with the appropriate VLAN ID by a switch action.
-
-A dynamic approach can use a controller to authenticate users and track their current locations, then tag traffic at runtime. The handwritten revision cue raises an important configuration question: if the same VLAN ID is assigned inappropriately or reused where it should distinguish traffic, the intended isolation may fail. The VLAN identifier and the rules that map users/ports to VLANs therefore need to be managed consistently; merely using a VLAN tag does not remove the need for correct policy and configuration.
-
-\subsubsection{Mobile wireless VoIP clients}
-
-A controller can track the locations of Wi-Fi-enabled VoIP clients and re-route their connections by reprogramming flow tables as users move between access points. The aim is seamless handoff from one access point to another without requiring changes to the end-host software.
-
-\subsubsection{Non-IP networks}
-
-OpenFlow does not require packets to use IP, provided the flow table can match the relevant packet header. This enables experiments with new naming, addressing, and routing schemes. Non-IP traffic could be identified through Ethernet source/destination MAC addresses, a new EtherType value, or a new IP version number. The paper also anticipates a generic matching mask of the form \emph{offset + value + mask}, allowing a researcher to specify which portions of a packet header should be matched.
-
-\subsubsection{Processing packets rather than flows}
-
-The earlier examples are flow-based: the controller makes a decision when a flow starts, then the flow table handles later packets. Some experiments instead need every packet to be processed. Examples include:
+\subsection{Additional features: Type 0 and Type 1}
 \begin{itemize}
-  \item an intrusion-detection system that inspects each packet;
-  \item explicit congestion-control mechanisms; and
-  \item modifying packet contents, such as converting packets from one protocol format to another.
+\item \key{If a switch supports the header formats and the four basic actions}, it is a \key{``Type 0'' switch}.
+\item \key{Many switches will support additional actions}, e.g., to \key{rewrite portions of the packet header} (for NAT, or to obfuscate addresses on intermediate links) and to \key{map packets to a priority class}. Some Flow Tables will match arbitrary header fields, enabling non-IP experiments. As a particular set of such features emerges, it will be defined as a \key{``Type 1'' switch}.
+\end{itemize}
+\marginnote{Type 1 = a particular set of extra features.}
+
+\section{Controllers}
+\begin{itemize}
+\item \key{A controller adds and removes flow entries from the Flow Table on behalf of experiments.}
+\item A \key{static controller} might be a \key{simple application running on a PC} that statically connects a set of test machines for an experiment. The flows then resemble VLANs, isolating experimental traffic --- so \emph{OpenFlow is a generalization of VLANs}.
+\item \key{Sophisticated controllers} \key{dynamically add/remove flows} as an experiment progresses. One \key{might support multiple researchers, each with different accounts and permissions}, letting them \key{run multiple independent experiments} on different sets of flows. Flows belonging to a researcher (e.g., identified by a policy table in the controller) can be delivered to that researcher's user-level program, which decides whether to add a new flow entry.
+\item \textbf{Performance questions:} Can a central controller process new flows fast enough? What happens if it fails? Ethane's experience suggested a low-cost PC controller can handle over 10,000 new flows/second --- enough for a large campus. Scalability and redundancy are possible by making a controller (and experiments) \emph{stateless}, allowing load balancing across several devices.
+\end{itemize}
+\paperfig[0.5]{of_fig2_network}{A network of OpenFlow switches and OpenFlow-enabled commercial switches/access points, all managed by one controller. The commercial switch keeps its normal software and datapath next to the Secure Channel and Flow Table.}
+
+\section{Using OpenFlow}
+\subsection{Example: Amy-OSPF}
+Amy has invented \emph{Amy-OSPF} to replace OSPF and wants to test it on OpenFlow switches without changing any end-host software. Amy-OSPF runs in a controller.
+\begin{enumerate}
+\item She defines a flow for all traffic entering the OpenFlow switch through the port her PC is connected to, with action ``encapsulate and forward all packets to a controller''.
+\item When a new application flow starts, its packet reaches the controller; Amy-OSPF picks a route through the switches and adds a flow entry in every switch along the path.
+\item Subsequent packets are processed quickly, at line rate, by the Flow Tables.
+\end{enumerate}
+Only traffic from her own desktop is affected, so she does not disrupt others.
+
+\subsection{Experiments in a production network: two properties}
+\begin{enumerate}
+\item Packets of users other than Amy should be routed by a standard, tested routing protocol running in the switch from a ``name-brand'' vendor.
+\item Amy should only be able to add flow entries for her own traffic, or traffic her administrator allows her to control.
+\end{enumerate}
+\begin{itemize}
+\item \key{Property 1 is achieved by OpenFlow-enabled switches.} In Amy's experiment, the \key{default action for all packets that don't come from Amy's PC is to forward them through the normal processing pipeline}; her packets go directly to the outgoing port.
+\item \key{Property 2 depends on the controller.} The controller is a platform for experiments, and \key{Property 2 can be achieved with appropriate permissions or other ways to limit researchers' power to control flow entries}. The exact mechanism depends on the controller (e.g., NOX, a follow-on to Ethane; or extended GENI management software).
 \end{itemize}
 
-The paper gives two ways to process packets in an OpenFlow-enabled network:
+\section{More example applications}
+\paragraph{Example 1: Network management and access control (Ethane).} An OpenFlow switch is a generalization of Ethane's datapath switch. Ethane lets managers define a network-wide policy in a central controller, enforced by admission-control decisions for each new flow (e.g., ``guests may use HTTP only through a web proxy'', ``VoIP phones may not talk to laptops''). The controller binds packets to senders by managing name--address bindings --- it essentially takes over DNS and DHCP, authenticates users as they join, and tracks which switch port or access point they use.
+
+\paragraph{Example 2: VLANs.} OpenFlow can give users isolated networks, as VLANs do. Static approach: declare flows specifying which ports are reachable by traffic with a given VLAN ID; traffic from one user (identified by switch port or MAC) is tagged by the switch, via an action, with the right VLAN ID. Dynamic approach: a controller authenticates users and uses their locations to tag traffic at runtime.
+\marginnote{Use of VLAN ID: hosts in the same group get the same VLAN ID.}
+
+\paragraph{Example 3: Mobile wireless VoIP clients.} In an experiment with a new call-handoff mechanism for WiFi phones, \key{VoIP clients establish a new connection over the OpenFlow-enabled network}. A \key{controller tracks the location of clients and re-routes connections} by reprogramming the Flow Tables as users move, \key{allowing seamless handoff from one access point to another}.
+\marginnote{VoIP = Voice over Internet Protocol (calls over WiFi). Seamless handoff is possible with OpenFlow!}
+
+\paragraph{Example 4: A non-IP network.} OpenFlow does not require IP, as long as the Flow Table can match the header. \key{There are several ways an OpenFlow-enabled switch can support non-IP traffic}: \key{flows could be identified by their Ethernet header} (MAC src/dst), by a \key{new EtherType value}, or, at the IP level, by a \key{new IP Version number}. Future switches might let a controller define a generic mask (offset + value + mask).
+
+\paragraph{Example 5: Processing packets rather than flows.} So far the controller decides when a flow starts. Some experiments must process \emph{every} packet: an intrusion-detection system inspecting each packet, an explicit congestion-control mechanism, or converting packets between protocol formats. Two ways:
 \begin{enumerate}
-  \item \textbf{Send all packets to the controller.} The controller does not install a new flow entry, so the switch continues to forward every packet to the controller. This is flexible and useful for testing protocol functionality, but has a performance cost and is unlikely to be suitable for deployment in a large network.
-  \item \textbf{Send packets to a programmable packet-processing device.} The OpenFlow switch acts as a patch panel, forwarding packets to an external programmable device such as a NetFPGA router. That device can process packets in a user-defined way at line rate. It may be located in a wiring closet or, more likely, in a laboratory.
+\item \key{Force all of a flow's packets to pass through a controller}: the \key{controller doesn't add a new flow entry into the Flow Table, so the switch defaults to forwarding every packet to the controller}. Flexible, but \key{at the cost of performance}; good for testing functionality, unlikely to suit a large deployment.
+\item \key{Route them to a programmable switch that does packet processing}, e.g., a \key{NetFPGA-based programmable router}. \key{Packets can be processed at line rate in a user-definable way}. The \key{OpenFlow-enabled switch acts as a patch panel to allow the packets to reach the NetFPGA}, which may sit in the wiring closet or (more likely) in a lab.
 \end{enumerate}
-The important trade-off is flexibility versus performance. Controller-level processing makes experimentation easy but can become a bottleneck; dedicated programmable hardware can process packets at line rate but requires a suitable external processing device. The red annotation beside this discussion specifically emphasizes the question of how to process packets rather than only flows.
+\paperfig[0.48]{of_fig3_netfpga}{Processing packets through an external line-rate device: the OpenFlow-enabled switch acts as a patch panel and steers selected flows (red dotted) to a NetFPGA router in a laboratory.}
+\marginnote{How to process packets rather than flows?}
 
-\subsection{OpenFlow Consortium, Specification, and Deployment}
+\section{OpenFlow Consortium and deployment}
+\key{The OpenFlow Consortium aims to popularize OpenFlow and maintain the OpenFlow Switch Specification.} It is a group of university researchers and network administrators; membership is free for schools and government agencies but excludes employees of switch/router/AP vendors, to keep it free of vendor influence. A commercial switch claiming to be OpenFlow-enabled must meet the Type 0 requirements. Two Stanford buildings were being deployed with production and experimental traffic on the same OpenFlow-enabled switches, isolated by VLANs.
 
-The OpenFlow Consortium aims to popularize OpenFlow and maintain the switch specification. It consists of researchers and network administrators at universities and colleges. The paper describes membership as open and free to schools, colleges, universities, and government agencies worldwide, while excluding individuals employed by manufacturers or sellers of Ethernet switches, routers, or wireless access points in order to limit vendor influence.
-
-The specification is available for commercial and non-commercial use. A commercial switch or router claiming to be OpenFlow-enabled must satisfy the requirements for a Type 0 switch. OpenFlow is identified as a Stanford University trademark to be protected on behalf of the Consortium. Reference implementations were intended to be open source and free for commercial and non-commercial use, subject to any license constraints of the underlying platform (for example, the Linux GPL).
-
-\paragraph{Deployment strategy.}
-The paper argues that vendors can add OpenFlow by implementing a flow table in existing hardware and running secure-channel software on the existing processor, without necessarily changing the hardware. The authors report working with manufacturers and deploying OpenFlow networks in two Stanford buildings. Their plan was to carry production and experimental traffic over the same OpenFlow-enabled infrastructure while isolating the two using different VLANs under network-administrator control. Researchers would be allowed to add and remove entries only for their own traffic.
-
-The paper also anticipates community reference designs for different platforms, including Linux software, OpenWRT for access points, and NetFPGA hardware. Testing implementations against reference designs would help create a uniform interface across heterogeneous switches and routers.
-
-\subsection{Main Takeaways for Revision}
-
+\section{Main takeaways}
 \begin{itemize}
-  \item \textbf{Problem:} Realistic experimentation is blocked by closed commercial equipment, the poor performance/port density of general-purpose PCs, and the cost or limited fanout of specialized research platforms.
-  \item \textbf{Idea:} Standardize access to a useful subset of the flow-table capabilities already present in many switches, instead of exposing all internal implementation details.
-  \item \textbf{Architecture:} Flow Table + Secure Channel + OpenFlow Protocol, controlled by a remote controller.
-  \item \textbf{Flow entry:} header match, action, and statistics.
-  \item \textbf{Baseline actions:} forward to port(s), send encapsulated packets to the controller, and drop; the commercial-switch isolation mechanism also provides a way to send experimental traffic through the normal pipeline or separate it using VLANs.
-  \item \textbf{Safety principle:} non-experimental traffic continues through standard vendor processing, while the controller restricts researchers to authorized flows.
-  \item \textbf{Flow versus packet processing:} install entries to handle subsequent packets efficiently when decisions are flow-based; use controller processing or external programmable hardware when every packet needs custom handling.
-  \item \textbf{Trade-off:} OpenFlow offers uniform programmability and realistic experiments without requiring vendors to open their entire platforms, but its practical value depends on isolation, controller performance, permissions, and deployment.
+\item \textbf{Problem:} networks are ossified; commercial gear is closed, PCs lack ports and performance, research platforms are too costly or have too few ports; GENI is years away.
+\item \textbf{Idea:} standardize access to the common flow-table functions already in most switches, without opening vendor internals.
+\item \textbf{Switch:} Flow Table (hw) + Secure Channel (sw) + OpenFlow Protocol, driven by a remote controller.
+\item \textbf{Flow entry:} header (10-tuple, wildcards) + action + statistics.
+\item \textbf{Actions:} forward to port(s); encapsulate to controller (first packet of a flow); drop; plus (for OpenFlow-enabled switches) forward through the normal pipeline. Header rewrite and priority classes are extra (Type 1).
+\item \textbf{Isolation:} the fourth action or separate VLANs. Property 1 by the switch, Property 2 by the controller's permissions.
+\item \textbf{Controllers:} static (VLAN-like) or dynamic; one switch may have several controllers.
+\item \textbf{Flows vs.\ packets:} flow-level decisions are cheap; per-packet processing goes to the controller (slow) or an external NetFPGA (line rate).
 \end{itemize}
