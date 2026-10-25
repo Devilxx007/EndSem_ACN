@@ -1,0 +1,237 @@
+\chapter{B4: Experience with a Globally-Deployed Software Defined WAN}
+\paperinfo{S. Jain, A. Kumar, S. Mandal, J. Ong, L. Poutievski, A. Singh, S. Venkata, J. Wanderer, J. Zhou, M. Zhu, J. Zolla, U. H\"olzle, S. Stuart, A. Vahdat (Google)}{ACM SIGCOMM 2013}
+
+\begin{keybox}[B4 in one paragraph]
+B4 is Google's private WAN connecting its data centres worldwide. Its traffic has three unusual properties: (i) \key{massive bandwidth to a modest number of sites}, (ii) \key{elastic demand} that wants to maximize average bandwidth, and (iii) \key{full control of the edge servers and network}, allowing rate limiting and demand measurement at the edge. These led to an \key{SDN architecture using OpenFlow to control simple switches built from merchant silicon}. A \key{centralized traffic-engineering (TE) service} drives links to \key{near 100\% utilization}, splitting application flows across multiple paths according to priority and demand.
+\end{keybox}
+
+\section{Motivation}
+\subsection{How WANs are normally built}
+\begin{itemize}
+\item WAN links are expensive and WAN packet loss is considered unacceptable, so WAN routers are \key{high-end, specialized equipment} built for high availability.
+\item WANs \key{treat all bits the same}. When a failure happens, all applications suffer equally, even though they differ greatly in how sensitive they are to capacity.
+\item So links are provisioned at only \key{30--40\% average utilization}, which hides almost all failures from clients. The cost: \key{2--3$\times$ bandwidth over-provisioning} plus expensive routing gear.
+\end{itemize}
+
+\subsection{What is different about Google's data-centre WAN}
+Google runs \key{two separate WANs}: a \emph{user-facing} network that peers with other Internet domains (must support many protocols, dense topology, highest availability), and \key{B4}, which connects data centres to each other (well over 90\% of internal application traffic). Applications on B4 fall into three classes, in \emph{increasing volume, decreasing latency sensitivity and decreasing priority}:
+\begin{enumerate}
+\item user data copies (email, documents, audio/video) to remote data centres for availability/durability --- lowest volume, most latency sensitive, highest priority;
+\item remote storage access for computation over distributed data;
+\item large-scale data push synchronizing state across data centres --- highest volume, lowest priority.
+\end{enumerate}
+Characteristics that drove the design:
+\begin{itemize}
+\item \key{Elastic bandwidth demands}: most traffic synchronizes large data sets; it uses as much bandwidth as it can get but tolerates periodic failures with temporary bandwidth reductions.
+\item \key{Moderate number of sites}: only a few dozen WAN sites, which makes central control of bandwidth feasible.
+\item \key{End-application control}: Google controls both the applications and the site networks, so it can \emph{enforce relative priorities and control bursts at the edge}, instead of by over-provisioning or complex functionality inside B4.
+\item \key{Cost sensitivity}: at B4's capacity and growth rate, the traditional 30--40\% provisioning with high per-port router cost would be prohibitively expensive.
+\end{itemize}
+
+\subsection{Why SDN and OpenFlow}
+\begin{itemize}
+\item A dedicated, \key{software-based control plane on commodity servers}, able to reason about \key{global state}, greatly simplifies coordination for planned and unplanned changes.
+\item Servers are much faster than switches' embedded processors, and can be \key{upgraded independently} of switch hardware.
+\item \key{SDN/OpenFlow decouples software and hardware evolution}: control software gets simpler and evolves faster; data-plane hardware evolves on programmability and performance.
+\item Other benefits: rapid iteration on new protocols; simpler testing (the whole stack is emulated in a local cluster); better capacity planning by simulating a \emph{deterministic} central TE server; and a \key{fabric-centric rather than router-centric} view of the WAN.
+\end{itemize}
+The design centres on (i) \key{accepting failures as inevitable and common}, with their effects exposed to applications, and (ii) switch hardware that exports a \key{simple interface to program forwarding entries under central control}.
+
+\subsection{Summary of design decisions}
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}>{\raggedright}p{0.2\linewidth} X >{\raggedright\arraybackslash}p{0.24\linewidth}@{}}
+\toprule
+\textbf{Decision} & \textbf{Rationale / benefit} & \textbf{Challenge} \\
+\midrule
+Routers built from merchant switch silicon & Apps trade average bandwidth for fault tolerance; edge control removes the need for large buffers; few sites $\Rightarrow$ no large forwarding tables; low router cost lets capacity scale. & Give up hardware fault tolerance, deep buffers and large routing tables. \\
+Drive links to 100\% utilization & Efficient use of expensive long-haul transport; many apps prefer higher average bandwidth to predictability; the biggest consumers adapt to available bandwidth. & Packet loss becomes inevitable, with large capacity loss on link/switch failure. \\
+Centralized traffic engineering & Multipath forwarding balances demand across capacity under failures and changing demand; uses application priority together with edge rate limiting; distributed TE (e.g., link-state) is known to be sub-optimal; faster, deterministic global convergence. & No existing protocols; needs knowledge of site-to-site demand and importance. \\
+Separate hardware from software & Custom routing/monitoring protocols; rapid iteration; protect against software failures by external replication; agnostic to hardware exporting the same interface. & Untested development model; breaks fate sharing between hardware and software. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\section{Architecture}
+\paperfig[0.6]{b4_fig2_arch}{B4 architecture: switch hardware layer, site controller layer, and global layer.}
+B4 is logically three layers:
+\begin{enumerate}
+\item \key{Switch hardware layer}: primarily forwards traffic; runs no complex control software. Each switch runs an \key{OpenFlow Agent (OFA)}.
+\item \key{Site controller layer}: \key{Network Control Servers (NCS)} at each site host \key{OpenFlow Controllers (OFC)} and \key{Network Control Applications (NCAs)} such as the Routing Application Proxy (RAP), Quagga and the TE agent. OFCs keep network state based on NCA directives and switch events, and tell switches which forwarding entries to set. For fault tolerance, a per-site instance of \key{Paxos} elects one of several replicas (on different servers) as primary.
+\item \key{Global layer}: logically centralized applications, e.g., the \key{SDN Gateway} and the \key{central TE server}, controlling the whole network through the site-level NCAs. The \emph{SDN Gateway hides OpenFlow and switch-hardware details from the TE server}. Global applications are replicated across sites with their own leader election.
+\end{enumerate}
+
+\subsection{Routing and TE as separate layers}
+\begin{itemize}
+\item Each server cluster is a logical \key{AS} with its own prefixes; its BGP routers peer with the B4 switches at each site (iBGP inside B4, eBGP to the clusters). Before SDN, B4 already ran as one AS using \key{BGP/IS-IS}. The SDN version had to keep supporting these protocols for interoperability with the non-SDN WAN and for a gradual rollout.
+\item Rather than one integrated centralized service, Google deployed \key{routing and TE as independent services}: standard routing first, then \key{central TE as an overlay}. This let them build and debug the SDN infrastructure (OFC, agents, routing) before adding new features.
+\item Most importantly, TE is layered on top of routing using \key{prioritized forwarding entries}. This gives a \key{``big red button''}: if TE misbehaves, disable it and the network \key{falls back to shortest-path forwarding}.
+\item \key{Topology abstraction}: a site has many switches with hundreds of ports to remote sites. TE treats \key{each site as a single node} with \key{one edge of given capacity} to each remote site. To make this valid, traffic on a site-to-site edge must be spread evenly over its constituent links, using a custom variant of \key{ECMP hashing}.
+\end{itemize}
+
+\section{Switch design}
+\paperfig[0.6]{b4_fig3_switch}{A custom-built 128-port 10GE switch: 24 merchant-silicon 16$\times$10GE chips in a two-stage Clos topology with a copper backplane.}
+\begin{itemize}
+\item Conventional WAN routers need deep buffers, huge forwarding tables and hardware high availability. B4 argues it needs none of these: \key{endpoint rate control} avoids deep buffers, \key{few sites} means small tables, and switch failures are mostly \emph{software} failures, which are handled better by moving software off the switch and using distributed-systems techniques.
+\item The main reason to build their own hardware: no existing platform could export the \key{low-level control over forwarding} an SDN needs.
+\item Switches are built from multiple \key{merchant silicon} chips in a \key{two-stage Clos} topology. Each ingress chip bounces packets to the spine unless the destination is on the same chip; spine chips forward to the right output chip.
+\item Each switch has an embedded Linux processor running the \key{OpenFlow Agent (OFA)}, a user-level process implementing a slightly extended OpenFlow. The OFA connects to a remote OFC, accepts OpenFlow commands, and sends packets and link/switch events up. Routing-protocol packets (e.g., BGP) are punted to the OFA, which forwards them to the OFC and on to the BGP stack.
+\item The OFA translates OpenFlow messages into chip driver commands. Two challenges: (1) mapping OpenFlow's architecture-neutral table entries onto the chip's pipeline of many linked tables, and (2) presenting \key{one non-blocking switch} with hundreds of 10\,Gb/s ports, when it is really many chips with separately managed tables.
+\end{itemize}
+
+\section{Network control functionality}
+\begin{itemize}
+\item Most functionality runs on NCSs at each site, sharing a dedicated \key{out-of-band control network} with the switches.
+\item \key{Paxos} does leader election for all control functions: when a majority detects a failure they elect a new leader, which gets a monotonically increasing \key{generation ID} to identify itself unambiguously to clients.
+\item The OFC is a modified \key{Onix}. Its key part is the \key{Network Information Base (NIB)}: current topology, trunk configurations and link status (operational, drained\ldots). OFC replicas are \key{warm standbys}; OFAs keep connections to several OFCs but talk to only one at a time. On start-up, the OFC reads the expected static state from configuration and then syncs with the switches for dynamic state.
+\end{itemize}
+
+\section{Routing: integrating BGP/IS-IS with OpenFlow}
+\paperfig[0.5]{b4_fig4_routing}{Integrating routing with OpenFlow: Quagga's RIB is proxied by RAP into the NIB, then into Flow and ECMP Group tables, and finally into hardware tables.}
+\begin{itemize}
+\item Routing protocols (BGP/IS-IS) come from the open-source \key{Quagga} stack running on the NCS. A \key{Routing Application Proxy (RAP)} connects Quagga to the OpenFlow switches for: (i) route updates, (ii) routing-protocol packets between switches and Quagga, and (iii) interface updates from switches to Quagga.
+\item \key{RAPd} subscribes to Quagga's \key{RIB} and proxies changes over RPC to a RAP component inside the OFC. RAP caches the RIB and translates it into NIB entries for Onix.
+\item Because switches use \key{ECMP hashing}, RAP turns each RIB entry into \key{two OpenFlow tables}: a \key{Flow table} mapping prefixes to entries in an \key{ECMP Group table}, which lists the next-hop physical interfaces. Many flows can share one group entry.
+\item BGP and IS-IS sessions run over the \emph{data plane}, but Quagga's server has no data-plane connection. So protocol packets are proxied: Quagga uses \texttt{tuntap} interfaces for each switch port, and packets travel NCS kernel $\to$ RAPd $\to$ OFC $\to$ OFA $\to$ data plane (and back). This is expedient but complex and brittle.
+\item Port state changes go the other way: OFA $\to$ OFC (updates NIB) $\to$ RAPd $\to$ Quagga's \texttt{netdev} interfaces $\to$ routing updates.
+\end{itemize}
+
+\section{Traffic engineering}
+The goal of TE is to \key{share bandwidth among competing applications, possibly using multiple paths}. The objective is \key{max-min fair allocation}: maximize utilization as long as further gain does not come from penalizing some application's fair share.
+
+\subsection{Centralized TE architecture}
+\paperfig[0.55]{b4_fig5_te}{TE overview: the Bandwidth Enforcer supplies flow groups and bandwidth functions, Topology Aggregation supplies a site-level topology, and the TE Optimization Algorithm outputs tunnels and tunnel groups, which the TED Manager sends as TE ops via the SDN Gateway.}
+The TE server works on this state:
+\begin{itemize}
+\item \key{Network topology}: sites are vertices, site-to-site connectivity are edges. The SDN Gateway gathers topology events from all sites; TE \key{aggregates trunks into site-to-site edges}, greatly shrinking the graph.
+\item \key{Flow Group (FG)}: TE cannot work per application, so applications are aggregated into an FG defined by \key{\{source site, destination site, QoS\}}.
+\item \key{Tunnel (T)}: a site-level path, e.g., $A\to B\to C$, implemented with \key{IP-in-IP encapsulation}.
+\item \key{Tunnel Group (TG)}: maps an FG to a set of tunnels with \key{weights}: the fraction of the FG's traffic sent on each tunnel.
+\end{itemize}
+The TE server outputs TGs (and by reference tunnels and FGs) to the SDN Gateway, which passes them to the OFCs to install in switches with OpenFlow.
+
+\subsection{Bandwidth functions}
+\paperfig[0.6]{b4_fig6_bwfunc}{Bandwidth functions: (a) per application, with weights 10, 1 and 0.5; (b) composed per flow group, flattened at measured demand.}
+\begin{itemize}
+\item Each application has a \key{bandwidth function}, effectively a \emph{contract} between the application and B4. It gives the bandwidth an application gets as a function of a dimensionless priority scale called \key{fair share}. Its slope is an administrator-set static \key{weight}.
+\item An FG multiplexes several applications between two sites, so \key{an FG's bandwidth function is the piecewise-linear sum} of its applications' functions. Each function is \key{flattened at the measured demand} (getting all you asked for = infinite fair share).
+\item Bandwidth functions are configured, measured and supplied to TE by the \key{Bandwidth Enforcer}, which also computes the rate limits enforced at the edge. TE's max-min objective is over this \emph{per-FG fair share}.
+\end{itemize}
+
+\subsection{TE optimization algorithm}
+An optimal LP is too expensive, so B4 uses a greedy algorithm that gets similar fairness and at least 99\% of the LP's bandwidth utilization, about 25$\times$ faster. Two parts:
+\begin{enumerate}
+\item \key{Tunnel Group Generation}: allocates bandwidth to FGs using their bandwidth functions, prioritizing at bottleneck edges.
+\item \key{Tunnel Group Quantization}: rounds each TG's split ratios to the granularity the switch hardware supports.
+\end{enumerate}
+
+\textbf{Tunnel Group Generation.} Each edge has a cost (typically latency); a tunnel's cost is the sum of its edges. An FG's \key{preferred tunnel} is its minimum-cost path that avoids every bottleneck edge.
+\begin{enumerate}
+\item Fill all FGs together on their preferred tunnels by \key{raising their fair share equally}.
+\item The first edge to become full is the \key{bottleneck edge}. Freeze every tunnel that crosses it; it is not used again.
+\item Each affected FG moves to its next preferred tunnel; keep raising fair share and finding the next bottleneck.
+\item Stop when every FG is either satisfied or has no preferred tunnel left.
+\end{enumerate}
+The result: on every edge, competing FGs either get \emph{equal fair share} or fully satisfy their demand.
+
+\paperfig[0.55]{b4_fig7_alloc}{Two TE allocations with two FGs. All edges cost 1 except $A\to D$ (cost 10). (a) FG$_1$ ($A\to B$, 20G demand) and FG$_2$ ($A\to C$, 10G); (b) after App$_1$'s demand drops, FG$_1$ needs only 10G.}
+\textbf{Worked example (Fig.\ above (a)).} FG$_1$ starts on $T_1^1=A\to B$ and FG$_2$ on $T_2^1=A\to C$. At fair share 0.9, FG$_1$ has 10\,Gb/s and FG$_2$ 0.45\,Gb/s; edge $A\to B$ is full, so $T_1^1$ is frozen. FG$_1$ moves to $T_1^2=A\to C\to B$; at fair share 3.33, edge $A\to C$ fills. FG$_1$ is forced to $T_1^3=A\to D\to C\to B$ and FG$_2$ to $T_2^2=A\to D\to C$. FG$_1$ then becomes fully satisfied and FG$_2$ gets the rest. Final splits: FG$_1 \approx 0.5{:}0.4{:}0.1$ over its three tunnels, FG$_2 \approx 0.3{:}0.7$ over two.
+\textbf{Takeaway:} \key{an FG with a higher bandwidth function pushes an FG with a lower one onto longer, lower-capacity tunnels.}
+
+\textbf{Tunnel Group Quantization.} Hardware only supports splits in fixed steps (e.g., multiples of 0.5 in the example). Optimal rounding is an integer linear program, so B4 again uses a greedy heuristic that keeps fairness and throughput close to the unquantized solution. In the example FG$_2$'s split becomes $0{:}1.0$ and FG$_1$'s becomes $0.5{:}0.5{:}0$.
+
+\section{TE protocol and OpenFlow}
+\subsection{Switch roles and table mapping}
+B4 switches play three roles:
+\begin{itemize}
+\item \key{Encapsulating switch} (source site): maps packets to an FG when the destination IP matches one of the FG's prefixes, \key{hashes each packet to one of the TG's tunnels} in the desired ratio, and adds an outer IP header whose \key{destination IP is a tunnel ID}, not a real address.
+\item \key{Transit switch}: forwards on the \key{outer header} (tunnel ID).
+\item \key{Decapsulating switch}: recognizes tunnel IDs it should terminate, removes the outer header, and forwards on the inner header using normal \key{LPM} (BGP) routes.
+\end{itemize}
+So installing one tunnel means configuring switches at several sites.
+
+\begin{center}
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{TE construct} & \textbf{Switch} & \textbf{OpenFlow message} & \textbf{Hardware table} \\
+\midrule
+Tunnel & Transit & FLOW\_MOD & LPM table \\
+Tunnel & Transit & GROUP\_MOD & Multipath table \\
+Tunnel & Decap & FLOW\_MOD & Decap tunnel table \\
+Tunnel Group & Encap & GROUP\_MOD & Multipath table, Encap tunnel table \\
+Flow Group & Encap & FLOW\_MOD & ACL table \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paperfig[0.55]{b4_fig8_multipath}{Multipath forwarding: the encap switch splits flows by hash; half get outer header 2.0.0.1$\to$4.0.0.1 (direct path), half get 2.0.0.1$\to$3.0.0.1 (through a transit site). The decap switch strips the outer header.}
+
+\subsection{Composing routing and TE in the switch}
+B4 must keep working if TE is disabled, so it runs both shortest-path routing and TE, using the \key{multiple forwarding tables} in merchant silicon:
+\begin{itemize}
+\item Routing/BGP populates the \key{LPM table}. TE uses the \key{ACL table}.
+\item Packets are matched against both \key{in parallel}, and \key{ACL rules take strict precedence over LPM}.
+\item The ACL entry points into the \key{Multipath table} (index + number of entries); the switch hashes the header modulo that number (ECMP) to pick an entry, which points into the \key{Encap Tunnel table} giving the outer source/destination IPs.
+\end{itemize}
+\paperfig[0.6]{b4_fig9_layering}{Layering TE over shortest-path forwarding in an encap switch. A packet to 9.0.0.1 matches both LPM and ACL; the ACL wins, indexes the multipath table, and the hash picks one of two tunnels.}
+This is exactly what makes the ``big red button'' work: remove the ACL (TE) entries and the LPM (routing) entries take over.
+
+\subsection{Coordinating TE state across sites}
+\begin{itemize}
+\item The TE server converts its output into a per-site \key{Traffic Engineering Database (TED)}: a key-value store of tunnels, TGs and FGs. Each OFC uses its TED to program its switches, so the TE server never deals with tables, hashing or individual switches.
+\item The TE server \key{diffs the desired TED against the current TED} and issues one \key{TE op} per difference. A TE op adds, deletes or modifies \emph{exactly one TED entry at one OFC}. The OFC turns it into flow-programming instructions for all switches at its site and waits for ACKs from all of them before replying.
+\end{itemize}
+\paperfig[0.55]{b4_fig10_schedule}{TED state and op schedules: (a) creating TG$_1$ with tunnels T$_1$ and T$_2$ for FG$_1$ ($A\to B$) --- tunnels first at every site, then the TG, then the FG; (b) removing T$_2$ from TG$_1$ --- modify the TG first, then delete T$_2$ at each site.}
+
+\subsection{Dependencies and failures}
+\begin{itemize}
+\item \key{Dependencies among ops}: to avoid drops, ops have an order. A tunnel must exist at all affected sites \emph{before} the TG and FG that use it; a tunnel cannot be deleted until everything referencing it is removed.
+\item \key{Synchronizing TED between TE and OFC}: a \key{TE session} between the master TE server and master OFC, with an ID built from both sides' mastership and process IDs. At session start both sync their TED views (either can recover the other after a restart). Ops from an old session are rejected, e.g., during a mastership flap. TED is also saved periodically to persistent storage.
+\item \key{Ordering}: delayed ops could arrive out of order (an old TG split after a newer one). Each op carries a \key{site-specific sequence ID}; the OFC rejects ops older than the highest it has seen, and the TE server retries rejected ops after a timeout.
+\item \key{Op failures} (RPC failure, OFC rejection, hardware programming failure): each TED entry has a \key{dirty/clean bit}. Issuing an op marks it dirty; the ACK cleans it; dirty entries are retried and replayed when computing diffs. This is safe because \key{TE ops are idempotent}.
+\item If no TE session can be established, TE assumes the site's \key{last known state} and \key{force-fails} new ops to that site, so no dependent ops are issued.
+\end{itemize}
+
+\section{Behaviour under failures (key results)}
+\begin{itemize}
+\item A \key{single link failure} or \key{encap switch failure} costs only milliseconds of loss: neighbouring switches simply \key{prune the failed link from their ECMP groups}.
+\item Failure of a \key{transit switch next to an encap switch} takes much longer (seconds): the encap switch must update multipath entries for every tunnel that crossed it, and each update is slow.
+\item \key{OFC and TE server failures are hitless}: losing control software does not drop data-plane traffic. \key{Disabling TE} falls back to the lower-priority routing entries.
+\item Topology aggregation greatly reduces path churn; even so, edges are added/removed several times a day. Most links run at \key{near 100\%}; this works because high-priority traffic is protected by \key{mixing priority classes on every edge}: local QoS schedulers drop low-priority traffic first, and low-priority applications throttle to available capacity.
+\item Main TE gains come during \emph{failures or high demand}: e.g., moving a weekly high-priority bulk copy off the shortest path barely changes average utilization but greatly cuts the capacity that must be deployed.
+\end{itemize}
+
+\section{Lessons from a major outage}
+During a planned maintenance move at the largest site, a new switch was \key{manually configured with the same ID} as an existing one. Switches flooded conflicting IS-IS link-state packets; because B4 sends routing-protocol packets through software (Quagga $\to$ OFC $\to$ OFA), the \key{OFC--OFA link queued up} (over 400\,MB). IS-IS Hellos were delayed behind them, interfaces were declared down and BGP adjacencies broke. TE traffic kept flowing on the \key{last known TE state}, but no new tunnels could be created. Rebooting the OFCs hit a latent bug under load; recovery needed draining the site, disabling TE and restarting the OFCs from scratch. Lessons:
+\begin{enumerate}
+\item The \key{OFC--OFA packet I/O path} must scale: e.g., separate high-priority (packet I/O) and low-priority (programming) channels, credit-based flow control, dropping superseded duplicate messages.
+\item The \key{OFA should be asynchronous and multi-threaded}, to program many chips in parallel.
+\item More performance profiling and reporting (warning signs were in the logs; the largest site was nearest its limits).
+\item Losing a control session (e.g., TE--OFC) does \emph{not} invalidate forwarding state: B4 \key{fails open} rather than rerouting around an unresponsive OFC. The catch is that physical failures and control failures cannot be told apart; acceptable because hardware is more reliable than control software.
+\item The TE server must \key{avoid failed or unresponsive OFCs} when computing new configurations.
+\item Most failures come from \key{human error}; SDN should remove multi-step manual operations.
+\item \key{Test systems to their breaking point}, including rare operations like OFC recovery under stress.
+\end{enumerate}
+
+\section{Relation to earlier papers}
+\begin{itemize}
+\item \key{RCP} (Chapter 1) centralized BGP decisions for an AS; B4 extends the idea to \key{fine-grained traffic engineering} with a full SDN implementation.
+\item \key{MPLS-TE} (MPLS data plane, OSPF/IS-IS/iBGP to spread state, RSVP-TE to set up paths) lets each site set up paths independently, without central coordination, so the result is \key{sub-optimal and non-deterministic}. B4's TE is centralized and deterministic.
+\item B4 uses \key{OpenFlow} (Chapter 3) and \key{Onix}, and follows the \key{4D} idea (Chapter 2) of a logically centralized decision layer.
+\end{itemize}
+
+\section{Revision checklist}
+\begin{itemize}
+\item \textbf{Why B4:} elastic bulk traffic, a few dozen sites, control of the edge, cost $\Rightarrow$ SDN WAN run near 100\% instead of 30--40\%.
+\item \textbf{Layers:} switch hardware (OFA) --- site controllers (NCS: OFC/Onix + NCAs, Paxos) --- global (SDN Gateway, central TE server).
+\item \textbf{Switch:} merchant silicon, two-stage Clos, no deep buffers or big tables; OFA translates OpenFlow to chip tables.
+\item \textbf{Routing:} Quagga BGP/IS-IS + RAP; RIB $\to$ NIB $\to$ Flow table + ECMP Group table; protocol packets proxied through software.
+\item \textbf{TE as overlay:} TE in ACL table beats routing in LPM table; ``big red button'' falls back to shortest path.
+\item \textbf{TE state:} topology (site-level), FG \{src site, dst site, QoS\}, tunnel (IP-in-IP site path), TG (FG $\to$ weighted tunnels).
+\item \textbf{Bandwidth function:} bandwidth vs.\ fair share, slope = weight; FG function = sum, flattened at demand; max-min fair on fair share.
+\item \textbf{Algorithm:} TG generation (raise fair share, freeze bottleneck edges, move to next preferred tunnel) + TG quantization (greedy rounding to hardware granularity).
+\item \textbf{Switch roles:} encap (FG$\to$ACL, TG$\to$multipath + encap table), transit (forward on tunnel ID), decap (strip, then LPM).
+\item \textbf{TED and TE ops:} per-site key-value DB; one op = one entry at one OFC; ordered by dependencies; sessions, sequence IDs, dirty bits, idempotent ops.
+\item \textbf{Failures:} link/encap fail = ms (ECMP pruning); OFC/TE server fail = hitless; fails open.
+\item \textbf{Outage lessons:} slow OFC--OFA path, need async OFA, profiling, fail-open trade-off, avoid failed OFCs, human error, stress testing.
+\end{itemize}

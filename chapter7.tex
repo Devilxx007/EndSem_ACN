@@ -1,0 +1,221 @@
+\chapter{B4 and After: Hierarchy, Partitioning and Asymmetry in Google's SD-WAN}
+\paperinfo{C.-Y. Hong, S. Mandal, M. Al-Fares, M. Zhu, R. Alimi, et al.\ (Google)}{ACM SIGCOMM 2018}
+
+\begin{keybox}[B4-After in one paragraph]
+This paper describes \key{five years of B4's evolution}: from a best-effort, content-copy network (\key{99\%} availability) to a \key{carrier-grade} network (\key{99.99\%}), while traffic grew \key{100$\times$}. The central challenge is a \key{tension} between three things: \key{hierarchy} (needed for scalability), \key{partitioning} (needed for availability), and \key{capacity asymmetry} (inevitable in any large network). The answer has three parts: (i) a custom \key{hierarchical topology} (supernodes and sidelinks) that scales horizontally and vertically; (ii) a \key{hierarchical TE} algorithm that handles capacity asymmetry \key{without extra packet encapsulation}; (iii) \key{two-stage matching and hashing} in switch forwarding rules to stay within hardware table limits.
+\end{keybox}
+
+\section{Motivation: what changed since B4 (2013)}
+\begin{itemize}
+\item B4 started for loss-tolerant applications needing no better than 99\% availability (e.g., index copies). Over time it had to carry applications with \key{service level objectives (SLOs) of 99.99\%}.
+\item \textbf{Availability SLO of X\%} means both network connectivity (packet loss below a threshold) \emph{and} promised bandwidth between every pair of data-centre sites are available X\% of the minutes in a trailing 30-day window.
+\item Conventional wisdom says such availability needs heavy over-provisioning and fast local failure recovery (within ~50\,ms).
+\item At the same time, bandwidth demand grew \key{100$\times$ in five years} (doubling every ~9 months), across many dimensions: capacity, number of sites, number of TE paths, number of prefixes --- all \key{without downtime} for existing traffic.
+\end{itemize}
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Service class} & \textbf{Example applications} & \textbf{Availability SLO} \\
+\midrule
+SC4 & Search ads, DNS, WWW & 99.99\% \\
+SC3 & Photo service backend, Email & 99.95\% \\
+SC2 & Ads database replication & 99.9\% \\
+SC1 & Search index copies, logs & 99\% \\
+SC0 & Bulk transfer & N/A \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Three lessons that drove the redesign}
+\subsection{A flat topology scales poorly and hurts availability}
+The original site hardware had a rigid structure, so capacity was added by \key{building new B4 sites next to existing ones}. At scale this caused three problems:
+\begin{enumerate}
+\item The central TE algorithm runs on the \key{site-level topology}; its runtime grew \key{super-linearly} with site count. Slow TE meant long periods of \key{blackholing} after data-plane failures, violating availability targets.
+\item More sites put pressure on limited \key{switch forwarding-table space}.
+\item Most important: it \key{complicated capacity planning and confused application developers}, who had to understand which of several nearby B4 sites a cluster mapped to.
+\end{enumerate}
+\textbf{Solution:} a \key{two-layer hierarchical site topology}. The bottom layer is a \key{supernode}: a standard two-layer Clos fabric of merchant-silicon chips. The top layer loosely connects several supernodes in a \key{full mesh}. This scales \key{horizontally} (add supernodes, not sites) and supports \key{vertical} upgrades (replace one supernode with a new generation in place without disrupting traffic).
+
+\subsection{Capacity asymmetry in a hierarchical topology}
+\begin{itemize}
+\item Supernodes are designed to have symmetric WAN capacity, but \key{capacity asymmetry is inevitable} because of maintenance, operations and device instability. 6--20\% of site-level links had $>$5\% asymmetry.
+\item \key{Capacity asymmetry} of a site-level link $=\dfrac{\text{avg}_i(C_i)-\min_i(C_i)}{\text{avg}_i(C_i)}$, where $C_i$ is supernode $i$'s total active capacity toward the next site.
+\item In about 17\% of asymmetric site-level links, \emph{100\%} of the site-level capacity was lost, because at least one supernode lost all connectivity to the other site.
+\end{itemize}
+\paperfig[0.55]{b4a_fig3_sidelinks}{Two sites with two supernodes each; ingress traffic split equally between $A_1$ and $A_2$. (a) Without sidelinks, $A_2$ has only 2 units toward site B, so only $c=4$ can be admitted. (b) With sidelinks $A_1$--$A_2$, $c=12$ (3$\times$ more).}
+\textbf{Why asymmetry hurts:} ingress traffic is split evenly across supernodes, so the \emph{weakest} supernode limits the whole site-level link. In the example, $A_1$ has 10 units toward B and $A_2$ only 2, so only 4 units can be admitted; 8 units are wasted.
+
+\textbf{Solution: sidelinks.} \key{Sidelinks} connect supernodes \emph{within} a site in a full mesh. The central controller uses them to \key{rebalance traffic inside the site} to match the asymmetric WAN capacity. Sidelinks are inside a data centre, so they are \key{much cheaper and more reliable than long-haul WAN links} --- this cost/reliability difference is a unique WAN property the design exploits. Sidelinks also enable \key{in-place upgrades}: disabling a supernode's links for maintenance only slightly degrades site capacity instead of causing downtime.
+
+\textbf{The catch: no second layer of encapsulation.} TE normally needs tunnel encapsulation (MPLS label, IP-in-IP, VLAN tag), and commodity chips can hash on \emph{either} the inner \emph{or} the outer header. With \key{two layers of encapsulation} (site-level and supernode-level), both headers have very low entropy, so traffic cannot be split. Rewriting MAC addresses as tags was not possible either (MACs are reserved for hashing). Hence a new \key{intra-site TE algorithm that needs no tagging or encapsulation}.
+
+\textbf{The other catch: update safety.} With pre-installed tunnels, moving traffic between tunnels is atomic (only the ingress changes). Without encapsulation, supernode-level updates touch several switches and, applied in arbitrary order, cause \key{loops and blackholes} (over 38\% packet blackholing in 2\% of updates). Earlier solutions (two-phase commit, dependency trees, Dionysus) all assume tunnels/version tags. B4 instead uses a \key{dependency-graph} ordering that is provably loop- and blackhole-free.
+
+\subsection{Efficient switch rule management}
+Merchant silicon supports only a limited number of \emph{matching} and \emph{hashing} rules. The existing pipeline would run out of matching rules at ~32 sites, and hierarchical TE needs far more hashing entries for two-level splits (8$\times$ more than available even with dynamic tunnelling). Solution: \key{two-stage matching} across two pipeline tables (about 60$\times$ more sites) and \key{two-stage hashing} across the edge and backend stages of the Clos fabric.
+
+\section{Site topology evolution}
+\paperfig[0.95]{b4a_fig4_fabrics}{B4 fabric evolution from the flat Saturn topology to the hierarchical Jumpgate topology (JPOP and Stargate) built from supernodes.}
+\begin{center}
+\small
+\begin{tabular}{@{}llllll@{}}
+\toprule
+\textbf{Fabric} & \textbf{Year} & \textbf{Location} & \textbf{Chip} & \textbf{Site capacity} & \textbf{Control domains/site} \\
+\midrule
+Saturn & 2010 & Data centre & 24$\times$10G & 5.12/6.4T WAN, 5.12T cluster & 1 \\
+JPOP & 2013 & POP (transit) & 16$\times$40G & 10.24T (WAN/sidelinks) & 2 \\
+Stargate & 2014 & Data centre & 32$\times$40G & 81.92T (WAN/cluster/sidelinks) & 4 \\
+\bottomrule
+\end{tabular}
+\end{center}
+\begin{itemize}
+\item \key{Saturn} (first generation, 2010): two stages of Saturn chassis (lower stage cluster-facing, upper stage WAN-facing; the difference allowed transit traffic). Physically split across two buildings so a site could survive losing one building at reduced capacity. \key{One control domain per site}.
+\item \key{Jumpgate} (umbrella for the new fabrics): introduces the \key{supernode}, a \key{2-stage folded Clos}. Half of the lower-stage ports face outward and can be flexibly used toward other B4 sites, cluster fabrics, or other supernodes (\key{sidelinks}). A site is a \key{full mesh of supernodes}.
+\item \key{Partitioning for availability}: Saturn's single control domain meant one faulty domain controller damaged \emph{all} traffic through a site. Jumpgate splits a site into \key{multiple control domains, one per supernode}, reducing the \key{blast radius} of a controller fault to one supernode. Later generations use more supernodes and domains.
+\item \key{JPOP}: a low-cost, high-density configuration for \key{transit-only POP sites}. Transit sites shorten cable spans between data centres (long intercontinental cables are fragile) and make the topology more ``meshy'', helping TE route around failures.
+\item \key{Stargate}: replaces Saturn; up to four supernodes, over 8$\times$ Saturn's capacity. It is big enough to \key{subsume the campus aggregation network} and connect directly to the Jupiter cluster fabrics, simplifying modelling, capacity planning and management.
+\end{itemize}
+\paperfig[0.45]{b4a_fig5_stargate}{Stargate subsumes the campus aggregation network: clusters connect to it directly over BGP, and intra-site TE runs inside the site.}
+
+\section{Hierarchical traffic engineering}
+\subsection{Requirements and two straw men}
+Managing asymmetry needs supernode-level load balancing that is \key{fast} (shorter blackholing after failures), \key{efficient} (high throughput within switch table limits), and uses \key{at most one layer of encapsulation}.
+\begin{itemize}
+\item \key{Flat TE on supernodes does not scale}: run TE on the full supernode-level graph with IP-in-IP tunnels. TE complexity grows super-linearly with topology size: with four supernodes per site a 3-hop site path becomes $4^3=64$ supernode paths. Runtime was 188$\times$ higher than hierarchical TE, with much larger switch tables.
+\item \key{Supernode-level shortest-path routing is inefficient under asymmetry}: site-level TE plus shortest-path routing inside sites scales and needs one encapsulation, and can route around a \emph{complete} WAN failure via sidelinks, but it \key{cannot use longer paths via sidelinks} to exploit asymmetric capacity. Tweaking sidelink metrics affects every other site-level link sharing them.
+\end{itemize}
+
+\subsection{Hierarchical TE architecture}
+\paperfig[0.55]{b4a_fig6_hierte}{Hierarchical TE: TG (site-level TE, IP-in-IP), TSG (new supernode-level TE, no encapsulation, progressive waterfill over sidelinks, loop-free updates), SSG (switch-level two-stage load balancing with WCMP).}
+The pathing hierarchy:
+\begin{itemize}
+\item \key{Flow Group (FG)}: \key{$\langle$source site, destination site, service class$\rangle$}; service class is carried in the \key{DSCP} bits. The central controller allocates paths per FG.
+\item \key{Tunnel Group (TG)}: maps an FG to a set of \key{site-level tunnels} via \key{IP-in-IP}, with weights from the (approximately max-min fair) B4 TE algorithm.
+\item \key{Tunnel Split Group (TSG)} (\textbf{new}): a \key{supernode-level rule} saying how traffic \emph{within a tunnel} is split between supernodes in the \key{self-site} (via sidelinks) and the \key{next site}.
+\item \key{Switch Split Group (SSG)}: the split across physical links on each switch, computed by the \key{domain controller}.
+\end{itemize}
+\textbf{TG and TSG are decoupled for scalability}: TSGs are computed from topology only; TG generation then runs on a \emph{site-level abstract topology} whose link capacities come from the TSG results. Steps:
+\begin{enumerate}
+\item The domain controller computes \key{supertrunk} (supernode-level link) capacity by aggregating active physical links, adjusted for fabric impairments.
+\item The central controller computes \key{TSGs for each outgoing site-level link}. If capacity is symmetric, sidelinks are unused; otherwise TSGs rebalance traffic via sidelinks to match outgoing supertrunk capacity (fair-share allocation).
+\item TSGs give the \key{effective capacity} of each site-level link, which feeds \key{TG generation}.
+\item A \key{dependency graph} sequences the TE ops loop- and blackhole-free.
+\item FGs, TGs and TSGs are programmed through the domain controllers, which compute SSGs and install \key{hierarchical splitting rules across two levels of the Clos fabric}.
+\end{enumerate}
+
+\subsection{TSG generation}
+\textbf{Problem.} Assuming a tunnel's incoming traffic is split equally across the source site's supernodes, compute TSGs for each supernode along the tunnel that \key{maximize the traffic admitted into the tunnel} subject to supertrunk capacities. Each TSG uses integer weights whose sum is at most a threshold $T$ (hardware hashing table limit).
+\paperfig[0.95]{b4a_fig7_tsg}{TSGs for tunnel $A\to B\to C$ under different failures; each supertrunk has capacity $c$ and TC is the resulting tunnel capacity. (a) symmetric; (b) $B_1$ loses both links to C, so its TSG sends everything to $B_2$; (c) $B_2$ has twice $B_1$'s capacity, so $B_1$ splits 2:1 between next-site and self-site; (d) $B_1$ loses next-site and self-site links; (e)--(f) consecutive asymmetric links.}
+\begin{itemize}
+\item TSGs are computed \key{independently per site-level link}, assuming \key{balanced incoming traffic} across supernodes (rarely violated). This lets TSGs be \key{shared by all tunnels} crossing that link, computed in parallel, and fit hardware limits.
+\item Rare sub-optimal cases: a supernode losing both next-site and self-site links (Fig.\ (d)); two consecutive asymmetric links (Fig.\ (e): 9c/4, 25\% below the optimal 3c of Fig.\ (f)), because TSGs ignore upstream imbalance.
+\end{itemize}
+\textbf{Algorithm} (network-flow problem per directed site-level link):
+\begin{enumerate}
+\item Build graph $G_{TSG}$: vertices are the source site's supernodes $S_i$ and the destination site $D$. Add a \key{full mesh among the $S_i$} (sidelinks) and a link $S_i\to D$ for each supernode; each link gets its aggregate supertrunk capacity.
+\item Each $S_i$ has a flow with infinite demand toward $D$, using only \key{one-hop} ($S_i\to D$) or \key{two-hop} ($S_i\to S_j\to D$) paths, with \key{one-hop strictly preferred}.
+\item A \key{greedy exhaustive waterfill} raises all flows together, allocating bottleneck capacity in a \key{max-min fair} way: find the link offering the minimum fair share (bottleneck), allocate, remove exhausted capacity, repeat. Stop when some flow has no path with remaining capacity.
+\item $TSG(u,v)$ = fraction of $u$'s traffic sent to $v$, proportional to the capacity allocated on $(u,v)$.
+\end{enumerate}
+\textbf{Theorem 4.1 (no loops).} Since direct paths are preferred, a supernode only forwards to a peer after its own direct link is bottlenecked. A loop $S_0\to S_1\to\cdots\to S_0$ would require each $(S_i,D)$ to be bottlenecked before $(S_{i+1},D)$, all the way round --- a cycle of ``before'' relations, impossible since each link is bottlenecked once.
+
+\subsection{Sequencing TSG updates}
+Applying TSG updates in arbitrary order causes transient but severe loops and blackholes. The sequencing algorithm:
+\begin{enumerate}
+\item Build a \key{dependency graph} on the same vertices: an edge $S_i\to S_j$ if $S_j$ is a next hop of $S_i$ in the \emph{target} TSGs, and $S_i\to D$ if $S_i$ forwards directly to the next site.
+\item By Theorem 4.1 it is a \key{DAG}, so a topological order exists.
+\item \key{Update supernodes in reverse topological order} (downstream first). This mirrors how IGPs handle link-down and metric changes.
+\end{enumerate}
+\textbf{Theorem 4.2 (no transient loops).} Each vertex is \emph{resolved} (uses target TSG) or \emph{unresolved} (uses original TSG). Loops cannot form among resolved vertices (target is loop-free) nor among unresolved ones (original is loop-free). A mixed loop needs an edge from a resolved to an unresolved vertex, but reverse topological order guarantees resolved vertices only forward to resolved ones.
+
+\textbf{Theorem 4.3 (no new blackholes).} If the target is blackhole-free and the set of down links does not change, no intermediate state blackholes a flow that was not already blackholing: a new blackhole would have to occur at or after the first resolved vertex, but resolved vertices only forward to resolved vertices, which follow the blackhole-free target.
+
+In practice sequencing needs only one or two ``steps'' for over 99.7\% of TSG ops, at the cost of somewhat higher update latency; without it, ~3\% of updates dropped capacity to zero.
+
+\section{Efficient switch rule management}
+\subsection{Hierarchical FG matching (two-stage matching)}
+\begin{itemize}
+\item Originally FGs were matched in the \key{ACL table} (generic wildcard matching). Required size $\ge$ \#sites $\times$ \#prefixes per site $\times$ \#service classes; with a 3K-entry ACL, 6 service classes and $\ge$16 prefixes per site, the limit would be hit at \key{about 32 sites}.
+\item New design splits matching into \key{two stages}:
+\begin{enumerate}
+\item The \key{VFP table} matches \key{DSCP bits} (and ingress port) and attaches a \key{VRF label} that represents the service class.
+\item The \key{per-VRF LPM table} (hundreds of thousands of entries) matches the \key{cluster prefix}. LPM cannot match DSCP directly, but can match the VRF label.
+\end{enumerate}
+This supports up to \key{1,920 sites} (about 60$\times$ more).
+\item Bonus: TE is the primary routing stack and \key{BGP/IS-IS is the backup}. Deleting TE rules at an ingress site makes packets fall back to lower-priority BGP/IS-IS rules without encapsulation. Disabling TE \emph{for a single source--destination pair} also requires matching \key{cluster-facing ingress ports} (otherwise unencapsulated packets could be wrongly encapsulated at a transit site where TE is still on) --- only feasible with two-stage matching.
+\end{itemize}
+\paperfig[0.6]{b4a_fig8_fgmatch}{Decoupling FG match into two stages: (a) before, one ACL matched DSCP and cluster prefix; (b) after, VFP matches DSCP and ingress port, then per-VRF LPM matches the cluster prefix.}
+
+\subsection{Efficient traffic hashing by partitioning (two-stage hashing)}
+\begin{itemize}
+\item The source site must implement TG, TSG and SSG splits. Originally all were collapsed onto the \key{ingress edge switches}. ECMP table size needed $\ge$ \#sites $\times$ \#pathing classes $\times$ \#TGs $\times$ \#TSGs $\times$ \#SSGs; for 33 sites that is \key{198K entries}, but switches support \key{14K}. Coarser splits would sharply reduce TE's benefit.
+\item Solution: \key{split the hashing across the two Clos stages}:
+\end{itemize}
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Stage} & \textbf{Before} & \textbf{After} \\
+\midrule
+Ingress edge switches & TG, TSG, SSG & TG, TSG (part 1) \\
+Backend switches & --- & TSG (part 2), SSG \\
+\bottomrule
+\end{tabular}
+\end{center}
+\begin{itemize}
+\item \key{Edge switches} choose the \key{tunnel} (TG split) and whether traffic goes to the \key{self-site or next-site} (TSG part 1). They encode the decision in the packet: the \key{tunnel IP} (IP-in-IP) records the TG choice, and a \key{special source MAC address} records the self/next-site choice.
+\item \key{Backend switches} read the tunnel IP and source MAC, choose the \key{peer supernode} (TSG part 2) and the \key{egress edge switch} connected to it (SSG).
+\item To further reduce rules, each edge switch uses a \key{link aggregation group (LAG)} toward its viable backend switches.
+\item Without two-stage hashing hierarchical TE would lose ~6\% throughput from coarse splits; with it, 128-way TG and TSG splits fit the hardware.
+\end{itemize}
+
+\section{Results in brief}
+\begin{itemize}
+\item \key{Scale}: traffic up 100$\times$ in five years; B4 carries more than Google's Internet-facing WAN. Stargate subsuming campus aggregation was a key growth driver.
+\item \key{Availability} is measured per FG as the \emph{minimum} of: \key{bandwidth-based availability} $=\dfrac{\text{allocation}}{\min\{\text{demand},\text{approval}\}}$ (from Bandwidth Enforcer), and \key{connectivity-based availability} from probes between all cluster pairs (1 if loss rate $\le 5\%$, otherwise decaying exponentially with loss). Availability went from 99\% to 99.99\%, meeting every service class's target.
+\item \key{Sidelinks + TSGs} cut median capacity loss from asymmetry from 3.2\% to 0.6\%.
+\item \key{Hierarchical TE} runs in 2--3\,s (188$\times$ faster than flat TE); TSG generation takes only 200--700\,ms.
+\end{itemize}
+
+\section{Operational experience and open problems}
+\begin{itemize}
+\item \key{Simpler management}: with Saturn's ECMP, the chassis with the least capacity limited the site, so operators had to manually account for asymmetry before disruptive operations. Sidelinks + TSGs let TE use asymmetric capacity automatically.
+\item With \key{multiple control domains per site}, operations now modify \key{one domain at a time}, with an \key{impact analysis} (projected capacity change, possible failures, overlapping maintenance) that can approve or reject a request.
+\item \key{Drain}: shift traffic away from an entity before a disruptive change, invoked by management tools through controller RPCs (CLI per domain controller is impractical at B4's scale).
+\item \key{Sidelink capacity planning}: up to 16\% of site capacity is dedicated to sidelinks; choosing the right amount is a hard provisioning problem.
+\item \key{Imbalanced ingress traffic}: TSGs assume balanced ingress so all tunnels sharing a site-level link use the same $\approx N$ rules ($N\approx 6$ peer sites); per-tunnel TSGs would need $>$1K rules. A future option: TSGs per pair of adjacent site-level links ($N(N-1)=30$ rules).
+\end{itemize}
+
+\section{B4 (2013) vs.\ B4-After (2018)}
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}l X X@{}}
+\toprule
+ & \textbf{B4 (2013)} & \textbf{B4 and After (2018)} \\
+\midrule
+Target & Bulk copies, $\sim$99\% availability & Up to 99.99\% (carrier grade), 100$\times$ traffic \\
+Site topology & Flat (Saturn), one control domain per site & Hierarchical: supernodes in a full mesh with sidelinks; one control domain per supernode \\
+Growth method & Add new sites nearby & Add supernodes (horizontal), upgrade in place (vertical) \\
+TE & Site-level TE: FG $\to$ TG $\to$ tunnels (IP-in-IP) & Hierarchical TE: FG $\to$ TG $\to$ TSG $\to$ SSG; TSG needs no extra encapsulation \\
+Inside a site & ECMP across links/chassis & TSGs rebalance via sidelinks for asymmetry; SSG two-stage load balancing with WCMP \\
+Update safety & Op dependencies, sequence IDs, dirty bits & Plus provably loop/blackhole-free TSG sequencing (reverse topological order) \\
+FG matching & ACL table & VFP (DSCP $\to$ VRF) + per-VRF LPM \\
+Hashing & All splits at ingress switch & Split across edge and backend Clos stages \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\section{Revision checklist}
+\begin{itemize}
+\item \textbf{Goal:} 99\% $\to$ 99.99\% availability while traffic grows 100$\times$; tension between hierarchy (scale), partitioning (availability), asymmetry (reality).
+\item \textbf{Flat topology problems:} super-linear TE runtime $\Rightarrow$ long blackholing; switch table pressure; planning/developer confusion.
+\item \textbf{Supernode:} 2-stage folded Clos; site = full mesh of supernodes connected by sidelinks; one control domain per supernode (small blast radius).
+\item \textbf{Fabrics:} Saturn (flat, 2010) $\to$ JPOP (transit POPs, 2013) $\to$ Stargate (2014, subsumes campus aggregation).
+\item \textbf{Asymmetry:} $(\text{avg}-\min)/\text{avg}$ of supernode capacities; weakest supernode limits the site link; sidelinks fix it cheaply.
+\item \textbf{Why no second encapsulation:} chips hash on only inner or outer header; two layers $\Rightarrow$ low entropy $\Rightarrow$ no splitting.
+\item \textbf{Hierarchy:} FG (src site, dst site, service class/DSCP) $\to$ TG (site tunnels, IP-in-IP) $\to$ TSG (self-site vs.\ next-site supernode split) $\to$ SSG (per-switch link split).
+\item \textbf{TSG algorithm:} per site-level link, graph of source supernodes + D, one-hop preferred over two-hop, max-min waterfill; loop-free (Thm 4.1).
+\item \textbf{TSG sequencing:} dependency DAG, update in reverse topological order; no transient loops (Thm 4.2) or new blackholes (Thm 4.3).
+\item \textbf{Two-stage matching:} VFP (DSCP/ingress port $\to$ VRF) + per-VRF LPM; $\sim$32 $\to$ 1,920 sites; enables per-pair TE disable.
+\item \textbf{Two-stage hashing:} edge = TG + TSG part 1 (tunnel IP + source MAC); backend = TSG part 2 + SSG; 198K $\to$ fits in 14K.
+\end{itemize}
