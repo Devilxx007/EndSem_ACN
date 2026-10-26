@@ -53,7 +53,7 @@ Separate hardware from software & Custom routing/monitoring protocols; rapid ite
 \end{center}
 
 \section{Architecture}
-\paperfig[0.6]{b4_fig2_arch}{B4 architecture: switch hardware layer, site controller layer, and global layer.}
+\paperfig[0.8]{b4-architecture}{B4 architecture: switch hardware layer, site controller layer, and global layer.}
 B4 is logically three layers:
 \begin{enumerate}
 \item \key{Switch hardware layer}: primarily forwards traffic; runs no complex control software. Each switch runs an \key{OpenFlow Agent (OFA)}.
@@ -88,6 +88,56 @@ B4 is logically three layers:
 
 \section{Routing: integrating BGP/IS-IS with OpenFlow}
 \paperfig[0.5]{b4_fig4_routing}{Integrating routing with OpenFlow: Quagga's RIB is proxied by RAP into the NIB, then into Flow and ECMP Group tables, and finally into hardware tables.}
+
+\paragraph{The core problem.} \key{Quagga}, the routing software, works out \emph{where} traffic should go. The switches only understand \key{OpenFlow} rules. Something has to translate between the two, and that is \key{RAP}.
+
+\paragraph{Key terms.}
+\begin{itemize}
+\item \textbf{Routing basics}
+  \begin{itemize}
+  \item \key{Routing protocol}: how routers tell each other which destinations they can reach. B4 uses two:
+    \begin{itemize}
+    \item \key{BGP} (Border Gateway Protocol): used \emph{between} separate networks (autonomous systems), e.g.\ a server cluster and B4.
+    \item \key{IS-IS}: used \emph{inside} one network to learn its topology and shortest paths.
+    \end{itemize}
+  \item \key{Prefix}: a range of IP addresses, e.g.\ \texttt{1.2.3.0/24} means 1.2.3.0--1.2.3.255. Routes are stored per prefix, not per address.
+  \item \key{RIB} (Routing Information Base): the routing table, a list of ``to reach this prefix, send out this interface'', e.g.\ \texttt{1.2.3.0/24} $\to$ \texttt{intf0, intf1}.
+  \item \key{Interface / port}: a physical connection point on a switch (\texttt{intf0}, \texttt{port35}, \dots).
+  \item \key{Next hop}: the next device or port a packet should be sent to.
+  \end{itemize}
+\item \textbf{The software pieces}
+  \begin{itemize}
+  \item \key{Quagga}: free, open-source routing software that speaks BGP and IS-IS and builds the RIB. In B4 it runs on the control servers (NCS), not on the switches.
+  \item \key{RAP} (Routing Application Proxy): the go-between connecting Quagga and the OpenFlow world. It has two parts:
+    \begin{itemize}
+    \item \key{RAPd} (RAP daemon/client): runs next to Quagga and watches its RIB.
+    \item \key{RAP server}: runs inside the OFC and receives those updates.
+    \end{itemize}
+  \item \key{RPC} (Remote Procedure Call): one program calling a function in another program over the network. This is how RAPd sends RIB changes to the RAP server.
+  \item \key{OFC} (OpenFlow Controller): the site controller that programs the switches.
+  \item \key{Onix}: the controller platform the OFC is built on.
+  \item \key{NIB} (Network Information Base): Onix's database of the network's state (ports, links and the forwarding rules that should exist). Think of it as the controller's model of the network.
+  \item \key{OFA} (OpenFlow Agent): the small program on each switch that receives rules from the OFC.
+  \item \key{Chip / hardware tables}: the switch's forwarding chip, which actually moves packets at line speed using tables stored in hardware.
+  \end{itemize}
+\item \textbf{OpenFlow tables}
+  \begin{itemize}
+  \item \key{OpenFlow}: the protocol a controller uses to install forwarding rules on switches.
+  \item \key{Flow table}: rules of the form ``packets matching X $\to$ do Y''. Here X is a prefix, e.g.\ \texttt{1.2.3.0/24} $\to$ \texttt{group 35}.
+  \item \key{ECMP} (Equal-Cost Multi-Path): when several paths are equally good, spread traffic across all of them. A hash of each packet's headers picks the path, so packets of the same connection always take the same path.
+  \item \key{ECMP Group table}: a list of port sets, e.g.\ \texttt{group 35 = \{port0, port1\}}. A flow points to a group, and the switch hashes each packet onto one port in that group.
+  \end{itemize}
+\item \textbf{The plumbing for protocol packets}
+  \begin{itemize}
+  \item \key{Data plane}: the part of the network that carries actual packets (switches and links).
+  \item \key{Control plane}: the software that decides the rules (Quagga, OFC).
+  \item \key{tuntap interface}: a fake network interface created in software. To a program it looks like a real network port, but the packets go to or from another program instead of a cable.
+  \item \key{netdev interface}: Linux's representation of a network interface, which is what Quagga watches to see if a port is up or down.
+  \item \key{NCS kernel}: the operating system of the control server Quagga runs on.
+  \end{itemize}
+\end{itemize}
+
+\paragraph{How it works.}
 \begin{itemize}
 \item Routing protocols (BGP/IS-IS) come from the open-source \key{Quagga} stack running on the NCS. A \key{Routing Application Proxy (RAP)} connects Quagga to the OpenFlow switches for: (i) route updates, (ii) routing-protocol packets between switches and Quagga, and (iii) interface updates from switches to Quagga.
 \item \key{RAPd} subscribes to Quagga's \key{RIB} and proxies changes over RPC to a RAP component inside the OFC. RAP caches the RIB and translates it into NIB entries for Onix.
@@ -96,30 +146,120 @@ B4 is logically three layers:
 \item Port state changes go the other way: OFA $\to$ OFC (updates NIB) $\to$ RAPd $\to$ Quagga's \texttt{netdev} interfaces $\to$ routing updates.
 \end{itemize}
 
+\paragraph{Path 1: a route from Quagga to the chip} (Figure top to bottom).
+\begin{enumerate}
+\item \key{Quagga} runs BGP/IS-IS and builds its \key{RIB}: \texttt{1.2.3.0/24} $\to$ \texttt{intf0, intf1}.
+\item \key{RAPd} subscribes to the RIB and sends every change by \key{RPC} to the \key{RAP server} inside the OFC.
+\item The RAP server keeps a cached copy of the RIB and translates each entry into \key{NIB} entries, as two OpenFlow tables:
+  \begin{itemize}
+  \item \textbf{Flow:} \texttt{1.2.3.0/24} $\to$ \texttt{group 35}
+  \item \textbf{ECMP group 35:} \texttt{\{port0, port1\}}
+  \end{itemize}
+\item The \key{OFC} sends these to each switch's \key{OFA} using the OpenFlow protocol.
+\item The OFA writes them into the switch chip's \key{hardware tables}, and packets are now forwarded.
+\end{enumerate}
+\emph{Why two tables?} The switch has to do ECMP hashing, so a route can't simply say ``go out port X''. It points to a \emph{group}, and the group lists the ports. Many prefixes can share the same group (e.g.\ everything heading toward Site B). When a link fails, you update one group entry instead of thousands of flows.
+
+\paragraph{Path 2: routing-protocol packets (both directions).}
+\begin{itemize}
+\item BGP and IS-IS messages have to travel over the real network links. For example, a BGP message from a server cluster arrives on a switch port.
+\item Quagga, however, runs on a server that is not connected to those links.
+\item The fix is that Quagga is given a fake \key{tuntap} interface for each switch port. Quagga thinks it is sending out ``port 5'', and the packet then travels NCS kernel $\to$ RAPd $\to$ OFC $\to$ OFA $\to$ out the real switch port. Incoming messages travel the same chain in reverse.
+\item This is ``expedient but complex and brittle'': it works and let Google reuse Quagga unchanged, but there are many hops where things can break.
+\end{itemize}
+
+\paragraph{Path 3: port status (upward).}
+\begin{itemize}
+\item If a switch port goes down: OFA $\to$ OFC (updates the NIB) $\to$ RAPd $\to$ marks the matching \key{netdev} interface down in Linux.
+\item Quagga sees ``my interface went down'' just as it would on a normal router, and recomputes routes. The new routes then flow back down through Path~1.
+\end{itemize}
+
+\paragraph{In one sentence.} Quagga thinks it is running on a normal router with normal interfaces. RAP keeps up that illusion by turning its routes into OpenFlow rules for the switches, and by relaying its protocol packets and port states between it and the real switches.
 \section{Traffic engineering}
 The goal of TE is to \key{share bandwidth among competing applications, possibly using multiple paths}. The objective is \key{max-min fair allocation}: maximize utilization as long as further gain does not come from penalizing some application's fair share.
 
+\paragraph{In plain terms.} \key{Traffic engineering (TE)} means deciding \emph{which paths} traffic takes and \emph{how much} bandwidth each kind of traffic gets, so that the WAN's expensive links are used well. \key{Max-min fairness} means: make the worst-off application as well off as possible first, then the next worst-off, and so on. You never take bandwidth from an application with a lower share just to give more to one that already has a higher share.
+
 \subsection{Centralized TE architecture}
 \paperfig[0.55]{b4_fig5_te}{TE overview: the Bandwidth Enforcer supplies flow groups and bandwidth functions, Topology Aggregation supplies a site-level topology, and the TE Optimization Algorithm outputs tunnels and tunnel groups, which the TED Manager sends as TE ops via the SDN Gateway.}
+
+\paragraph{Key terms (components in the figure).}
+\begin{itemize}
+\item \key{Bandwidth Enforcer}: measures how much each application is sending and decides how it should be shared. It supplies Flow Groups and their bandwidth functions to TE.
+\item \key{Topology Aggregation}: takes link and port status from the SDN Gateway and builds a simplified, site-level map of the network.
+\item \key{Trunk}: a bundle of physical links between two sites.
+\item \key{TE Optimization Algorithm}: the ``brain'' that decides which paths each Flow Group uses and how traffic is split across them.
+\item \key{TED Manager}: keeps the database of tunnels currently in use, and turns new decisions into \key{TE ops} (add, change or delete instructions).
+\item \key{SDN Gateway}: the TE server's only link to the network. It sends TE ops to each site's controller (OFC), which programs the switches with OpenFlow.
+\end{itemize}
+
+\paragraph{How the pieces fit.} Two inputs come in: \emph{what applications want} (from the Bandwidth Enforcer) and \emph{what the network can carry} (from Topology Aggregation). The optimization algorithm combines them into tunnels and tunnel groups. The TED Manager turns those into changes and sends them out through the SDN Gateway.
+
 The TE server works on this state:
 \begin{itemize}
 \item \key{Network topology}: sites are vertices, site-to-site connectivity are edges. The SDN Gateway gathers topology events from all sites; TE \key{aggregates trunks into site-to-site edges}, greatly shrinking the graph.
+  \begin{itemize}
+  \item \emph{Example:} three 100G trunks between sites A and B become one A--B edge of 300G. A smaller graph means a faster computation.
+  \end{itemize}
 \item \key{Flow Group (FG)}: TE cannot work per application, so applications are aggregated into an FG defined by \key{\{source site, destination site, QoS\}}.
+  \begin{itemize}
+  \item \key{QoS} (quality of service) is the traffic's priority class.
+  \item \emph{Example:} all high-priority traffic from site A to site B is one FG, however many applications produce it.
+  \end{itemize}
 \item \key{Tunnel (T)}: a site-level path, e.g., $A\to B\to C$, implemented with \key{IP-in-IP encapsulation}.
+  \begin{itemize}
+  \item \key{Encapsulation} means wrapping one packet inside another. At the tunnel's entry site, the original packet is put inside a new packet addressed to the exit site.
+  \item Switches along the way only read the outer header, so the packet follows the tunnel. At the exit, the wrapper is removed.
+  \end{itemize}
 \item \key{Tunnel Group (TG)}: maps an FG to a set of tunnels with \key{weights}: the fraction of the FG's traffic sent on each tunnel.
+  \begin{itemize}
+  \item \emph{Example:} FG $A\to B$ sends 0.5 on $A\to B$, 0.4 on $A\to C\to B$ and 0.1 on $A\to D\to C\to B$. Weights add up to 1.
+  \end{itemize}
 \end{itemize}
 The TE server outputs TGs (and by reference tunnels and FGs) to the SDN Gateway, which passes them to the OFCs to install in switches with OpenFlow.
 
 \subsection{Bandwidth functions}
 \paperfig[0.6]{b4_fig6_bwfunc}{Bandwidth functions: (a) per application, with weights 10, 1 and 0.5; (b) composed per flow group, flattened at measured demand.}
+
+\paragraph{Key terms.}
+\begin{itemize}
+\item \key{Fair share}: a single priority number with no units. Every application is compared on this one scale, and raising it means ``give everyone more''.
+\item \key{Bandwidth function}: a curve per application. It says ``at fair share $x$, this application gets $y$ Gbps''.
+\item \key{Weight}: the slope of the function, set by an administrator. At fair share 1, apps with weights 10, 1 and 0.5 get 10, 1 and 0.5 Gbps.
+\item \key{Demand}: how much the application is actually trying to send. The function goes flat there, since more fair share adds nothing.
+\item \key{Piecewise linear}: made of straight pieces joined at corners (rising, then flat).
+\item \key{Multiplex}: carry several applications' traffic together over the same path.
+\end{itemize}
+
 \begin{itemize}
 \item Each application has a \key{bandwidth function}, effectively a \emph{contract} between the application and B4. It gives the bandwidth an application gets as a function of a dimensionless priority scale called \key{fair share}. Its slope is an administrator-set static \key{weight}.
+  \begin{itemize}
+  \item A higher weight means a bigger share when bandwidth is short.
+  \end{itemize}
 \item An FG multiplexes several applications between two sites, so \key{an FG's bandwidth function is the piecewise-linear sum} of its applications' functions. Each function is \key{flattened at the measured demand} (getting all you asked for = infinite fair share).
+  \begin{itemize}
+  \item \emph{Example:} if FG$_1$ holds App$_1$ (weight 10) and App$_2$ (weight 1), its slope is $10+1=11$ until App$_1$ is satisfied, then 1, then flat once both are satisfied.
+  \end{itemize}
 \item Bandwidth functions are configured, measured and supplied to TE by the \key{Bandwidth Enforcer}, which also computes the rate limits enforced at the edge. TE's max-min objective is over this \emph{per-FG fair share}.
+  \begin{itemize}
+  \item TE raises every FG's fair share \emph{together}. Groups at the same fair share can still get very different bandwidth, because their functions differ.
+  \end{itemize}
 \end{itemize}
 
 \subsection{TE optimization algorithm}
-An optimal LP is too expensive, so B4 uses a greedy algorithm that gets similar fairness and at least 99\% of the LP's bandwidth utilization, about 25$\times$ faster. Two parts:
+An optimal LP is too expensive, so B4 uses a greedy algorithm that gets similar fairness and at least 99\% of the LP's bandwidth utilization, about 25$\times$ faster.
+
+\paragraph{Key terms.}
+\begin{itemize}
+\item \key{LP (linear program)}: a mathematical method that finds the exact best allocation, but is slow on a network of B4's size.
+\item \key{Greedy algorithm}: makes the best local choice at each step instead of searching for the global optimum. It is much faster and here nearly as good.
+\item \key{Edge cost}: a number per edge, typically its latency. A \key{tunnel's cost} is the sum of its edges' costs.
+\item \key{Bottleneck edge}: an edge that has become full.
+\item \key{Frozen tunnel}: a tunnel that crosses a bottleneck edge, so it cannot carry any more traffic.
+\item \key{Satisfied FG}: an FG that already gets its full demand.
+\end{itemize}
+
+Two parts:
 \begin{enumerate}
 \item \key{Tunnel Group Generation}: allocates bandwidth to FGs using their bandwidth functions, prioritizing at bottleneck edges.
 \item \key{Tunnel Group Quantization}: rounds each TG's split ratios to the granularity the switch hardware supports.
@@ -134,12 +274,49 @@ An optimal LP is too expensive, so B4 uses a greedy algorithm that gets similar 
 \end{enumerate}
 The result: on every edge, competing FGs either get \emph{equal fair share} or fully satisfy their demand.
 
+This procedure is often called \key{progressive filling}: picture pouring water into all FGs at the same rate, where each pipe that fills up is closed off and the water finds the next route.
+
 \paperfig[0.55]{b4_fig7_alloc}{Two TE allocations with two FGs. All edges cost 1 except $A\to D$ (cost 10). (a) FG$_1$ ($A\to B$, 20G demand) and FG$_2$ ($A\to C$, 10G); (b) after App$_1$'s demand drops, FG$_1$ needs only 10G.}
-\textbf{Worked example (Fig.\ above (a)).} FG$_1$ starts on $T_1^1=A\to B$ and FG$_2$ on $T_2^1=A\to C$. At fair share 0.9, FG$_1$ has 10\,Gb/s and FG$_2$ 0.45\,Gb/s; edge $A\to B$ is full, so $T_1^1$ is frozen. FG$_1$ moves to $T_1^2=A\to C\to B$; at fair share 3.33, edge $A\to C$ fills. FG$_1$ is forced to $T_1^3=A\to D\to C\to B$ and FG$_2$ to $T_2^2=A\to D\to C$. FG$_1$ then becomes fully satisfied and FG$_2$ gets the rest. Final splits: FG$_1 \approx 0.5{:}0.4{:}0.1$ over its three tunnels, FG$_2 \approx 0.3{:}0.7$ over two.
-\textbf{Takeaway:} \key{an FG with a higher bandwidth function pushes an FG with a lower one onto longer, lower-capacity tunnels.}
+
+\textbf{Worked example (Fig.\ above (a)).} Every edge carries 10G. The tunnels, cheapest first:
+\begin{center}
+\begin{tabular}{llll}
+\hline
+FG & Tunnel & Path & Cost \\
+\hline
+FG$_1$ ($A\to B$, wants 20G) & $T_1^1$ & $A\to B$ & 1 \\
+ & $T_1^2$ & $A\to C\to B$ & 2 \\
+ & $T_1^3$ & $A\to D\to C\to B$ & 12 \\
+FG$_2$ ($A\to C$, wants 10G) & $T_2^1$ & $A\to C$ & 1 \\
+ & $T_2^2$ & $A\to D\to C$ & 11 \\
+\hline
+\end{tabular}
+\end{center}
+
+FG$_1$ starts on $T_1^1=A\to B$ and FG$_2$ on $T_2^1=A\to C$. At fair share 0.9, FG$_1$ has 10\,Gb/s and FG$_2$ 0.45\,Gb/s; edge $A\to B$ is full, so $T_1^1$ is frozen. FG$_1$ moves to $T_1^2=A\to C\to B$; at fair share 3.33, edge $A\to C$ fills. FG$_1$ is forced to $T_1^3=A\to D\to C\to B$ and FG$_2$ to $T_2^2=A\to D\to C$. FG$_1$ then becomes fully satisfied and FG$_2$ gets the rest. Final splits: FG$_1 \approx 0.5{:}0.4{:}0.1$ over its three tunnels, FG$_2 \approx 0.3{:}0.7$ over two.\footnote{Assuming exactly 20G and 10G demands on 10G edges, the arithmetic gives FG$_2$ about $0.17{:}0.83$. Either way, quantization rounds it to $0{:}1.0$.}
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Phase & Fair share & What happens \\
+\hline
+1 & $0 \to 0.9$ & FG$_1$ rises fast (steep function); $A\to B$ fills; $T_1^1$ frozen. \\
+2 & $0.9 \to 3.33$ & FG$_1$ spills onto $A\to C\to B$, competes with FG$_2$; $A\to C$ fills. \\
+3 & $> 3.33$ & Both use the expensive paths via $D$; FG$_1$ becomes satisfied. \\
+4 & until done & FG$_2$ rises alone on $A\to D\to C$ until it gets its 10G. \\
+\hline
+\end{tabular}
+\end{center}
+
+\textbf{Takeaway:} \key{an FG with a higher bandwidth function pushes an FG with a lower one onto longer, lower-capacity tunnels.} In the example, FG$_1$'s steeper function lets it take the short, cheap paths first. FG$_2$ is left with the long, expensive path through $D$.
 
 \textbf{Tunnel Group Quantization.} Hardware only supports splits in fixed steps (e.g., multiples of 0.5 in the example). Optimal rounding is an integer linear program, so B4 again uses a greedy heuristic that keeps fairness and throughput close to the unquantized solution. In the example FG$_2$'s split becomes $0{:}1.0$ and FG$_1$'s becomes $0.5{:}0.5{:}0$.
+\begin{itemize}
+\item \key{Integer linear program}: an LP whose answers must be whole steps. It is even slower to solve than a normal LP.
+\item After rounding, FG$_1$ puts 10G on $A\to B$ and 10G on $A\to C\to B$. FG$_2$ puts 10G on $A\to D\to C$. Every edge still fits within 10G.
+\end{itemize}
 
+\paragraph{In one sentence.} Raise every FG's fair share together. When an edge fills, freeze it and move the affected FGs to their next-cheapest tunnel. Stop when everyone is satisfied or out of paths, then round the splits to what the hardware supports.
 \section{TE protocol and OpenFlow}
 \subsection{Switch roles and table mapping}
 B4 switches play three roles:
