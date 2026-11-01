@@ -1,0 +1,180 @@
+\chapter{Integrating Microsecond Circuit Switching into the Data Center (Mordia)}
+\paperinfo{G. Porter, R. Strong, N. Farrington, A. Forencich, P. Chen-Sun, T. Rosing, Y. Fainman, G. Papen, A. Vahdat (UC San Diego, Google)}{ACM SIGCOMM 2013}
+
+\begin{keybox}[Mordia in one paragraph]
+Earlier designs used \key{optical circuit switching (OCS) to reduce the cost of data-centre networks}, but their \key{slow switching times (10--100\,ms)} and the \key{latency of their control planes} restricted them to the \key{largest data centres with highly aggregated, stable workloads}. This paper builds \key{Mordia}, a 24-port OCS prototype that switches in \key{11.5\,$\mu$s}, and a \key{microsecond-latency control plane} based on \key{Traffic Matrix Scheduling (TMS)}. Instead of measuring long-lived traffic and reconfiguring the topology in response, TMS uses \key{application information and short-term demand estimates} to \key{compute short-term circuit schedules} that rapidly time-share circuits across many destinations.
+\end{keybox}
+
+\section{Motivation: reducing network cost with faster switching}
+\subsection{The problem}
+\begin{itemize}
+\item \key{As data centres grow, meeting their bisection-bandwidth needs is a challenge}. Servers already have 10\,Gb/s (and 40\,Gb/s) NICs, which translates into huge bisection bandwidth. \key{High bisection bandwidth matters because application performance and server utilization suffer} without it. The result: network \key{complexity and expense keep increasing}.
+\item Operators use \key{multi-layer topologies} (folded Clos / \key{FatTree}). They scale to very high port counts, but each layer adds a \key{significant cost}, partly because of the \key{large number of switches}, optical transceivers, \key{fibres and power} needed.
+\item Recent work proposed \key{optical circuit switches (OCS)} to provide reconfigurable bandwidth and \key{cut the cost of multi-layer scale-out networks} (Fig.~below (b)).
+\item The key \key{challenge} with these proposals was their \key{slow reconfiguration time}, driven by 3D-MEMS technology. Two parts dominate it:
+\begin{enumerate}
+\item the \key{hardware switching time} of the 3D-MEMS OCS (10--100\,ms);
+\item the \key{software/control-plane overhead} of measuring communication patterns and computing a new schedule (100\,ms to 1\,s).
+\end{enumerate}
+So the control plane could only handle highly aggregated traffic at the core, or applications with very stable traffic.
+\item \key{As optical switches get faster}, using them more widely (e.g., to connect top-of-rack switches) \key{requires a faster control plane} capable of \key{efficiently using short-lived circuits}. That \key{control plane} is this paper's contribution.
+\end{itemize}
+\marginnote{Cost $\uparrow$ because of the hardware (many switches, transceivers, fibres, power). This (OCS) will be solved! Two delays: (1) optical path setup delay; (2) control-plane delay. $\downarrow$ This (fixing them) is what this paper introduces.}
+
+\paperfig[0.85]{mo_fig1_fattree_hybrid}{(a) A multi-layer FatTree: every layer adds electronics, core transceivers, fibre and power. (b) A hybrid electrical/optical design needs only one ``layer'' if the OCS reconfigures fast enough.}
+
+\subsection{Why multi-layer networks are expensive}
+\begin{itemize}
+\item FatTrees are scalable and flexible (any node can talk to any other at full bandwidth), but must be provisioned for the \emph{worst case}, needing up to 5--9 layers in the largest networks, with each upper layer less utilized than the one below.
+\item An $N$-level FatTree of $k$-radix switches supports $k^N/2^{N-1}$ servers, and each layer needs $k^{N-1}/2^{N-2}$ switches.
+\item Two trends add layers: \key{fault tolerance} (redundant links halve the effective switch radix) and \key{higher link rates} (40\,Gb/s switches have much lower radix, 16--24 ports, than mature 10\,Gb/s switches with 64--96).
+\end{itemize}
+
+\subsection{The OCS model}
+\begin{itemize}
+\item An $N$-port optical circuit switch with reconfiguration latency of $O(10)\,\mu$s. Each input port maps to any output port, with \key{only one input per output} at a time.
+\item The OCS \key{does not buffer packets} and does \key{not interpret packet bits}; an \key{external scheduler} decides and programs the time-varying input--output mapping.
+\item ToRs support \key{per-destination flow control}: packets for destination $D$ are sent only while a circuit to $D$ exists; others \key{queue at the edge ToR}, and \emph{all} packets queue during reconfiguration. So the ToR must be \key{synchronized} with the OCS. The queueing delay is bad for small, latency-sensitive flows; those can go over a \key{packet switch} as in hybrid designs.
+\end{itemize}
+
+\section{Microsecond scheduling: Traffic Matrix Scheduling}
+\subsection{Hotspot scheduling (the old way)}
+Previous hybrid networks (Helios, c-Through, OSA, Flyways) use \key{hotspot scheduling (HSS)}:
+\begin{enumerate}
+\item measure the inter-rack traffic matrix,
+\item estimate the traffic demand matrix,
+\item identify hotspots,
+\item set up circuits to offload \emph{only} the hotspot traffic; everything else uses the packet-switched network.
+\end{enumerate}
+The long reconfiguration interval gives time for complex estimation, but \key{errors in picking hotspots waste capacity}: if a chosen hotspot doesn't fill its circuit, the rest of that circuit is wasted for the whole (long) configuration period. HSS is also \key{stateless}: each iteration greedily picks one perfect matching (the $k$ biggest elephants), so the control plane would have to run at the speed of host burst behaviour.
+
+\subsection{Traffic Matrix Scheduling (the new way)}
+\begin{itemize}
+\item With $\mu$s reconfiguration, \key{most traffic can go over circuits}. TMS \key{estimates demand and computes a short-term \emph{schedule}} that moves the OCS rapidly through a \key{sequence of configurations}, \key{time-sharing circuits across many destinations} at microsecond timescales.
+\item \key{Key insight:} the upcoming schedule is sent to \key{both the OCS and the ToRs}, so ToRs use each circuit as soon as it is available. Both short and long flows can be offloaded to the OCS.
+\item While one schedule runs, the control loop computes the \emph{next} one. So the \key{control plane's running time is decoupled from the switch speed}: it only needs to keep up with changes in traffic patterns.
+\item TMS computes a whole ``week'' of schedules at once, \key{amortizing one control-loop iteration over many switch reconfigurations}.
+\end{itemize}
+
+\subsection{Example: Hadoop all-to-all}
+\paperfig[0.55]{mo_fig2_hadoop}{Eight racks with all-to-all traffic: (a) physical topology, (b) logical full-mesh topology, (c) inter-rack demand matrix (each entry 1/8 of link rate), (d) circuit schedule over eight time slots.}
+\begin{itemize}
+\item Each source connects to each destination for exactly 1/8 of the time, implementing the logical full mesh at full link rate; the schedule repeats.
+\item \textbf{Two sources of waste:} (1) \key{loopback waste} --- intra-rack traffic is in the demand matrix but never crosses the circuit switch, so loopback slots are wasted (reduced by careful scheduling); (2) \key{setup waste} --- no traffic can cross while the switch reconfigures ($t_{\text{setup}}$, the black bars), reduced only by faster switching.
+\end{itemize}
+
+\subsection{Schedule computation}
+\paperfig[0.45]{mo_fig3_tms}{The four steps of Traffic Matrix Scheduling.}
+\begin{enumerate}
+\item \key{Gather the traffic demand matrix (TDM)} $M$: how much each source rack wants to send to each destination rack, in units of circuit line rate.
+\item \key{Scale $M$ into a bandwidth allocation matrix (BAM)} $M'$. If no rack sends or receives more than its link rate (row/column sums $\le 1$), the TDM is \emph{admissible} and \emph{doubly substochastic}. Scaling makes it \key{doubly stochastic} (row and column sums exactly 1, so circuits are fully used) while preserving relative demands, e.g., with \key{Sinkhorn's algorithm}, which works even if the network is over-driven.
+\item \key{Decompose the BAM into a schedule}: a convex combination of \key{permutation matrices}
+\[ \text{BAM}=\sum_{i=1}^{k} c_i P_i, \qquad k=N^2-2N+2, \]
+where each $P_i$ is one circuit configuration and $c_i$ is its slot duration as a fraction of the schedule. The \key{Birkhoff--von Neumann (BvN)} algorithm can decompose \emph{any} doubly stochastic matrix, so a perfect schedule always exists (improved versions run in $O(n\log^2 n)$ to $O(n^2)$).
+\item \key{Execute the schedule in hardware}: OCS and ToRs step through $P_1,\ldots,P_k$ for durations $t_1,\ldots,t_k$.
+\end{enumerate}
+
+\subsection{Demand estimation}
+TMS needs a demand estimate. Options: poll ToR packet counters (as in Hedera; adds delay); use OpenFlow controllers' view; query end hosts' TCP send buffers (as in c-Through); or take hints from applications (e.g., the Hadoop JobTracker). The prototype does not implement estimation.
+
+\section{Analysis}
+\subsection{Duty cycle and effective link rate}
+Each reconfiguration takes $t_{\text{setup}}$ during which no data flows; a circuit then stays up for $t_{\text{stable}}$.
+\[ D=\frac{t_{\text{stable}}}{t_{\text{setup}}+t_{\text{stable}}}, \qquad R = D\cdot R_{\text{link}} \]
+E.g., $R_{\text{link}}=10$\,Gb/s and $D=90\%$ (like Mordia) give $R=9$\,Gb/s. $D$ improves by \emph{reducing} $t_{\text{setup}}$ (switch technology) or \emph{increasing} $t_{\text{stable}}$ (controllable, but longer circuits mean more buffering). Since the OCS is \key{rate agnostic}, faster transceivers can raise bandwidth even at a lower duty cycle.
+
+\subsection{Buffer requirements: why microseconds are necessary}
+\paperfig[0.5]{mo_fig4_voq}{VOQ occupancies at a ToR from cold start (in units of slot time $T$): each queue fills until its circuit comes up and drains while it is open; steady state is reached within one schedule.}
+Each ToR keeps $N$ \key{virtual output queues (VOQs)}, one per destination; when a circuit is established, that destination's queue drains. For all-to-all traffic with $N$ ToRs, effective rate $R$ and slot time $T$:
+\[ B = R\,(N-1)\,T \ \text{bits per host} \]
+With $R=9$\,Gb/s and $N=64$: \key{$T=100$\,ms needs 7.1\,GB} of buffering per port (impractical), while \key{$T=100\,\mu$s needs only 7.1\,MB} (practical). Since $R$ and $N$ will grow, \key{the only way to make TMS practical is to shrink $T$ with microsecond switching}.
+
+\subsection{Longest time-slot first scheduling}
+BvN produces slots of very different lengths; some are tiny ($<1\%$ of the schedule) and would be dominated by switching time. Better: schedule \key{only the first $n$ (longest) slots} over the OCS and send the \key{remaining traffic over the packet-switched network}. Larger $n$ sends more traffic over circuits but lowers the duty cycle (more reconfigurations).
+\begin{center}
+\begin{tabular}{@{}cccc@{}}
+\toprule
+$n$ & Circuit & Packet & $D$ \\
+\midrule
+0 & 0\% & 100\% & N/A \\
+1 & 39.4\% & 60.6\% & 100\% \\
+3 & 63.8\% & 36.2\% & 97\% \\
+5 & 80.6\% & 19.4\% & 95\% \\
+7 & 92.3\% & 7.7\% & 93\% \\
+10 & 100\% & 0\% & 90\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+E.g., requiring $D\ge 95\%$, choose $n=5$: 80.6\% of traffic goes over circuits.
+
+\section{The Mordia OCS prototype}
+\subsection{Technology choice: 2D-MEMS wavelength-selective switches}
+\begin{itemize}
+\item \key{3D-MEMS} space switches steer large mirrors in two axes with precise analog control; more ports means larger mirrors and slower response. They offer \key{high port count but tens-of-ms reconfiguration}.
+\item A \key{wavelength-selective switch (WSS)} takes a fibre carrying $N$ wavelengths and sends any subset to $M$ output ports (a $1\times M$ switch; here $M=4$), with a ``bypass'' for the remaining $N-M$.
+\item \key{Binary (2D) MEMS} mirrors have only two mechanically stopped positions and are much smaller, so they switch \key{several orders of magnitude faster} --- but only at small port counts ($1\times4$, $1\times8$).
+\item \key{Key idea of Mordia: combine six $1\times4$ WSSes with bypass into one $24\times24$ switch.}
+\end{itemize}
+
+\subsection{Data plane: a wavelength ring}
+\paperfig[0.55]{mo_fig5_prototype}{The Mordia prototype: a ring carrying $N=24$ wavelengths through six stations. Each ToR transmits on its own wavelength; each station's WSS drops four selected wavelengths to its four ToRs. Switch time 11.5\,$\mu$s.}
+\begin{itemize}
+\item A \key{unidirectional ring of $N=24$ wavelengths} in one fibre. Each input port has \key{its own wavelength}, used by no other input; an output port can \key{tune to receive any wavelength}.
+\item So it supports circuit \key{unicast, multicast, broadcast} and \key{loopback}. Although physically a ring, any input--output mapping is possible.
+\item Six \key{stations} add/drop wavelengths. To receive, the station's WSS selects four wavelengths and sends one to each of its four ToRs; to transmit, it adds back the same four wavelengths it dropped. Wavelengths not dropped bypass the WSS.
+\item \textbf{Example:} circuit T4$\to$T5: T4 transmits on $\lambda_4$, which an optical mux adds to the ring; at Station 2 the WSS is configured to forward $\lambda_4$ to its first port (T5); the other wavelengths ($\lambda_{1\text{--}4,9\text{--}24}$) bypass and rejoin the ring.
+\item End-to-end reconfiguration time is bounded below by the WSS switching speed.
+\end{itemize}
+
+\subsection{ToRs and synchronization}
+\begin{itemize}
+\item Each ToR keeps $N-1$ queues (one per OCS output) and participates in the control plane, which tells it the \key{short-term schedule}, so it knows which circuits are coming and uses them efficiently.
+\item The OCS cannot buffer, so the ToR must drain the right queue \key{in sync} with circuit setup. Synchronization: (1) receive the schedule over an out-of-band channel (e.g., the ToR's Ethernet management port), (2) find the OCS's current state by matching \key{link up/down events} against the schedule (the scheduler can periodically lengthen one reconfiguration as a marker).
+\item \textbf{Terminology:} \key{day} = circuit up, packets flow; \key{night} = switch reconfiguring, no light, no packets; \key{week} = one full schedule. Day and week lengths can vary.
+\item When day $i$ starts the ToR drains queue $i$; at night (link down) it re-buffers the packet it was sending (likely truncated) and stops sending.
+\item The prototype's scheduler is an \key{FPGA}; the WSSes were modified to step through a programmed schedule on a single signal pin, so the prototype supports weighted round-robin schedules that can change week to week.
+\end{itemize}
+
+\subsection{Emulating ToRs with commodity servers}
+Real ToRs with per-destination flow control were not available, so 23 Linux servers emulate them. Three kernel changes:
+\begin{enumerate}
+\item \key{Synchronization packets}: the FPGA scheduler sends sync frames over a separate 10G packet network before and after each reconfiguration, carrying slot number, slot duration and whether circuits are being set up or torn down (not needed in production with NIC firmware access).
+\item \key{Ignore link-down events}: normally Linux would disable the interface and reset sockets and TCP connections on every reconfiguration.
+\item A custom \key{Mordia Qdisc} (queuing discipline): frames are placed in a per-destination VOQ; \texttt{qdisc\_dequeue} checks the current slot number and sends only from the queue whose circuit is up, using per-circuit tokens to control timing and rate; a sync frame updates the state and triggers another dequeue.
+\end{enumerate}
+\paperfig[0.5]{mo_fig6_qdisc}{Software implementation of multi-queue support in Linux: application $\to$ TCP/IP $\to$ Mordia Qdisc VOQs $\to$ dequeue only for the current slot; sync frames update the slot state.}
+
+\textbf{Results in brief:} measured switching (setup) time 11.5\,$\mu$s; despite non-realtime Linux, hosts reach about 95\% of an electrical packet switch's bandwidth for UDP and about 88\% for (non-TSO) TCP. The gap comes from the duty cycle and commodity-hardware artifacts (sync jitter, NIC delays), not from the design.
+
+\section{Scalability}
+\begin{itemize}
+\item \key{WDM}: the C-band holds 44 channels at 100\,GHz spacing (44 ports); 50\,GHz spacing gives 88 ports; WDM alone reaches at most a couple of hundred ports.
+\item \key{Bandwidth}: the data plane is \key{rate agnostic}, so faster links (40/100/400\,Gb/s) need no data-plane change --- only a faster control plane. Duty-cycle overhead depends on the per-lane line rate (likely 25--28\,Gb/s), not the aggregate rate.
+\item \key{Multiple stacked rings}: a $k\times k$ ring-selection OCS on the inputs lets $k$ rings reuse the same wavelengths (e.g., $8\times 88 = 704$ ports, about 25{,}000 servers at 40 servers/ToR). But it is \key{blocking} (not all mappings possible) and has longer weeks; tunable lasers could restore non-blocking at extra cost.
+\item \key{Integrated OCS}: build multi-stage OCSes on one board with waveguides to reduce loss.
+\end{itemize}
+\paperfig[0.45]{mo_fig12_rings}{Stacking $k$ rings behind a $k\times k$ ring-selection OCS to increase port count.}
+
+\section{Relation to other work}
+\begin{itemize}
+\item \key{Optical switch technologies}: electro-optic/semiconductor switches are nanosecond-fast but limited by crosstalk and loss; analog 3D-MEMS have high port counts but millisecond speed; \key{digital 2D-MEMS} are a middle ground (microseconds, low port count, composable).
+\item \key{Hotspot schedulers} (Helios, c-Through, Flyways, OSA) are \emph{reactive}: detect hotspots, then change topology. Mordia is \key{proactive}: many scheduling decisions amortized over one control-plane pass.
+\item \key{Optical burst switching}: also separates control and data planes; groups same-source/destination packets into bursts.
+\item \key{TDMA}: Mordia's time slots resemble TDMA, but a controller cannot send pause frames to endpoints with no circuit, so in-NIC TDMA techniques don't directly apply.
+\end{itemize}
+
+\section{Revision checklist}
+\begin{itemize}
+\item \textbf{Problem:} multi-layer FatTrees cost a lot (switches, transceivers, fibre, power); earlier OCS designs were too slow (3D-MEMS 10--100\,ms hardware + 100\,ms--1\,s control plane).
+\item \textbf{Contribution:} a microsecond control plane (TMS) + the Mordia 24-port OCS prototype switching in 11.5\,$\mu$s.
+\item \textbf{OCS model:} no buffering, no packet inspection, one input per output; external scheduler; ToRs queue per destination and must be synchronized.
+\item \textbf{HSS vs.\ TMS:} reactive hotspot offload vs.\ proactive schedule time-sharing circuits among all destinations; schedule sent to ToRs too; control loop decoupled from switch speed.
+\item \textbf{TMS steps:} gather TDM $\to$ scale to doubly stochastic BAM (Sinkhorn) $\to$ BvN decomposition into permutation matrices $\sum c_iP_i$ $\to$ execute.
+\item \textbf{Waste:} loopback waste (scheduling) and setup waste (switch speed).
+\item \textbf{Formulas:} $D=t_{\text{stable}}/(t_{\text{setup}}+t_{\text{stable}})$; $R=D\,R_{\text{link}}$; $B=R(N-1)T$ (7.1\,GB at 100\,ms vs.\ 7.1\,MB at 100\,$\mu$s).
+\item \textbf{Longest time-slot first:} use only the $n$ longest slots on the OCS; the rest goes over the packet switch; trade-off between circuit share and duty cycle.
+\item \textbf{Mordia hardware:} six $1\times4$ binary-MEMS WSS stations on a 24-wavelength ring; each input has its own wavelength; outputs tune to any wavelength.
+\item \textbf{Day / night / week:} circuit up / reconfiguring / one schedule.
+\item \textbf{Host changes:} sync packets, ignore link-down, Mordia Qdisc with VOQs.
+\item \textbf{Scaling:} more wavelengths, rate-agnostic data plane, stacked rings (blocking), integrated OCS.
+\end{itemize}
