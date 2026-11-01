@@ -39,14 +39,51 @@ So the control plane could only handle highly aggregated traffic at the core, or
 
 \section{Microsecond scheduling: Traffic Matrix Scheduling}
 \subsection{Hotspot scheduling (the old way)}
-Previous hybrid networks (Helios, c-Through, OSA, Flyways) use \key{hotspot scheduling (HSS)}:
+\paragraph{The setting.} In a hybrid data centre every rack's top-of-rack (ToR) switch is connected to two networks at once:
+\begin{itemize}
+\item an \key{electrical packet switch (EPS)}: flexible (any rack can reach any rack at any moment), but expensive to give a lot of bandwidth;
+\item an \key{optical circuit switch (OCS)}: a box of mirrors that gives a \emph{huge-bandwidth pipe between a pair of racks}, cheap per bit, but \key{one destination per port at a time}, and it must physically move mirrors to change who is connected to whom.
+\end{itemize}
+The old optical switches (3D-MEMS) took \key{10--100\,ms} to move, and measuring traffic and computing a plan took another \key{100\,ms--1\,s}. So the earlier hybrid systems (\key{Helios, c-Through, OSA}, and the wireless \key{Flyways}) could only reconfigure the OCS \emph{rarely} --- once every few hundred milliseconds or seconds. \key{Hotspot scheduling (HSS)} is the strategy built around that limitation.
+
+\begin{keybox}[The idea of hotspot scheduling]
+Find the few rack pairs exchanging the most traffic (the \key{hotspots} / ``elephant flows''), give \emph{them} a dedicated optical circuit, and leave \emph{everything else} on the normal packet network.
+\end{keybox}
+
+\paragraph{The four-step loop.}
 \begin{enumerate}
-\item measure the inter-rack traffic matrix,
-\item estimate the traffic demand matrix,
-\item identify hotspots,
-\item set up circuits to offload \emph{only} the hotspot traffic; everything else uses the packet-switched network.
+\item \key{Measure} the inter-rack traffic: count how much each rack sends to each other rack.
+\item \key{Estimate} the traffic demand matrix: a prediction of who will send how much to whom.
+\item \key{Identify hotspots}: pick the heaviest pairs. Since each OCS port connects to only one other port, it picks \emph{one partner per rack} --- a \key{matching} covering the biggest flows.
+\item \key{Configure} the OCS: move the mirrors to build those circuits. Hotspot traffic now uses the optical circuits; all remaining traffic stays on the packet switch.
 \end{enumerate}
-The long reconfiguration interval gives time for complex estimation, but \key{errors in picking hotspots waste capacity}: if a chosen hotspot doesn't fill its circuit, the rest of that circuit is wasted for the whole (long) configuration period. HSS is also \key{stateless}: each iteration greedily picks one perfect matching (the $k$ biggest elephants), so the control plane would have to run at the speed of host burst behaviour.
+Then it \emph{holds} that configuration for a long time and repeats the loop.
+
+\paragraph{Example.} Four racks with this measured traffic (Gb/s):
+\begin{center}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{From $\backslash$ To} & \textbf{A} & \textbf{B} & \textbf{C} & \textbf{D} \\
+\midrule
+\textbf{A} & -- & \textbf{9} & 0.5 & 0.5 \\
+\textbf{B} & 0.2 & -- & 0.3 & 0.1 \\
+\textbf{C} & 0.4 & 0.2 & -- & \textbf{8} \\
+\textbf{D} & 0.3 & 0.5 & 0.1 & -- \\
+\bottomrule
+\end{tabular}
+\end{center}
+The hotspots are clearly \key{A$\to$B (9)} and \key{C$\to$D (8)}. HSS builds optical circuits A$\to$B and C$\to$D and keeps them for the next few hundred milliseconds. All the small flows (0.1--0.5\,Gb/s) stay on the packet switch.
+
+\paragraph{Why it made sense back then.} Reconfiguration was slow, so every reconfiguration was expensive: it was sensible to reconfigure \emph{rarely} and only for traffic that clearly benefits. The long gap between reconfigurations also gave plenty of time for complex demand estimation and hotspot detection.
+
+\paragraph{Its weaknesses (what Mordia fixes).}
+\begin{enumerate}
+\item \key{A wrong guess wastes the circuit for a long time.} If HSS picks A$\to$B but A finishes its transfer 10\,ms later, the A$\to$B circuit sits mostly empty for the rest of the period (possibly hundreds of ms). In the paper's words, \emph{errors in identifying hotspots can lead to significant losses in efficiency}.
+\item \key{Only elephants benefit.} All small and medium traffic --- often most flows --- never uses the cheap optical bandwidth, so a big, expensive packet network is still needed.
+\item \key{It is reactive.} It measures what already happened, then reacts; by the time the circuit is up, the traffic pattern may have changed.
+\item \key{It is stateless, one decision at a time.} Each iteration greedily picks just \emph{one} matching (the $k$ biggest elephants for a $k$-port switch), then must rerun measure $\to$ estimate $\to$ decide. With microsecond switches this loop would have to run at microsecond speed --- impossible.
+\end{enumerate}
+\marginnote{HSS = old approach for \emph{slow} optical switches: measure, estimate, find the heaviest rack pairs, give only them long-lived circuits; everything else uses the packet switch. Reactive, wastes capacity on a wrong guess, offloads only elephants.}
 
 \subsection{Traffic Matrix Scheduling (the new way)}
 \begin{itemize}
@@ -55,6 +92,27 @@ The long reconfiguration interval gives time for complex estimation, but \key{er
 \item While one schedule runs, the control loop computes the \emph{next} one. So the \key{control plane's running time is decoupled from the switch speed}: it only needs to keep up with changes in traffic patterns.
 \item TMS computes a whole ``week'' of schedules at once, \key{amortizing one control-loop iteration over many switch reconfigurations}.
 \end{itemize}
+
+\paragraph{The same 4-rack example under TMS.} Instead of permanently connecting A$\to$B and C$\to$D, TMS gives A a time slice to B, then a slice to C, then to D, and so on, with \key{slice lengths proportional to demand} (A$\to$B gets a long slice, A$\to$D a tiny one). Because the switch moves in 11.5\,$\mu$s, the slices can be very short, so \key{almost all traffic --- small flows included --- goes over the cheap optical circuits}.
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}l X X@{}}
+\toprule
+ & \textbf{Hotspot scheduling (HSS)} & \textbf{Traffic Matrix Scheduling (TMS)} \\
+\midrule
+Switch speed assumed & Slow (10--100\,ms, 3D-MEMS) & Fast ($\sim$10\,$\mu$s, 2D-MEMS WSS) \\
+Which traffic uses the OCS & Only the hotspots (elephants) & Almost all traffic, time-shared \\
+Decision style & Reactive: measure, then react & Proactive: plan a schedule ahead \\
+Output of one control loop & One matching (one configuration) & A whole ``week'' of configurations \\
+Circuit lifetime & Long (100s of ms to seconds) & Very short (microsecond slots) \\
+Who knows the plan & Only the OCS & OCS \emph{and} the ToRs (they send in sync) \\
+Cost of a wrong guess & Circuit wasted for a long period & Small: slices are short, next week adapts \\
+Control loop vs.\ switch speed & Loop must run every reconfiguration & Decoupled: loop only tracks traffic changes \\
+Examples & Helios, c-Through, OSA, Flyways & Mordia \\
+\bottomrule
+\end{tabularx}
+\end{center}
 
 \subsection{Example: Hadoop all-to-all}
 \paperfig[0.55]{mo_fig2_hadoop}{Eight racks with all-to-all traffic: (a) physical topology, (b) logical full-mesh topology, (c) inter-rack demand matrix (each entry 1/8 of link rate), (d) circuit schedule over eight time slots.}
