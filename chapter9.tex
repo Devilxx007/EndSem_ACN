@@ -1,0 +1,98 @@
+\chapter{The Internet at the Speed of Light}
+\paperinfo{A. Singla, B. Chandrasekaran, P. B. Godfrey, B. Maggs (UIUC, Duke, Akamai)}{ACM HotNets 2014}
+
+\begin{keybox}[The paper in one paragraph]
+In principle Internet latency could nearly match the \key{speed of light}, but \key{infrastructural inefficiencies and protocol overheads} make today's Internet \key{one to two orders of magnitude slower} than that bound. The paper proposes a \key{grand challenge}: a \key{speed-of-light Internet}. It (i) argues why such a leap would be transformative, (ii) measures how far today's Internet is from the bound, (iii) \key{breaks down the causes of latency inflation across the network stack} (DNS, TCP handshake, TCP transfer, physical path/routing, queuing), and (iv) proposes two broad directions to close the gap.
+\end{keybox}
+
+\section{Key definitions}
+\begin{itemize}
+\item \key{c-latency}: the round-trip time for light travelling in a \emph{vacuum} along the \key{shortest path on the Earth's surface} (great-circle path) between two end-points. This is the physical lower bound.
+\item \key{Latency inflation}: (measured latency) / (c-latency). E.g., an inflation of $34\times$ means the operation took 34 times longer than light would need.
+\item Light in \key{optical fibre} travels at about \key{$2/3\,c$}, so even a fibre laid perfectly along the great circle has an inflation of about \key{$1.5\times$}. A medium travelling at $c$ (microwave through air, free-space laser, hollow-core fibre) avoids this.
+\end{itemize}
+
+\section{Why latency matters}
+\begin{itemize}
+\item Latency drives revenue and user experience: for Amazon, 100\,ms extra latency $\approx$ 1\% sales loss; Google, 400\,ms extra $\Rightarrow$ 0.74\% fewer searches; Bing, 500\,ms $\Rightarrow$ 1.2\% less revenue per user.
+\item \key{Bandwidth is not the answer}: beyond about 5\,Mb/s, more bandwidth barely improves page load time. ``\key{Latency lags bandwidth}'' --- it is the harder problem.
+\item \key{It is achievable}: high-frequency traders cut New York--Chicago RTT from 14.5\,ms (1980s) to 13.1\,ms (straighter fibre, 2010) to 9\,ms and then 8.5\,ms with \key{microwave} links (2012), only 0.6\,ms above c-latency. Similar races exist for London--Frankfurt.
+\end{itemize}
+
+\subsection{What a speed-of-light Internet would enable}
+\begin{itemize}
+\item \key{New applications}: telemedicine, remote collaborative music, telepresence --- anything that wants to ``join'' two distant places.
+\item \key{Illusion of instant response}: humans struggle to order visual events less than about \key{30\,ms} apart, so responses within 30\,ms feel instant.
+\item \key{Super-linear community size}: the area reachable within a latency bound grows about \emph{quadratically} with communication speed (a radius-$r$ disc has area $\propto r^2$), so the \emph{population} reachable within, say, 30\,ms RTT grows super-linearly. Going from $0.05c$ to $0.5c$ ($10\times$ faster) grows the median reachable population $49\times$ (7.5M $\to$ 366M).
+\item \key{Cloud computing and thin clients}: fewer data centres can serve everyone instantly; at $c$, about 6 locations could give 99\% of the world 30\,ms reachability.
+\item \key{Better geolocation}: latency-based location becomes precise (with privacy implications).
+\item \key{CDNs don't solve it}: some things cannot be replicated (people), CDNs are expensive, and a faster Internet improves the whole cost--latency trade-off (fewer CDN locations for the same latency target).
+\end{itemize}
+\paperfig[0.95]{sp_fig1_impact}{Impact of communication speed: (a) population within 30\,ms RTT grows super-linearly; (b) number of locations needed for global 30\,ms reachability falls super-linearly; (c) the latency-target vs.\ number-of-locations trade-off improves (shown for $c/32$, $c/4$, $c$).}
+
+\section{How slow is today's Internet?}
+Fetching just the HTML of popular landing pages (28,000 sites, 400+ PlanetLab clients) takes, in the \key{median, $34\times$} c-latency, and \key{$169\times$ at the 90th percentile}. Even the median \emph{ping} speed is only about $c/4$, and HTML fetch is about $c/32$. PlanetLab clients are well connected, so real users are probably worse.
+
+\section{Why is the Internet so slow? Breaking down the inflation}
+\paperfig[0.55]{sp_fig3_breakdown}{Components of latency inflation over c-latency (CDF across traces): DNS, router-path, minimum ping, TCP handshake, TCP transfer, and total time.}
+For each fetch they measured DNS time, TCP handshake, TCP transfer and total time, plus a traceroute to estimate the physical \key{router path}. Median inflation of each component:
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Component} & \textbf{Median inflation} & \textbf{Main reason} \\
+\midrule
+Router path (physical) & $2.3\times$ & Fibre is slower ($1.5\times$) and longer than the great circle \\
+Minimum ping RTT & $3.2\times$ & Physical path + routing inflation \\
+TCP handshake (SYN/SYN-ACK) & $3.2\times$ & $\approx$ one RTT --- same as ping \\
+DNS resolution & $5.4\times$ & Long tail; dominates slow page loads \\
+TCP transfer (32\,KB) & $8.7\times$ & \key{Slow start}, not bandwidth \\
+Total fetch & $34\times$ & Components add up (long tails) \\
+\bottomrule
+\end{tabular}
+\end{center}
+\begin{itemize}
+\item \key{DNS}: 5.4$\times$ at the median but with a long tail. Among the fastest 10\% of pages even the worst DNS inflation is under $3\times$; among the slowest 10\%, even the \emph{median} DNS time is over $20\times$. (DNS is sometimes faster than c-latency because the resolver is closer than the server.)
+\item \key{TCP transfer}: $8.7\times$, mostly \key{TCP slow start} --- for small transfers the window has not grown, so the sender waits several RTTs. Bandwidth is not the bottleneck.
+\item \key{TCP handshake}: $3.2\times$, about the same as the minimum ping, i.e., one RTT.
+\end{itemize}
+
+\subsection{Physical infrastructure and routing}
+\begin{itemize}
+\item The router path is $2.3\times$ inflated at the median. Of this, $1.5\times$ is unavoidable for fibre ($2/3\,c$); the remaining \key{$\approx 1.53\times$} comes from \key{fibre routes being longer than the great circle} and from \key{routing} (e.g., ``\key{hairpinning}'': traffic between eastern China and Taiwan travelling via California). This estimate is optimistic, because traceroute misses hops.
+\item Comparing research networks (Internet2, G\'EANT), \key{road distances are close to the shortest distance, but fibre lengths are much longer with a long tail}; even point-to-point fibre is usually $1.5$--$2\times$ longer than the road.
+\end{itemize}
+\paperfig[0.42]{sp_fig4_fiber_road}{Inflation over geo-distance for fibre vs.\ road distances in (a) Internet2 and (b) G\'EANT: roads track the shortest path far better than fibre.}
+\textbf{Lower layers matter as much as protocols.} Every protocol step (DNS, handshake, transfer) consists of RTTs, so it is multiplied by physical-layer inflation. Normalizing DNS, handshake and transfer by the ping inflation ($3.2\times$) leaves only $1.7$, $1.0$ and $2.7$. So \key{inflation at the physical/network layer is a big part of the total}.
+
+\subsection{Loss, queuing and bufferbloat}
+\key{Bufferbloat} = oversized, congested router buffers adding large queuing delay. Evidence says it is \emph{not} the main cause:
+\begin{itemize}
+\item The TCP handshake time $\approx$ minimum ping, so there is little queuing; ping variation is tiny (2nd-longest ping only 1.2\% above the minimum).
+\item Over 95\% of connections saw no loss; packet inter-arrival gaps were mostly sub-millisecond or one RTT (waiting for ACKs between windows).
+\item At the real edge (Akamai server--client RTTs), the average RTT is about 30\,ms above the minimum, plausibly bufferbloat --- but that is less than 20\% of the ping inflation, which itself is only part of the total.
+\end{itemize}
+\textbf{Conclusion:} loss, queuing and bufferbloat do \emph{not} explain most of the Internet's latency inflation; \key{infrastructure (physical path) and protocol overheads (DNS, TCP) do}.
+
+\section{Two directions to close the gap}
+\begin{enumerate}
+\item \key{A parallel low-latency infrastructure.} Most flows are \emph{small} (most bytes are in a few large flows). So build a separate \key{low-bandwidth, low-latency} network for small flows, connecting major cities \key{along great-circle paths} using a \key{$c$-speed medium} (microwave or \key{hollow-core fibre}). Since roads follow shortest paths and road building costs about 100$\times$ more per mile than fibre, \key{lay fibre conduits along new or repaved roads} (as proposed US legislation would require for federal highways).
+\item \key{Latency optimizations by ISPs}, which see real-time traffic:
+\begin{itemize}
+\item track achieved \key{TCP window sizes per prefix} and tell clients to start with them, avoiding slow start;
+\item keep \key{pools of pre-established TCP connections} to popular services and splice clients onto them, removing the handshake (as Akamai does between its servers);
+\item \key{predictive} optimizations: pre-resolve names / pre-fetch resources that clients usually request next;
+\item cut the DNS tail with \key{redundant DNS queries}.
+\end{itemize}
+\end{enumerate}
+
+\section{Revision checklist}
+\begin{itemize}
+\item \textbf{c-latency:} RTT at vacuum light speed along the great-circle path; inflation = measured / c-latency.
+\item \textbf{How slow:} HTML fetch $34\times$ median, $169\times$ 90th percentile; ping $\approx c/4$.
+\item \textbf{Why it matters:} revenue, 30\,ms instant response, super-linear community growth, fewer data centres, better geolocation; CDNs are not enough.
+\item \textbf{Breakdown (median):} router path 2.3$\times$, ping 3.2$\times$, handshake 3.2$\times$, DNS 5.4$\times$ (long tail), TCP transfer 8.7$\times$ (slow start).
+\item \textbf{Physical layer:} fibre at $2/3\,c$ ($1.5\times$), longer than roads, hairpin routing; lower layers multiply every protocol RTT.
+\item \textbf{Not bufferbloat:} little queuing or loss in measurements; edge bufferbloat is $<20\%$ of ping inflation.
+\item \textbf{Fixes:} parallel $c$-speed low-bandwidth network on great-circle routes (microwave, hollow fibre, along roads); ISP tricks (window hints, connection pools, prefetch, redundant DNS).
+\item \textbf{HFT example:} NY--Chicago 14.5 $\to$ 13.1 (fibre) $\to$ 8.5\,ms (microwave), c-latency only 0.6\,ms less.
+\end{itemize}

@@ -1,0 +1,127 @@
+\chapter{SDN in the Stratosphere: Loon's Aerospace Mesh Network}
+\paperinfo{F. Uyeda, M. Alvidrez, E. Kline, B. Petrini, B. Barritt, D. Mandle, A. C. Alexander (Loon LLC)}{ACM SIGCOMM 2022}
+
+\begin{keybox}[Loon in one paragraph]
+\key{Loon} provided \key{4G LTE} coverage to under-served regions using \key{base stations carried by high-altitude balloons} (15--18\,km up, in the stratosphere). To \key{backhaul} user data, Loon built a \key{moving mesh of long-range, highly directional point-to-point radio links} connecting balloons to each other and to ground stations. Because nodes move and beams are narrow, the mesh was planned centrally by a \key{Temporospatial SDN (TS-SDN)} called \key{Minkowski}, which \key{models and forecasts the physical world} (positions, antenna geometry, weather) and folds it into network planning. The paper gives lessons on (1) \key{predictive vs.\ reactive failure recovery}, (2) a \key{hybrid, multi-channel control plane}, (3) \key{long-range point-to-point links}, and (4) \key{explainability}.
+\end{keybox}
+
+\section{Background}
+\subsection{Non-terrestrial networks (NTNs)}
+\begin{itemize}
+\item People without connectivity mostly live in remote, sparse areas where cell towers are too expensive per user, widening the digital divide.
+\item \key{Raising the transmitter} increases coverage. Options: aircraft, \key{High-Altitude Platform Stations (HAPS)} in the stratosphere, and satellites in LEO, MEO and GEO (GEO at about 36,000\,km). LEO/MEO improve capacity density (Mb/s per km$^2$) by 1--2 orders of magnitude over GEO.
+\item Loon chose cheap HAPS: \key{untethered balloons} about an order of magnitude lower than LEO, giving even higher capacity density, and close enough for ordinary phones to connect over 4G. One balloon could serve about \key{5,000\,km$^2$}.
+\end{itemize}
+
+\subsection{Service and architecture}
+\paperfig[0.48]{ln_fig2_payload}{The Loon bus: solar panels, four 4G LTE sectors (eNodeB, body fixed), three gimballed E-band backhaul terminals, and embedded computers.}
+\begin{itemize}
+\item Each balloon carried \key{LTE sector antennas and base stations (eNodeBs)}. Backhaul from the balloons to the mobile operator's core used \key{E-band} point-to-point radio links to \key{ground stations (GS)} and \key{to other balloons} --- similar to satellite \key{inter-satellite links (ISLs)}.
+\item A few \key{ground stations} (with reliable power and wired backhaul) were \key{gateways} between the balloon mesh and wired networks, carrying IPv6 traffic over encrypted tunnels to Loon's \key{Edge Compute (EC)}, which ran virtual network functions and peered with the partner's core (EPC).
+\end{itemize}
+\paperfig[0.48]{ln_fig1_mesh}{A Loon mesh spanning 3,781\,km over East Africa and the Indian Ocean (meshes regularly had 20+ balloons over 3000+\,km).}
+
+\section{Challenges and design constraints}
+\paragraph{Navigation (topology is not controllable).} Balloons had \key{no lateral thrust}; they could only change \key{altitude} to catch winds blowing the right way. The Fleet Management System (FMS) steered them, but because winds are stochastic, \key{navigation was probabilistic}, unlike deterministic satellite orbits (Starlink, Chapter 10) or steerable drones. So the controller \key{formed meshes from whichever balloons happened to be in position}. With 100+ transceivers (3 per balloon, 2 per GS site), possible antenna pairings grow as $O(n^2)$. The \key{candidate graph} --- all feasible links between transceivers --- averaged about 3,275 links and changed in 99.9\% of hours.
+
+\paragraph{Power.} Solar panels plus batteries were not enough to run LTE and backhaul all night, so service ran about \key{14 hours per day}. The network had to \key{bootstrap itself every day} and handle nodes entering low-power states (safety systems kept a reserve).
+
+\paragraph{Radio links.} Three \key{E-band (71--76/81--86\,GHz)} transceivers per balloon, up to \key{1\,Gb/s} each, with \key{high-gain, highly directional antennas on mechanical gimbals}. Both ends must \key{slew to point at each other}, using differential GPS for position/orientation (ground stations also used the balloons' ADS-B broadcasts). Once linked, local control loops track the peer by signal strength, and one-hop telemetry (position, heading) allows fast local reacquisition.
+\begin{itemize}
+\item Antennas have limited fields of view and \key{occlusions} (by the balloon's own hardware, terrain, buildings, trees near ground stations).
+\item E-band is badly \key{attenuated by rain, clouds and fog} --- far worse than Ka/Ku bands. This mainly hurts \key{balloon-to-ground (B2G)} links; \key{balloon-to-balloon (B2B)} links are above the weather.
+\item Ranges: B2G established at about 130\,km and held to 250+\,km; B2B established at 500+\,km, up to 700+\,km.
+\end{itemize}
+
+\paragraph{Command and control.} Balloons needed a reliable channel for navigation and safety, so Loon used \key{two commercial satellite (satcom) providers, one GEO and one LEO}, as redundant \key{out-of-band} channels. They were chosen for low cost per message, so they were slow (\key{minutes} of latency) and tiny (about one 1\,KiB message per minute per balloon). They complemented the \key{in-band} path through the backhaul mesh itself (high bandwidth, low latency), which was available only part of the time.
+
+\section{Architecture: Temporospatial SDN (TS-SDN)}
+\paperfig[0.95]{ln_fig3_arch}{Loon's data plane and tiered control plane: TS-SDN in a Google data centre; satcom control via two providers; ground stations with wired links to Edge Compute (VNFs, EPC); balloons with SDN agents and LTE eNodeBs; E-band RF links between them.}
+\begin{itemize}
+\item The TS-SDN ``\key{Minkowski}'' centrally \key{planned and actuated the backhaul network}: besides normal SDN duties (routing, VNF configuration) it decided \key{radio resource allocation and wireless link selection}.
+\item Core ability: \key{model the 3-D geometry and RF propagation of the physical world and anticipate how it changes} as nodes move and the weather changes. ``Temporospatial'' = it reasons over \emph{space and time}.
+\item \textbf{Bootstrapping a balloon:} satcom (always reachable) carries the command to bring up the first E-band link $\to$ balloon routers build \key{in-band control routes to ground stations using a MANET protocol} $\to$ through the GS gateway, balloons reach the SDN endpoints in EC $\to$ the SDN programs the \key{data plane}.
+\item The LTE system \key{requests backhaul} from the TS-SDN to connect each balloon's eNodeB to the operator's EPC; the TS-SDN builds the topology and implements the data plane as an \key{overlay} on the moving mesh.
+\end{itemize}
+
+\section{Predictive failure response}
+In ground networks, failures are handled \emph{reactively}. In moving NTNs failures are more frequent and detection/recovery is slower, so the TS-SDN \key{predicted failures by modelling the physical environment together with the logical network}.
+
+\subsection{TS-SDN design}
+\paperfig[0.55]{ln_fig5_tssdn}{Logical data flow of the TS-SDN: physical models (motion, weather, platform definitions, interference) feed the Link Evaluator; candidate link reports and requests feed the Solver; intents are compiled and actuated through the southbound CDPI.}
+\begin{itemize}
+\item \key{Inputs}: static network entities (interfaces, subnets), dynamic \key{route provisioning requests}, radio parameters and antenna properties, \key{3-D positions and trajectories} of platforms over time (GPS reports and FMS predictions), and \key{3-D volumes of atmospheric conditions and forecasts} (GS rain gauges in real time, ECMWF forecasts every 12\,h, ITU-R regional-seasonal model as backstop).
+\item \key{Link Evaluator}: continuously evaluates \emph{candidate links between all transceiver pairs at multiple future time steps}. It prunes pairs failing \key{field-of-view/line-of-sight} constraints, computes attenuation (free-space loss, atmospheric absorption, moisture) per RF band, and for each transmit power computes the \key{max bitrate with acceptable link margin}. Highly parallel (run across a data centre), with precomputed attenuation volumes and 4-D interpolation. Links just below the margin are kept as ``\key{marginal}'' --- penalized, but used if nothing better exists.
+\item \key{Solver}: produces \key{intent-based plans} for radio resources, topology and \key{IPv6 source--destination routing}, considering link feasibility and throughput, requested backhaul capacity per node, interference avoidance, and redundancy.
+\item \key{Actuation}: compiles intents into per-node configuration, monitors node state, and sends commands over the \key{control-to-data-plane interface (CDPI)}. (Update sequencing to avoid transient blackholes was planned but not built.)
+\end{itemize}
+
+\subsection{Stability vs.\ adaptivity}
+Losing one critical link can force a complete topology change. Link reconfigurations \key{failed often and were costly to recover}, so the solver favoured high-utility links and \key{biased toward keeping established links} (hysteresis), damping the rate of change.
+
+\subsection{Lessons}
+\begin{itemize}
+\item \key{Layered availability}: data plane depends on the in-band control plane, which depends on the link layer. Yet with \key{redundant links + MANET routing}, the in-band control plane's availability could \emph{exceed} the link layer's, because routes repaired around failed links quickly.
+\item \key{Redundancy}: \key{three E-band transceivers per balloon} worked well (hardware redundancy and up to 50\% more links); four or more gave diminishing returns. Idle transceivers were used to add \key{redundant links} for faster failover.
+\item \key{Planned teardown recovers faster}: route repair was much quicker when the TS-SDN \emph{withdrew} a link in anticipation (degrading signal, occlusion, rain, re-optimization) than when a link \emph{failed} unexpectedly --- \key{anticipating failures cut recovery time by about 38\%}. Most short breakages were repaired by the MANET protocol (AODV-based) without a new link.
+\end{itemize}
+\textbf{Takeaway:} reactive recovery is always needed (not everything can be predicted), MANET routing adapts well, idle transceivers for redundancy are worth it, and NTNs should adopt \key{predictive} coordination.
+
+\section{Hybrid control planes}
+Traditional SDN assumes a reliable, available, in-order control channel. NTN control channels may be limited in availability, latency and bandwidth.
+
+\subsection{Three control-plane tiers}
+Each tier is more capable (latency from \emph{minutes} down to \emph{milliseconds}) but \key{less reliable} than the one below:
+\begin{enumerate}
+\item \key{Tier 0 --- Satcom}: highly available, used to bootstrap a disconnected balloon. The TS-SDN sent the \key{minimum information to start a link} (\key{future enactment timestamp}, expected pointing geometry, channel settings, peer identity) to both ends, possibly over different channels, cryptographically signed. Latency up to minutes.
+\item \key{Tier 1 --- MANET}: once links exist, \key{batman-adv} (an AODV-based ad-hoc routing protocol) routes control traffic across the mesh, from ground stations up to and between balloons. Its job: let each balloon keep a \key{gRPC connection to the TS-SDN} despite link failures; it repairs routes \key{faster than the remote TS-SDN could}.
+\item \key{Tier 2 --- SDN}: the TS-SDN-programmed \key{in-band data plane}, used for LTE traffic and management. Applications chose SDN or MANET routes by picking a \key{source address}.
+\end{enumerate}
+Ground stations reached EC over wired links; the SDN set up \key{IPsec tunnels} between GS and EC pods and routed balloon traffic over them.
+
+\subsection{Composing the channels (extending the OpenFlow-style CDPI)}
+\begin{itemize}
+\item \key{Channel selection}: messages were spread over the available channels (2 satcom + 1 in-band) along the \key{lowest-latency path}; in-band reachability was tracked by heartbeats; delivery was tracked and retried, possibly over another channel. Satcom RTT was about 1.5 minutes at the median (many minutes in the tail); in-band was sub-second with up to about 1\,Gb/s.
+\item \key{Time to enact (TTE)}: commands reach nodes at different times, and both ends of a new link must search for each other simultaneously. So CDPI commands carried a \key{TTE}: nodes apply topology changes at a \key{common future time using GPS-synchronized clocks}. TTE was set from the slowest channel to any affected node (satcom 95th percentile delay, or 3\,s if in-band reached everyone). Problems: queue depth was invisible, and a TTE couldn't be shortened if a fast in-band path appeared later.
+\item \key{In-band side channel}: a balloon that joins the mesh immediately opens an in-band connection to the TS-SDN, often long before the satcom reply arrives --- so the TS-SDN \key{infers the command succeeded} and proceeds.
+\item \key{Message queuing}: satcom messages that couldn't arrive by their TTE, or that needed in-band connectivity (e.g., forwarding table updates), were dropped; retry relied on timeouts; parallel channels could deliver \key{out of order}.
+\end{itemize}
+\textbf{Takeaway:} combining channels made the control plane more available and faster than any single channel, but slow satcom forced a lot of complexity; lower-latency satellite or long-range broadcast (e.g., LoRaWAN) channels are recommended.
+
+\section{Long-range point-to-point links}
+In a moving network almost everything changes over time, so its properties must be either \key{modelled explicitly} or \key{detected reactively}. The TS-SDN modelled vehicle motion and enacted commands at a future time using projected pointing vectors and signal strengths.
+\begin{itemize}
+\item \key{Model validation}: physical models go stale (e.g., new buildings blocking a ground station). Instead of sending technicians, Loon \key{correlated historical link telemetry with antenna pointing} to detect stale obstruction masks.
+\item \key{Weather and data freshness}: E-band is very sensitive to moisture, so weather data was fed into link modelling, preferring \key{fresh data} (GS rain gauges, live telemetry) over forecasts. Forecasts added only \key{marginal value} in thunderstorm-prone regions; better options would be fusing observed signal strength back into the weather model and local weather radar.
+\item \key{Modelled vs.\ measured}: modelled and measured B2B signal strength rarely matched; Loon deliberately used pessimistic models and de-prioritized links within 5\,dB of the minimum.
+\item \key{Link lifetime}: \key{B2G links were short-lived} (median about 1m45s; 45\% lasted under 1 minute) due to weather and obstructions; \key{B2B links lasted much longer} (median about 26 min), helped by \key{correlated motion} (nearby balloons ride the same winds). Many links needed retries; 35\% never succeeded. The TS-SDN optimized for one instant a few minutes ahead, not for link \emph{duration} or success probability --- it should have.
+\end{itemize}
+\textbf{Takeaway:} physical models are essential but imperfect (wrong inputs, coarse inputs, approximations, stale ``static'' assumptions). Use \key{network telemetry to validate and correct models}, flag big deviations to operators, \key{prefer real-time observations over models when they conflict}, and include on-board recalibration loops.
+
+\section{Explainability}
+Debugging was hard: \emph{What is the state? How did it get there? Why did the TS-SDN choose this topology?}
+\begin{itemize}
+\item Centralization helped (intents and telemetry history were easy to inspect), but a \key{disconnected node's state is unknown}, and logs often arrived only after a node rejoined.
+\item Visualization tools combining \key{physical and logical views}, with a time scrubber to roll back and forward, helped explain how a state was reached.
+\item ``Why'' was hard: the solver was iterative, fed by many asynchronous inputs, \key{order-dependent} (which balloon came into range first), and used hysteresis, so operators kept asking ``\key{why not\ldots?}''.
+\item Recommendations: log comprehensively for path-dependent effects; make solver runs reproducible; show the solver's near-term \key{goal state} and the intents to reach it; define a \key{utility metric} for each configuration; invest in visualization.
+\end{itemize}
+
+\section{Conclusions}
+\begin{itemize}
+\item Folding a \key{model of the physical world into logical network planning} made route recovery faster than purely reactive recovery, but models are sensitive to data quality and freshness.
+\item The \key{hybrid control plane} (satcom + in-band) traded availability against performance well; \key{MANET} for mesh redundancy and in-band control routing was a good choice, at the cost of extra CDPI complexity.
+\item \key{TS-SDN is a compelling architecture for networks of moving platforms and steerable beams} --- applicable also to satellite constellations with ISLs (cf.\ Starlink, Chapter 10), and aviation or maritime meshes.
+\end{itemize}
+
+\section{Revision checklist}
+\begin{itemize}
+\item \textbf{What:} LTE base stations on stratospheric balloons (15--18\,km); backhaul via a moving mesh of directional E-band links (B2B, B2G) to ground stations $\to$ Edge Compute $\to$ operator core.
+\item \textbf{Why hard:} balloons drift with winds (probabilistic navigation, uncontrolled topology); daily power cycle; narrow steerable beams; rain attenuation; slow satcom control.
+\item \textbf{TS-SDN (Minkowski):} central SDN that models and forecasts geometry, motion and weather; Link Evaluator $\to$ candidate links $\to$ Solver $\to$ intents $\to$ actuation via CDPI; hysteresis to keep links.
+\item \textbf{Predictive recovery:} anticipated link teardown recovers faster ($\sim$38\%) than reacting to failures; reactive MANET still essential; 3 transceivers per balloon; idle ones for redundancy.
+\item \textbf{Control-plane tiers:} satcom (bootstrap, minutes) $\to$ MANET batman-adv (in-band control, keeps gRPC to TS-SDN) $\to$ SDN data plane (ms); capability up, reliability down.
+\item \textbf{CDPI extensions:} lowest-latency channel selection, time-to-enact with GPS clocks, in-band side-channel inference, satcom queue dropping.
+\item \textbf{Links:} B2G short-lived (weather, obstruction), B2B long-lived (correlated motion); validate models with telemetry; fresh data beats forecasts.
+\item \textbf{Explainability:} order-dependent, iterative solver is hard to explain; physical + logical + time visualization.
+\end{itemize}
