@@ -1,0 +1,159 @@
+\chapter{netmap: A Novel Framework for Fast Packet I/O}
+\paperinfo{L. Rizzo (Universit\`a di Pisa)}{USENIX ATC 2012}
+
+\begin{keybox}[netmap in one paragraph]
+Routers, traffic monitors, firewalls and generators need to send and receive packets at \key{line rate} --- millions of packets per second on 1--10\,Gb/s links --- but standard OS APIs are far too slow. \key{netmap} lets \key{unmodified commodity OSes} (FreeBSD, Linux) handle such rates \key{without custom hardware}. It removes three main costs: \key{per-packet dynamic memory allocation} (removed by \key{preallocating} buffers), \key{system-call overhead} (\key{amortized over large batches}), and \key{memory copies} (eliminated by \key{sharing buffers and metadata between kernel and user space}) --- while still \key{protecting device registers and kernel memory}. One core at 900\,MHz can send or receive \key{14.88\,Mpps} (the maximum on 10\,Gb/s), more than 20$\times$ faster than conventional APIs.
+\end{keybox}
+
+\section{Background: why packet I/O is slow}
+\subsection{NIC data structures}
+\paperfig[0.5]{nm_fig1_nicrings}{Typical NIC data structures (registers, ring of descriptors with physical address and length, buffers) and the OS shadow structures (mbufs with virtual addresses).}
+\begin{itemize}
+\item NICs manage packets with circular queues (\key{rings}) of \key{buffer descriptors}; each slot holds a buffer's length and physical address. NIC registers (\emph{head}, \emph{tail}) mark which part of the ring is available.
+\item \textbf{Receive}: the NIC writes incoming packets into the next free buffers, writes back length/status, and interrupts the CPU. \textbf{Transmit}: the OS fills buffers and writes a NIC register to start sending.
+\item At high rates, interrupts can cause \key{receive livelock}; polling drivers and interrupt mitigation help. Some NICs have \key{multiple rings} to spread load over cores.
+\end{itemize}
+
+\subsection{Kernel and user APIs}
+\begin{itemize}
+\item The OS keeps shadow copies of NIC structures and wraps buffers in device-independent containers (\key{mbufs} / \texttt{sk\_buff}s) holding \key{lots of metadata}.
+\item The driver/OS interface assumes packets may be split into \key{arbitrary fragments}, and that subsystems may hold packets for later --- so buffers must be \key{copied or reference counted}. These 20--30-year-old API contracts are now too expensive: managing buffer chains often costs more than just copying the data.
+\item \key{Raw packet I/O} for user programs (sockets, BPF) needs at least \key{one memory copy} between kernel and user space and \key{one system call per packet} (or per small batch).
+\end{itemize}
+
+\subsection{Where the time goes: FreeBSD \texttt{sendto()}}
+Instrumenting a UDP \texttt{sendto()} loop on a 2.93\,GHz i7 with a 10\,Gb/s NIC shows about \key{950\,ns per packet}, spread across every layer:
+\begin{center}
+\small
+\begin{tabular}{@{}lr@{}}
+\toprule
+\textbf{Stage} & \textbf{Approx.\ time (ns)} \\
+\midrule
+User program + entering the kernel (system call) & $\sim$100 \\
+Socket layer: sockbuf locking, \key{mbuf allocation, copy-in} & $\sim$140 \\
+UDP output & $\sim$60 \\
+IP output: route lookup, IP header setup & $\sim$200 \\
+Ethernet output: MAC header lookup and copy & $\sim$160 \\
+Driver: mbuf mangling, device programming & $\sim$220 \\
+\bottomrule
+\end{tabular}
+\end{center}
+No single fix suffices; \key{radical changes at all layers} are needed for the 10$\times$ speedup required at 10\,Gb/s.
+
+\section{Earlier approaches and their problems}
+\begin{itemize}
+\item \key{Socket APIs} (BPF, \texttt{AF\_PACKET}): tap the driver and copy each packet to a file descriptor --- copies and per-packet syscalls.
+\item \key{Packet filter hooks} (Netfilter, Netgraph): in-kernel, no extra copies, but still mbuf/\texttt{sk\_buff} based.
+\item \key{Run the application in the kernel} (kernel-mode Click): removes kernel/user copies, but the kernel environment is \key{constrained and fragile}.
+\item \key{Shared buffers exported to user space} (PF\_RING, \texttt{PACKET\_MMAP}): amortize syscalls over batches, but the kernel still \key{copies} between \texttt{sk\_buff}s and the shared buffers.
+\item \key{Full user-space drivers} (UIO-IXGBE, PF\_RING-DNA, Intel \key{DPDK}): fastest, but need \key{custom drivers}, and since the NIC's DMA can write anywhere, a \key{misbehaving client can corrupt any memory} (crash the system).
+\item \key{PacketShader I/O engine}: preallocated buffers and shared memory, but one specific NIC, kernel copies, no \texttt{select()/poll()}.
+\item Hardware (DAG, NetFPGA): special cards with custom drivers.
+\item netmap is \key{orthogonal} to TCP offloads (checksum, TSO, LRO) and virtualization features (multiqueue, SR-IOV) --- those reduce host-stack work but don't address moving packets between device and application.
+\end{itemize}
+
+\section{netmap design}
+Goal: very fast access to packets for user-space applications (both NIC and host-stack traffic), \key{without sacrificing safety} (the OS still validates NIC programming and enforces memory protection), with a \key{simple API} integrated with existing OS mechanisms and \key{not tied to specific hardware}.
+
+Techniques:
+\begin{itemize}
+\item a \key{lightweight metadata representation}, compact, hiding device-specific features, supporting \key{many packets per system call};
+\item \key{linear, fixed-size packet buffers preallocated} when the device is opened (no per-packet allocation);
+\item \key{no data copies}: applications get direct but protected access to packet buffers; this also enables \key{zero-copy forwarding} between interfaces;
+\item support for hardware features like \key{multiple queues}.
+\end{itemize}
+Division of labour: the \key{NIC moves data} between network and memory; the \key{OS enforces protection and provides synchronization}.
+
+\paperfig[0.38]{nm_fig3_mode}{In netmap mode the NIC rings are disconnected from the host stack and exchange packets with the application through netmap rings; two extra netmap rings connect the application to the host stack.}
+When a program puts an interface into \key{netmap mode}, the NIC is \key{partially disconnected from the host protocol stack}; the program exchanges packets with the NIC (and, separately, with the host stack) through \key{circular queues of buffers in shared memory}, using \texttt{select()/poll()} for synchronization. The OS still manages the interface otherwise (ifconfig etc.).
+
+\subsection{Data structures}
+\paperfig[0.5]{nm_fig4_shared}{User view of the shared memory region: a netmap\_if describing the interface, netmap rings (ring\_size, cur, avail, flags, buf\_ofs, slots with buffer index, length, flags), and fixed-size packet buffers also referenced by the NIC ring.}
+All objects live in one \key{non-pageable memory region} allocated by the kernel and shared by all processes. Because it is mapped at different virtual addresses in kernel and processes, references are \key{offsets}, not pointers (position independent).
+\begin{itemize}
+\item \key{Packet buffers}: \key{fixed size (2\,KB)}, shared by NIC and processes, each identified by an \key{index} that translates to a virtual address (for software) or physical address (for NIC DMA). Preallocated when entering netmap mode.
+\item \key{netmap ring}: a device-independent replica of the NIC ring: \texttt{ring\_size}; \texttt{cur} (current read/write position); \texttt{avail} (received packets on RX, empty slots on TX); \texttt{buf\_ofs} (offset to the buffer array); and \texttt{slots[]}, each holding a buffer index, packet length, and flags.
+\item \key{netmap\_if}: read-only description of the interface: number of rings and offsets to each ring.
+\end{itemize}
+\textbf{Ownership (no races):} the netmap ring belongs to the \key{user application except during a system call}, when the kernel updates it in the process's context; interrupt handlers never touch it. Buffers from \texttt{cur} to \texttt{cur+avail-1} belong to the application; the rest belong to the kernel/NIC; the boundary moves only during system calls.
+
+\subsection{The netmap API}
+\begin{enumerate}
+\item \texttt{open("/dev/netmap")} and \texttt{ioctl(fd, NIOCREG, arg)} with the interface name (optionally which rings) $\to$ returns the shared-region size and the offset of the netmap\_if.
+\item \texttt{mmap()} the region into the process.
+\item \textbf{Transmit}: fill up to \texttt{avail} buffers starting at \texttt{cur} (write lengths into the slots), then \texttt{ioctl(fd, NIOCTXSYNC)}; on return \texttt{avail} reports slots freed by completed transmissions.
+\item \textbf{Receive}: \texttt{ioctl(fd, NIOCRXSYNC)} to learn how many packets arrived; they are then directly readable via the slots from \texttt{cur}.
+\end{enumerate}
+Both sync calls are \key{non-blocking}, \key{copy no data} (only slot metadata is synchronized between netmap and NIC rings), and handle \key{many packets per call}. In the kernel they (i) \key{validate} \texttt{cur}/\texttt{avail} and slot contents (lengths, buffer indexes), (ii) sync slots between netmap and hardware rings and tell the NIC about new packets / free buffers, and (iii) update \texttt{avail}. The checks ensure user data can't crash the system.
+\begin{itemize}
+\item \key{Blocking I/O} uses standard \texttt{select()/poll()}: a netmap fd is ready when \texttt{avail} $>0$, and the rings are synced before returning --- so an event loop needs \key{one system call per iteration}.
+\item \key{Multi-queue}: an fd can control all rings (default) or be bound to \key{one TX/RX ring pair}, so several threads/processes (pinned to cores with \texttt{setaffinity()}) work on separate rings without locking.
+\end{itemize}
+\begin{lstlisting}[language=C]
+fds.fd = open("/dev/netmap", O_RDWR);
+strcpy(nmr.nm_name, "ix0");
+ioctl(fds.fd, NIOCREG, &nmr);
+p = mmap(0, nmr.memsize, fds.fd);
+nifp = NETMAP_IF(p, nmr.offset);
+fds.events = POLLOUT;
+for (;;) {
+  poll(fds, 1, -1);
+  for (r = 0; r < nmr.num_queues; r++) {
+    ring = NETMAP_TXRING(nifp, r);
+    while (ring->avail-- > 0) {
+      i = ring->cur;
+      buf = NETMAP_BUF(ring, ring->slot[i].buf_index);
+      /* ... store the payload into buf ... */
+      ring->slot[i].len = /* packet length */;
+      ring->cur = NETMAP_NEXT(ring, i);
+    }
+  }
+}
+\end{lstlisting}
+
+\subsection{Talking to the host stack}
+Even in netmap mode the OS still controls the interface and sends/expects traffic. An \key{extra pair of netmap rings} connects to the host stack: \texttt{NIOCTXSYNC} on it wraps buffers into mbufs and passes them up \emph{as if from the NIC}; packets from the host stack appear on the host RX ring. The application must forward between host rings and NIC rings --- an ideal place to implement \key{firewalls, shapers, NAT}.
+
+\subsection{Safety}
+Processes using netmap \key{cannot crash the kernel}: the shared region contains no critical kernel memory, and \key{buffer indexes and lengths are always validated} by the kernel before use (unlike UIO-IXGBE, PF\_RING-DNA, or in-kernel Click). A misbehaving process \emph{can} corrupt other processes' netmap rings/buffers in the shared region; separate memory regions per ring would fix that.
+
+\subsection{Zero-copy forwarding}
+Since all buffers of all interfaces are in one region, forwarding a packet between interfaces is just \key{swapping buffer indexes} between the RX slot and the TX slot (plus copying length/flags and setting \texttt{BUF\_CHANGED} so the kernel updates NIC addresses). This enqueues the packet on the output and refills the input ring with an empty buffer \key{without any allocation or copy}.
+\begin{lstlisting}[language=C]
+src = &src_nifp->slot[i];  /* locate src and dst slots */
+dst = &dst_nifp->slot[j];
+tmp = dst->buf_index;      /* swap the buffers */
+dst->buf_index = src->buf_index;
+src->buf_index = tmp;
+dst->len = src->len;       /* update length and flags */
+dst->flags = src->flags = BUF_CHANGED;
+\end{lstlisting}
+
+\subsection{libpcap compatibility and implementation}
+\begin{itemize}
+\item A small library maps \key{libpcap} calls (\texttt{pcap\_dispatch}, \texttt{pcap\_inject}) to netmap (about 20 lines), so \key{unmodified libpcap applications} (Click userspace, Open vSwitch) speed up 4--8$\times$.
+\item About 2000 lines of kernel code; no user library (a 200-line header). Each driver needs only small changes (sync routines, ring reinit, lock export, $\sim$500 lines).
+\item Drivers do most work \key{in the context of the user process during the system call} (better cache locality, easier core binding, less work in non-interruptible contexts); the interrupt handler just wakes the process.
+\item Simple optimizations: skip reclaiming buffers when \texttt{avail} $>0$; push pending TX even without \texttt{POLLOUT}; update a timestamp before \texttt{poll()} returns --- cutting a typical loop from 3 syscalls to 1.
+\end{itemize}
+
+\section{Key performance insights (concepts only)}
+\begin{itemize}
+\item \key{Per-byte vs.\ per-packet costs}: netmap has \key{zero per-byte cost} (it exports NIC buffers); \key{per-packet costs dominate}, so the hardest case is \key{minimum-size (64-byte) packets}.
+\item Amortized cost is about \key{60--70 CPU cycles per packet}, so \key{one 900\,MHz core} reaches 10\,Gb/s line rate (14.88\,Mpps); standard APIs reach about 1\,Mpps (userspace) or 4\,Mpps (in-kernel pktgen).
+\item \key{Batching is essential}: with 1 packet per syscall, throughput is only about 2.45\,Mpps; line rate needs batches of about 8 packets (a bare \texttt{poll()} alone costs $\sim$250\,ns).
+\item Contributions of each optimization: \key{per-packet system calls matter a lot}; data copies are moderately expensive; and \key{the mbuf/sk\_buff buffer management itself} is a big cost (pktgen $\sim$250\,ns/pkt vs.\ netmap 20--30\,ns/pkt, differing mainly in buffer handling).
+\item Applications may have their own bottlenecks (e.g., Click's C++ allocator, Open vSwitch's event loop) that must be fixed to benefit from fast I/O.
+\end{itemize}
+
+\section{Revision checklist}
+\begin{itemize}
+\item \textbf{Problem:} raw packet I/O via sockets/BPF is $\sim$1\,Mpps; 10\,Gb/s needs 14.88\,Mpps.
+\item \textbf{Three costs removed:} dynamic allocation (preallocated fixed 2\,KB buffers), syscalls (batching), copies (shared buffers + metadata).
+\item \textbf{Safety:} kernel validates indexes/lengths; NIC registers and kernel memory not exposed; no crashes.
+\item \textbf{Structures:} netmap\_if, netmap rings (cur, avail, slots), packet buffers by index; offsets not pointers; one shared non-pageable region.
+\item \textbf{Ownership:} user owns ring except during syscalls; buffers cur..cur+avail-1 belong to user.
+\item \textbf{API:} /dev/netmap + NIOCREG + mmap; NIOCTXSYNC / NIOCRXSYNC; select/poll; per-ring fds for multicore.
+\item \textbf{Host stack rings}, \textbf{zero-copy forwarding by buffer swap}, \textbf{libpcap emulation}.
+\item \textbf{vs.\ others:} vs.\ BPF (copies, per-packet syscalls), PF\_RING (kernel copies), DPDK/UIO (custom drivers, unsafe), kernel Click (fragile).
+\end{itemize}

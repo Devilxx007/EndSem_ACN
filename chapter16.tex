@@ -1,0 +1,128 @@
+\chapter{Universal Packet Scheduling}
+\paperinfo{R. Mittal, R. Agarwal, S. Ratnasamy, S. Shenker (UC Berkeley, ICSI)}{USENIX NSDI 2016}
+
+\begin{keybox}[The paper in one paragraph]
+There are countless packet scheduling algorithms (FIFO, priorities, fair queueing, SJF/SRPT, FIFO+\ldots), each built for one goal. The paper asks: \key{is there a single, universal packet scheduling algorithm (UPS)} that can match the result of \emph{any} other scheduling algorithm? \key{Theoretically: no} --- but the classical \key{Least Slack Time First (LSTF)} comes \key{as close as any algorithm can}. \key{Practically}: by choosing how each packet's initial \key{slack} is set at the network \key{edge}, LSTF in the routers can \key{minimize average flow completion time}, \key{reduce tail packet delay}, and provide \key{fairness}, close to the best specialized schedulers. LSTF's slack also enables doing \key{AQM (CoDel, DCTCP-style ECN) from the edge} without changing core routers.
+\end{keybox}
+
+\section{Why ask the question?}
+\begin{itemize}
+\item A \key{packet scheduling algorithm} here means both \emph{how routers serve packets} (using arrival times and headers) and \emph{how packet header fields are initialized and updated} --- covering FIFO, LIFO, priority, round robin, and schemes with dynamic packet state.
+\item If \key{no UPS} exists, we must keep designing new schedulers as goals change $\Rightarrow$ a strong case for \key{programmable packet schedulers} in switches.
+\item If a \key{practical UPS} exists, the question for a new algorithm becomes ``is it easier/cheaper than the UPS?'', and the need for programmable scheduling hardware shrinks. (P4/RMT make \emph{parsing} and match-action processing programmable --- Chapter 4 --- but not the \emph{scheduler}.)
+\end{itemize}
+Two definitions of universality:
+\begin{itemize}
+\item \key{Theoretical}: the algorithm can \key{replay any schedule} produced by any other algorithm.
+\item \key{Practical}: it can meet \key{different performance objectives} as well as the best known algorithm for each, where header initialization may depend on the objective.
+\end{itemize}
+
+\section{Theory: replaying schedules}
+\subsection{Model}
+\begin{itemize}
+\item A network of store-and-forward, output-queued routers. Input: a set of packets $p$, each with arrival time $i(p)$ at its ingress and a path $path(p)$; no drops. Routers may run any \emph{non-preemptive} scheduler (possibly non-work-conserving, even with oracles); different routers may differ.
+\item A \key{schedule} is the set $\{(path(p), i(p), o(p))\}$, where $o(p)$ is when $p$ exits the network.
+\item \key{Replay}: another set of algorithms, on the same packets and paths, \key{replays} the schedule iff \key{every packet exits no later than before}: $\forall p,\ o'(p) \le o(p)$. (Early packets can be held at the egress.)
+\item A schedule is \key{viable} if some algorithms produce it. An algorithm is \key{universal} if it can replay \emph{all} viable schedules.
+\end{itemize}
+\textbf{Practical constraints on a UPS:}
+\begin{enumerate}
+\item \key{Uniformity and determinism}: the same deterministic logic at every router.
+\item \key{Limited scheduling state}: only \key{packet headers} plus static topology info (link speeds, propagation delays) --- no oracles. It may rewrite headers (dynamic packet state).
+\item \key{Limited header initialization} (``\key{black-box}''): the ingress initializes a packet's header using only that packet's $o(p)$ and $path(p)$ (and $i(p)$, which it observes) --- not other packets' information.
+\end{enumerate}
+This mirrors the common assumption of a \key{smart edge and simple core}. Knowing $o(p)$ in advance is unrealistic, but read $o(p)$ as a \emph{desired} output time: if the targets are viable, a UPS will meet them.
+
+\subsection{Results}
+\begin{itemize}
+\item \key{With omniscient initialization} (the header carries each router's original output time $o(p,\alpha)$ for every hop), perfect replay is possible: each router pops its value and serves the earliest first --- unsurprising, as this is knowing all original decisions.
+\item \key{With black-box initialization, there is no UPS} (proof by counter-example).
+\end{itemize}
+
+\subsection{Least Slack Time First (LSTF)}
+Each packet carries a \key{slack} value in its header, initialized at the ingress to
+\[ slack(p) = o(p) - i(p) - t_{min}(p, src(p), dest(p)) \]
+where $t_{min}$ is the time to cross the network with \emph{no congestion}. So slack = the \key{maximum total queueing time the packet can tolerate} and still meet its target.
+\begin{itemize}
+\item Each router serves the packet with the \key{least remaining slack} (evaluated at the time its last bit would be transmitted).
+\item Before forwarding, the router \key{overwrites the slack} with the remaining slack: old slack minus the time the packet waited in this queue.
+\item Equivalent alternative: \key{Earliest Deadline First (EDF)} with a static deadline in the header and per-router knowledge of $t_{min}$.
+\end{itemize}
+Difficulty depends on the number of \key{congestion points} (routers where a packet has to wait) per packet:
+\begin{center}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Algorithm} & \textbf{Replays all viable schedules with} & \textbf{Fails for some with} \\
+\midrule
+Simple priorities (static, set at ingress) & $\le 1$ congestion point & 2 \\
+\key{LSTF} & \key{$\le 2$ congestion points} & 3 \\
+\key{Any} algorithm (under the constraints) & --- & $\ge 3$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+\textbf{Takeaway:} LSTF is closer to universal than priorities, and \key{no algorithm can do better} in terms of congestion points handled.
+
+\textbf{Intuition.}
+\begin{itemize}
+\item \key{Why LSTF beats priorities}: slack \key{carries information about delay already suffered}, so a packet delayed early can ``\key{make up for lost time}'' at later congestion points. With static priorities, a low-priority packet may be delayed again and again.
+\item \key{Why 2 points work}: define a packet's \emph{local deadline} at router $\alpha$ (when $\alpha$ served it originally) and \emph{global deadline} (latest it can leave $\alpha$ and still meet $o(p)$ with no further queueing, i.e., when its slack hits zero). If all packets arrive at a router by their local deadlines, LSTF (like EDF on one processor) meets every global deadline. At the first congestion point a packet can't be late (no queueing before it); at the last one, local = global deadline. So with two points, packets are never late.
+\item \key{Why 3 fail}: with a \emph{middle} congestion point, a packet can arrive after its local deadline unless the first router made exactly the right choice --- and the counter-example shows two cases with identical header information that require \emph{opposite} choices at the first router. No deterministic, black-box-initialized algorithm can get both right.
+\end{itemize}
+
+\subsection{Empirical replay (in brief)}
+In simulations of realistic topologies and many original schedulers (random, FIFO, LIFO, FQ, SJF, mixtures), non-preemptive LSTF replayed schedules very well (typically under 1\% of packets late by more than one transmission time). It did worse for SJF and LIFO (many packets with tiny slack, and without preemption LSTF can't compensate), which preemption fixes. LSTF also reduces \emph{total} queueing by eliminating ``\key{wasted waiting}'' --- it never makes packet A wait behind B if B will wait much longer later anyway. Static priorities with priority $=o(p)$ replayed far worse.
+
+\section{Practice: meeting performance objectives with LSTF}
+With no known original schedule, the edge \key{chooses slacks heuristically} for the desired objective; routers run plain LSTF.
+\begin{enumerate}
+\item \key{Minimize average flow completion time (FCT)}: SRPT is near-optimal and SJF is close for heavy-tailed sizes. LSTF emulates \key{SJF} with
+\[ slack(p) = fs(p)\times D \]
+where $fs(p)$ is the flow size (in packets) and $D$ is larger than any queueing delay (e.g., 1\,s). Shorter flows get less slack $\Rightarrow$ served first. Results match SJF/SRPT and beat FIFO.
+\item \key{Minimize tail packet delay}: give \key{all packets the same slack}. Then LSTF = \key{FIFO+} (Clark et al.): packets that have \key{already waited longer} upstream are favoured. Slightly higher average delay but lower 99th-percentile delay than FIFO.
+\item \key{Fairness}: with $r_{est}$ an estimate of the fair-share rate, the first packet of a flow gets slack 0 and later packets
+\[ slack(p_i) = \max\left(0,\ slack(p_{i-1}) + \frac{size(p_i)}{r_{est}} - \big(i(p_i) - i(p_{i-1})\big)\right) \]
+(a virtual-clock-like pacing: a flow sending faster than $r_{est}$ accumulates slack and is de-prioritized).
+\begin{itemize}
+\item \key{Asymptotic fairness} (long-run throughput): converges to fair shares for \emph{any} $r_{est}$ below the true fair rate, as long as all flows use the same value.
+\item \key{Instantaneous fairness} (short time scales): depends on $r_{est}$ --- too high gives little isolation (like FIFO); too low starves long flows. A reasonable $r_{est}$ (from topology and traffic matrices) gives FCTs between FIFO and FQ, close to FQ. This needs more knowledge than FQ.
+\end{itemize}
+\end{enumerate}
+
+\subsection{Limitations: policy-based objectives}
+\begin{itemize}
+\item \key{Multi-tenancy / class-based (hierarchical) fairness}: the right slack for a packet depends on traffic at \emph{other} ingresses of the same class, so LSTF alone can't isolate tenants; it must be combined with multi-queue mechanisms (FQ, round robin, dedicated links) --- though strict priority between classes is possible.
+\item \key{Traffic shaping / rate limiting} needs \key{non-work-conserving} schedulers (token buckets); LSTF is work-conserving. Shaping at the edge may suffice.
+\end{itemize}
+
+\section{Incorporating network feedback (AQM) from the edge}
+LSTF is only a scheduler; AQM (dropping/marking to signal congestion, e.g., \key{CoDel}, \key{ECN for DCTCP}) seems to require a ``universal AQM'' in every router. Instead, two insights:
+\begin{enumerate}
+\item It doesn't matter \emph{where} the right packets are dropped/marked --- in the core or at the edge.
+\item LSTF gives a useful by-product: add an \key{initial slack} field (never changed) next to the \key{current slack} field. At the egress, \key{initial $-$ current slack = exact queueing delay} the packet experienced across the whole network.
+\end{enumerate}
+\begin{itemize}
+\item \key{Edge-CoDel}: CoDel drops a packet when its queue \emph{sojourn time} exceeds a target (5\,ms) and the last drop was more than an interval ago (100\,ms, shrinking with the square root of the drop count). Edge-CoDel runs FQ-CoDel logic \emph{at the egress} on each packet's \key{total network queueing time}, with routers doing LSTF fairness. Since the egress can't see when a flow's queue empties, it refreshes the interval when the gap between consecutive packets' send times (TCP timestamps) exceeds a threshold (2--4$\times$ the target). Performs close to in-router FQ-CoDel.
+\item \key{Edge-ECN for DCTCP}: mark a packet at the edge if its queueing delay exceeds the \key{transmission time of $K$ packets} (easy in data centres where link speeds are known); routers run LSTF with equal slacks. Matches in-switch ECN marking (Chapter 14).
+\end{itemize}
+Benefit: \key{AQM can be upgraded without touching core routers}.
+
+\section{Implementing LSTF}
+\begin{itemize}
+\item Given \key{fine-grained priority scheduling}, LSTF is easy with programmable header processing (verified in P4). At router $\alpha$, the remaining slack when $p$'s last bit leaves at time $t$ is $slack(p,\alpha) - (t - i(p,\alpha)) + T(p,\alpha)$, where $T$ is the transmission time. Since $t$ is common to all packets compared at the same moment, the \key{priority value} is
+\[ slack(p,\alpha) + i(p,\alpha) + T(p,\alpha) \]
+computed on arrival (lower = served first). Just before sending, write back the new slack = priority value $-$ (current time $+\,T(p,\alpha)$).
+\item \key{Fine-grained priorities in hardware}: a \key{pipelined heap (p-heap)} scales to very large buffers ($>$100\,MB) but is complex and costly in chip area (suits deep-buffered WAN core routers); a \key{bucket-sort}-based design is much cheaper (about 1.65\% area) but limited to tens of MB (suits shallow-buffered data-centre switches).
+\end{itemize}
+
+\section{Revision checklist}
+\begin{itemize}
+\item \textbf{Question:} one scheduler to replace all? Matters for whether switches need programmable schedulers.
+\item \textbf{Replay:} same packets and paths, every packet exits no later; viable schedule; universal = replays all viable schedules.
+\item \textbf{Constraints:} same deterministic logic everywhere; only header + static info; black-box ingress initialization (own $o(p)$, $path(p)$).
+\item \textbf{Results:} no UPS; priorities handle $\le1$ congestion point, LSTF $\le2$, nothing handles 3.
+\item \textbf{LSTF:} slack $= o - i - t_{min}$; serve least slack; subtract waiting time at each hop; equivalent to EDF.
+\item \textbf{Objectives via slack:} FCT: $slack = $ flow size $\times D$ (SJF); tail: equal slack (FIFO+); fairness: virtual-clock slack with $r_{est}$.
+\item \textbf{Limits:} tenant/class fairness, traffic shaping (non-work-conserving).
+\item \textbf{Edge AQM:} initial $-$ current slack = queueing delay $\Rightarrow$ Edge-CoDel, Edge-ECN for DCTCP; upgrade AQM without core changes.
+\item \textbf{Hardware:} priority $= slack + i + T$; p-heap (deep buffers) vs.\ bucket sort (shallow).
+\end{itemize}

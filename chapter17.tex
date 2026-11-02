@@ -1,0 +1,209 @@
+\chapter{YouTube Videos: SDN Talks from the Open Networking Summit 2011}
+\paperinfo{Two keynote talks at the Open Networking Summit, Stanford, October 2011}{(1) Scott Shenker --- ``The Future of Networking, and the Past of Protocols'' (27 min) \quad (2) Nick McKeown --- ``How SDN will Shape Networking'' (34 min)}
+
+\begin{keybox}[The two talks in one paragraph]
+Both talks ask \emph{why} Software-Defined Networking is the right direction. \key{Shenker} answers from first principles: networking mastered \emph{complexity} but never learned to \emph{extract simplicity}; the way other fields did that is through \key{abstractions}. Decomposing the \key{network control problem} yields exactly three abstractions --- \key{distributed state}, \key{specification}, \key{forwarding} --- and \key{SDN is precisely those three abstractions}. \key{McKeown} answers from the industry side: networking is moving from a \key{vertically integrated, closed} industry (like 1980s mainframes) to a \key{horizontal, open} one built on merchant silicon; SDN \key{refactors} the duplicated distributed systems inside routers into one network OS, and OpenFlow's \key{$\langle$match, action$\rangle$} abstraction will \key{empower operators, speed up innovation, diversify suppliers, and build a robust foundation} (e.g., provable properties with \key{header space analysis}).
+\end{keybox}
+
+\section{Talk 1 --- Scott Shenker: The Future of Networking, and the Past of Protocols}
+\textbf{Question of the talk:} SDN clearly beats the status quo, but is it the \emph{right} answer or a stop-gap? The talk explains not \emph{what} SDN is but \key{why} it is --- and argues it is right for fundamental reasons.
+
+\subsection{What made the Internet great: layering}
+\paperfig[0.55]{yt_sh_layers}{Key to Internet success: layers --- applications on reliable (or unreliable) transport, on best-effort global delivery, on best-effort local delivery, on physical transfer of bits.}
+\begin{itemize}
+\item \key{Layering} decomposed delivery into its \key{fundamental components}. Think about how to move bits from here to there and you rediscover exactly these layers.
+\item This decomposition \key{enabled innovation}: each layer could innovate \emph{independently} while the whole stayed coherent. (SDN's value proposition is also innovation.)
+\end{itemize}
+
+\subsection{``We built an artifact, not a discipline''}
+\begin{itemize}
+\item The Internet was an amazing success, but an \key{academic failure}. Other systems fields (OS, databases, distributed systems) teach \key{principles} (e.g., Paxos, Byzantine agreement); networking teaches a \key{big bag of protocols}.
+\item Other systems are \key{easily managed} (thanks to virtualization) and \key{keep evolving} (Ruby on Rails, iOS, Android); networks are \key{notoriously hard to manage} and \key{evolve very slowly}.
+\item \key{Why does networking lag behind?} Networks started simple (IP, Ethernet), but success brought many new \key{control requirements} (the state operators manage by hand), which led to \key{great complexity}. Networks still work \key{only because of our great ability to master complexity}.
+\end{itemize}
+
+\subsection{Mastering complexity vs.\ extracting simplicity}
+\begin{itemize}
+\item Story: around 1985, user-interface pioneer \key{Don Norman} visited Xerox PARC, asked who drives a stick shift (80\% of the engineers raised their hands), and said ``\emph{none of you should ever design a user interface}.''
+\item \key{His point}: \key{the ability to master complexity is not the same as the ability to extract simplicity}. Mastering complexity is needed when first building a system; making it easy to use and understand needs extracting simplicity --- a \emph{different job}.
+\item \key{Shenker's point}: networking has \key{never made this distinction}, so it never made the transition; the people who handle complexity best are ``kings of the hill''. And \key{extracting simplicity is what builds intellectual foundations} --- the principles of other fields come from boiling problems down to their essence. It is \key{necessary for creating a discipline}.
+\end{itemize}
+
+\subsection{The power of abstraction}
+\begin{itemize}
+\item Example transition --- \key{programming}: from machine languages (pure complexity) to higher-level languages, OS and other abstractions (file systems, virtual memory, abstract data types), to modern object-oriented languages. The lesson: \key{abstractions are the key to extracting simplicity}.
+\item Barbara Liskov: ``\key{Modularity based on abstraction is the way things get done}.'' Abstractions $\to$ interfaces $\to$ modularity $\to$ systems of tens of millions of lines we can build, maintain and reason about.
+\item \key{Layers are great abstractions}, but they cover \key{only the data plane}. The trouble is in the \key{control plane}, where networking has \key{no abstractions} --- no systematic way to think about control state.
+\end{itemize}
+
+\subsection{Defining and decomposing the network control problem}
+To find abstractions: \key{define the problem, then decompose it}.
+\paperfig[0.5]{yt_sh_controlproblem}{The network control problem: compute the configuration of each physical device (forwarding tables, ACLs, \ldots), operating without communication guarantees, within a given network-level protocol.}
+The \key{network control problem}:
+\begin{enumerate}
+\item \key{Compute the configuration of each physical device} (forwarding tables, ACLs\ldots),
+\item while \key{operating without communication guarantees} (the network we control is also the one carrying our messages: delays, drops),
+\item and \key{within a given network-level protocol} (if IP has no header field for what you need, you're out of luck).
+\end{enumerate}
+Only people who love complexity would accept this task as reasonable.
+
+\paperfig[0.55]{yt_sh_analogy}{Programming analogy: a programmer asked to specify where every bit is stored, handle all communication errors, in a language of limited expressiveness, would redefine the problem with abstractions.}
+\textbf{Programming analogy.} Ask a programmer to (i) specify where every bit is stored, (ii) explicitly deal with all internal communication errors, and (iii) use a language with limited expressiveness (COBOL). They would \key{redefine the problem}: a higher-level \key{memory abstraction}, \key{reliable communication abstractions}, and a \key{more general language}. Abstractions \key{divide the problem into tractable pieces}, leaving only the \emph{inherent} difficulty of the control program (e.g., computing $k$ shortest paths), not the \emph{extraneous} difficulty of distribution and errors.
+
+\subsection{From requirements to the three abstractions}
+\paperfig[0.55]{yt_sh_requirements}{From requirements to abstractions: each requirement of network control maps to one abstraction.}
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}X X X@{}}
+\toprule
+\textbf{Requirement} & \textbf{Abstraction needed} & \textbf{What it gives} \\
+\midrule
+Operate without communication guarantees & \key{Distributed state abstraction} & A \key{global network view} (an annotated graph) through an API \\
+Compute the configuration of each physical device & \key{Specification abstraction} & A \key{simplified, abstract network model} to express desired behaviour (network virtualization) \\
+Operate within a given network-level protocol & \key{Forwarding abstraction} & A \key{general, flexible forwarding model} hiding the hardware details (e.g., OpenFlow) \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\paragraph{1. Distributed state abstraction.} \key{Shield control mechanisms from the vagaries of distributed state} while still giving access to that state. Natural abstraction: a \key{global network view} --- a graph annotated with all needed information, through an API. The control mechanism is now a \key{program over a data structure}, not a distributed protocol: e.g., use \key{Dijkstra rather than Bellman--Ford}. This is ``logically centralized'', but the point is that \key{the distribution model becomes your choice} (driven by scalability and resilience), not dictated by having 10,000 switches.
+
+\paragraph{2. Specification abstraction.} A control program should \key{express desired behaviour}, not \emph{how} to implement it on a particular physical network. Natural abstraction: a \key{simplified model of the network}, only detailed enough to specify the behaviour --- i.e., \key{network virtualization}. \textbf{Example --- access control}: whatever the physical topology, give the program a single \key{crossbar switch}; it just says ``A can / cannot talk to B'', and a lower layer maps that onto the real switches.
+
+\paragraph{3. Forwarding abstraction.} The control plane needs a \key{flexible forwarding model} that does not constrain behaviour but \key{hides the details of the forwarding hardware} (to escape vendor-specific solutions).
+
+\begin{keybox}[``My entire talk in one sentence'']
+\key{SDN is defined precisely by these three abstractions} --- \emph{distribution}, \emph{forwarding}, \emph{configuration (specification)}. Since SDN can be \emph{derived} by decomposing network control, it has \key{fundamental validity}; since the argument never mentioned any particular control task, it has \key{general applicability}.
+\end{keybox}
+
+\subsection{Realizing the abstractions: the SDN stack}
+\begin{itemize}
+\item Core challenge: turn distributed control into a \key{logically centralized} one, via a common \key{distribution layer} that gathers information from network elements and sends them control messages --- the \key{Network Operating System (NOS)}.
+\item \key{Major change in paradigm}: instead of designing distributed control protocols, we define a \key{centralized control function}: \key{Configuration = Function(view)}. When the view converges, the configuration converges --- much easier to reason about. This spells the \key{end of distributed protocols} (for control) and the \key{beginning of the ``software era'' of networking} (different culture, rate of change, view of standards).
+\item Adding the specification abstraction inserts a \key{network virtualization layer}: the control program configures an \key{abstract network model}; virtualization maps it to the \key{global network view}; the NOS pushes that to the \key{physical switches}.
+\end{itemize}
+\paperfig[0.45]{yt_sh_sdnstack}{The full SDN stack: Control Program $\to$ (abstract network model) $\to$ Network Virtualization $\to$ (global network view) $\to$ Network OS $\to$ physical switches.}
+\textbf{Forwarding abstraction in detail.} Switches have \key{two ``brains''}: a \key{management CPU} (smart but slow) and a \key{forwarding ASIC} (fast but dumb). The CPU abstraction can be almost anything; the \key{ASIC abstraction is the subtle part --- that is OpenFlow}. But ``OpenFlow is the answer'' assumes \key{switches are the unit of abstraction}; one could instead abstract a whole \key{fabric} (e.g., a data-centre fabric delivering packets edge to edge). Both are SDN.
+
+\subsection{Don't let the tail wag the dog}
+OpenFlow is crucial for industry and must be standardized, but \key{architecturally it is a minor piece} near the hardware. The ``dog'' is the \key{clean separation of concerns}:
+\paperfig[0.5]{yt_sh_separation}{The dog: clean separation of concerns among control program, network virtualization, and network OS, each driven by one abstraction.}
+\begin{itemize}
+\item \key{Control program}: specifies behaviour on the abstract model --- driven by \key{operator requirements} only.
+\item \key{Network virtualization}: maps the abstract model to the global view --- driven by the \key{specification abstraction}.
+\item \key{Network OS}: maps the global view onto physical switches --- its API driven by the \key{distributed state abstraction}, its switch/fabric interface by the \key{forwarding abstraction}.
+\end{itemize}
+Each piece has a \key{limited job}. Just as layering let the Internet innovate in each layer independently, \key{SDN's abstractions enable innovation in each piece while keeping a coherent system} --- the tie between abstractions and innovation is why SDN is the right answer.
+
+\subsection{Final words}
+\paperfig[0.45]{yt_sh_finalwords}{Final words of Shenker's talk.}
+\begin{itemize}
+\item The \key{future of networking lies in finding the right abstractions}; the era of ``\key{a new protocol per problem}'' is over.
+\item It takes years to internalize and evaluate abstractions --- and \key{even longer to adjust to a software-oriented culture}.
+\item We are in the early stages of an intellectual voyage; keep an open mind.
+\end{itemize}
+
+\section{Talk 2 --- Nick McKeown: How SDN will Shape Networking}
+\textbf{Outline:} (A) SDN as an \key{industry change}; (B) how SDN will shape networking: \key{1. empower network owners/operators, 2. increase the pace of innovation, 3. diversify the supply chain, 4. build a robust foundation}. McKeown notes the ideas jelled around Martin Casado's PhD work at Stanford with Shenker, building on earlier work such as \key{4D} (Chapter 2).
+
+\subsection{SDN as an industry change: from vertical to horizontal}
+\paperfig[0.55]{yt_nm_horizontal}{From specialized hardware, OS (control plane) and features to merchant switching chips with open interfaces, multiple control planes, and applications on top.}
+\begin{itemize}
+\item \key{Computer industry of the 1980s} (IBM mainframes): specialized hardware, OS and applications from \key{one vendor} --- \key{vertically integrated, closed, proprietary, slow innovation}. The \key{microprocessor} with a published (open) interface led to many operating systems, then open interfaces led to huge numbers of applications: a \key{horizontal, open} industry with fast innovation and enormous growth.
+\item \key{Networking} has been the same vertical model: specialized hardware, specialized OS, specialized features. What really drives the change is \key{merchant switching silicon}; with \key{open interfaces} to those chips, \key{multiple control planes} (open or closed) will emerge, with applications/features on top.
+\item SDN is \key{one manifestation} of this trend: an \key{open interface to packet forwarding} (OpenFlow, or alternatives) and at least one, hopefully many, \key{network operating systems}.
+\end{itemize}
+\paperfig[0.5]{yt_nm_sdn}{A Software-Defined Network: control programs on a global network view provided by a Network OS that controls simple packet-forwarding elements.}
+
+\subsection{The OSPF example: SDN as refactoring}
+\paperfig[0.5]{yt_nm_ospf}{OSPF (RFC 2328) is 245 pages; building the distributed system for a consistent map takes 101 pages; Dijkstra's algorithm on the map takes 4 pages.}
+\begin{itemize}
+\item OSPF's RFC is \key{245 pages}; about \key{101 pages} describe building a \key{distributed system} to get a consistent, up-to-date \key{global view} of the topology; \key{Dijkstra's algorithm}, what we actually teach, takes \key{4 pages} (could be half a page).
+\item Every routing protocol or feature first \key{builds its own distributed system}, which we're not good at, and puts the control logic on top. Inside a router: OS $\to$ distributed system $\to$ protocol; and \emph{next to it} another nearly identical distributed system for IS-IS, etc. This \key{replication} costs complexity, reliability and elegance.
+\item SDN \key{refactors} this: \key{one distributed system (the Network OS) creates the global view}; OSPF (now just Dijkstra), IS-IS, or a new feature are just \key{control programs} on that view. Nothing fundamentally new --- the same functions, refactored through new abstractions and interfaces, making new functionality easy to add.
+\end{itemize}
+\paperfig[0.5]{yt_nm_refactor}{Refactoring: per-protocol distributed systems on custom hardware become control programs (OSPF as Dijkstra, IS-IS, new ones) on one Network OS over packet-forwarding elements.}
+
+\subsection{The OpenFlow forwarding abstraction: $\langle$Match, Action$\rangle$}
+\paperfig[0.5]{yt_nm_matchaction}{OpenFlow's forwarding abstraction: match on any header (or a new header) at any flow granularity; actions forward, drop, send to controller, overwrite header with mask, push/pop, forward at a specific bit-rate.}
+\begin{itemize}
+\item OpenFlow \key{exploits the flow tables} already in switches (timely, not necessarily the right design 15 years later). \key{Standardization gives hardware independence}; the aim is a pragmatic, \key{good-enough abstraction}, not perfection.
+\item Rules: ``header $P$ $\to$ send to port 4''; ``header $Q$ $\to$ overwrite fields, send to several ports (multicast/multipath)''; ``unknown header $\to$ send to controller or drop''.
+\item The key idea is the general \key{match + action} abstraction --- \key{every forwarding element today} (L2 switch, L3 router, firewall ACL) already does match + action.
+\begin{itemize}
+\item \key{Match}: on any header, ideally even a \key{new header} you define; \key{any flow granularity} (fine at the edge, aggregated in the core, VLANs, MPLS\ldots).
+\item \key{Action}: forward to port(s), drop, send to controller, \key{overwrite header with a mask}, \key{push/pop} (encapsulation), forward at a specific bit-rate.
+\end{itemize}
+\item The hard part is not matching but choosing a \key{minimal set of action primitives} that is meaningful, implementable by chip vendors, and leaves room for box vendors to \key{differentiate} with extra features.
+\end{itemize}
+\paperfig[0.5]{yt_nm_properties}{Properties of the forwarding abstraction: protocol independent, backward compatible, technology independent.}
+\begin{itemize}
+\item \key{Protocol independent}: can construct Ethernet, IPv4, VLAN, MPLS\ldots and new forwarding methods.
+\item \key{Backward compatible}: can run in existing networks (a box can look like a BGP router or firewall).
+\item \key{Technology independent}: switches, routers, Wi-Fi APs, cellular base stations, even WDM/TDM circuit switches.
+\item SDN products were emerging for data centres, public clouds, enterprise/campus, cellular backhaul, enterprise Wi-Fi, WANs and home networks.
+\end{itemize}
+
+\subsection{How SDN will shape networking}
+\paperfig[0.5]{yt_nm_shape}{How SDN will shape networking (points 3 and 4): diversify the supply chain; build a robust foundation (standardized forwarding abstraction, provable network properties at every step).}
+\paragraph{1. Empower network owners and operators.}
+\begin{itemize}
+\item \key{Customize networks to local needs} (campus admins started adding their own features once they could), or pay new suppliers to build features.
+\item \key{Eliminate unneeded features}: a router must implement around 6,000 RFCs; dropping the 99\% you don't use can make it \key{more reliable}.
+\item \key{Create virtual, isolated networks} (multi-tenancy, like VLANs today but more general).
+\end{itemize}
+\paragraph{2. Increase the pace of innovation.}
+\begin{itemize}
+\item \key{Innovation at software speed}; \key{standards (if any) follow software deployment} --- deploy, share, gain experience, then standardize, instead of waiting 5--10 years for a committee standard.
+\item \key{Technology exchange with partners} (neighbours can peer with their own home-grown techniques at their boundary, and use BGP elsewhere), and \key{technology transfer from universities} (testbeds like GENI).
+\item Expect some chaos and a need for careful testing, but much faster progress.
+\end{itemize}
+\textbf{Example 1 --- customizing the network: distributed load balancing.} Ordinary load balancers (expensive boxes in the middle of the network) pick only the \key{server}, not the \key{path}. With SDN, a control program on NOX \key{jointly chooses the path and the server} for each HTTP request (greedily, from recent congestion), with load balancing effectively distributed across every switch. Deployed on the GENI network across several campuses, it cut both response time and its variance. The real point: \key{a graduate student built it in a few weeks, in under 500 lines of code}, ran it on a national network with real traffic, and could hand others the code.
+
+\textbf{Example 2 --- innovation at software speed: Mininet.} A \key{narrow, standard forwarding interface can be emulated in software}, replacing expensive test labs.
+\paperfig[0.5]{yt_nm_mininet}{Mininet rapid prototyping: the network OS and control program run as processes; switches (Open vSwitch) run in the kernel; hosts are processes with their own network namespaces.}
+\begin{itemize}
+\item Map switches into the \key{kernel} (Open vSwitch) and hosts/controllers into \key{processes}, using Linux \key{network namespaces} (lightweight virtualization, much cheaper than full VMs), stitched together with \key{virtual Ethernet} links; pieces can be spread over cores and machines.
+\item \key{Fast}: tens of switches on a laptop, thousands on a server rack. \key{Rapid transfer}: the same \key{unmodified code} moves directly into the live network (even into a slice, without taking it down).
+\end{itemize}
+\paragraph{3. Diversify the supply chain.} A variety of software suppliers: \key{vendors, home-grown, outsourced, open source}; existing vendors well placed but competing with startups; a \key{common hardware abstraction, with extensions}.
+\paragraph{4. Build a robust foundation.} Turn an ad hoc discipline of mastering complexity into one with precision: a \key{standardized forwarding abstraction} and \key{provable network properties at every step}.
+
+\textbf{Example 3 --- Header Space Analysis (HSA): static checking.}
+\paperfig[0.5]{yt_nm_hsa}{Header space analysis: questions that are hard in today's networks, and the three-step approach.}
+\begin{itemize}
+\item In today's networks, simple questions are hard: \key{Can A talk to B?} What are all the packet headers from A that can reach B? \key{Are there loops?} \key{Is VLAN X (or a slice) totally isolated from VLAN Y?} --- vital for debugging and compliance (e.g., hospitals/HIPAA, PCI).
+\item Approach, relying only on $\langle$match, action$\rangle$:
+\begin{enumerate}
+\item Model a \key{packet header as a point in $\{0,1\}^L$} ($L$ = header length; a single point in an $L$-dimensional space, whatever the protocol layers).
+\item Model every \key{switch, router, firewall} as a \key{transform of that space}: a rule with wildcards matches a \key{region}; actions forward or rewrite it (e.g., NAT) to another region.
+\item Compose them into a \key{network transfer function} and analyze \key{reachability, loops, slice isolation}.
+\end{enumerate}
+\end{itemize}
+\paperfig[0.5]{yt_nm_hsatransfer}{Network transfer function: header-space regions are transformed by each packet-forwarding element along the paths through the network.}
+\paperfig[0.5]{yt_nm_hsaprops}{HSA properties: the network transfer function is a set of Boolean expressions; relies only on $\langle$match, action$\rangle$; proves reachability and isolation and finds loops; analyzed Stanford's backbone in about 10 minutes.}
+\begin{itemize}
+\item The transfer function is just a set of \key{Boolean expressions} (like Karnaugh maps / logic minimization), so tools from CAD, formal verification and \key{model checking} apply.
+\item \key{Protocol independent, general and surprisingly fast}; it subsumes Ethernet, IPv4, firewalls, NAT\ldots{} Applied to Stanford's backbone configuration, it found who can talk to whom and loops in about 10 minutes.
+\end{itemize}
+\textbf{McKeown's conclusion:} SDN gives the industry ways to \key{make the foundation stronger}, \key{innovate faster}, and \key{innovate on our own} --- the whole industry will change.
+
+\section{How the two talks connect to the rest of the course}
+\begin{itemize}
+\item Both build on \key{4D} (Chapter 2): network-wide views, direct control, decision logic out of routers; \key{RCP} (Chapter 1) is an early logically centralized controller.
+\item The \key{forwarding abstraction} is \key{OpenFlow} (Chapter 3); \key{P4} (Chapter 4) later makes even the parser and match-action pipeline programmable --- the ``new header'' McKeown asks for.
+\item \key{Frenetic} (Chapter 5) is exactly Shenker's argument applied to programming: higher-level abstractions over OpenFlow/NOX.
+\item \key{B4} (Chapters 6--7) is SDN in production: central TE as a control program over a global view, with OpenFlow switches built from merchant silicon --- McKeown's industry shift.
+\end{itemize}
+
+\section{Revision checklist}
+\begin{itemize}
+\item \textbf{Shenker's thesis:} networking masters complexity but never extracts simplicity; abstractions are how fields extract simplicity; SDN = three abstractions.
+\item \textbf{Network control problem:} compute every device's configuration, without communication guarantees, within a given network protocol.
+\item \textbf{Three abstractions:} distributed state $\to$ global network view (Dijkstra not Bellman--Ford; distribution is your choice); specification $\to$ abstract model / network virtualization (access control on a crossbar); forwarding $\to$ flexible model hiding hardware (OpenFlow; switch or fabric).
+\item \textbf{Paradigm shift:} Configuration = Function(view); end of distributed control protocols; start of the software era.
+\item \textbf{Stack:} control program $\to$ abstract model $\to$ network virtualization $\to$ global view $\to$ network OS $\to$ switches; clean separation of concerns (the dog), OpenFlow is the tail.
+\item \textbf{McKeown's thesis:} vertical $\to$ horizontal industry (mainframes $\to$ microprocessor analogy), driven by merchant silicon and open interfaces.
+\item \textbf{Refactoring:} OSPF 245 pages, 101 for the distributed system, 4 for Dijkstra; one network OS instead of a distributed system per protocol.
+\item \textbf{Match + action:} what every forwarding box does; match any header/granularity; minimal action set; protocol-, technology-independent, backward compatible.
+\item \textbf{Four impacts:} empower operators (customize, remove features, virtual networks), faster innovation (software speed, standards follow deployment; load-balancing demo, Mininet), diverse supply chain, robust foundation (HSA: header as point in $\{0,1\}^L$, boxes as transforms, network transfer function, prove reachability/isolation/loops).
+\end{itemize}

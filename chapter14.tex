@@ -1,0 +1,112 @@
+\chapter{Data Center TCP (DCTCP)}
+\paperinfo{M. Alizadeh, A. Greenberg, D. A. Maltz, J. Padhye, P. Patel, B. Prabhakar, S. Sengupta, M. Sridharan (Microsoft Research, Stanford)}{ACM SIGCOMM 2010}
+
+\begin{keybox}[DCTCP in one paragraph]
+Data centres mix \key{latency-sensitive short flows} with \key{throughput-hungry long flows}, over \key{cheap, shallow-buffered switches}. Standard TCP fills switch buffers, hurting the short flows (incast, queue buildup, buffer pressure). \key{DCTCP} is a TCP variant that keeps \key{switch queues persistently small while keeping throughput high}. It uses \key{ECN}: switches \key{mark} packets when the \emph{instantaneous} queue exceeds a small threshold $K$; the sender estimates the \key{fraction of marked packets} $\alpha$ and \key{cuts its window in proportion}: $cwnd \leftarrow cwnd\,(1-\alpha/2)$. The key contribution: \key{extracting multi-bit congestion feedback from a single-bit ECN stream}. It needs about 30 lines of TCP changes and one switch setting.
+\end{keybox}
+
+\section{Data-centre communication}
+\subsection{Partition/Aggregate}
+\paperfig[0.5]{dc_fig2_partagg}{The partition/aggregate pattern: a request is split across aggregators and workers, each level with a tighter deadline (250\,ms, 50\,ms, 10\,ms).}
+\begin{itemize}
+\item Web search, social feeds and ad selection split a request into pieces handled by many \key{workers}; \key{aggregators} combine the responses. Interactive, \key{soft real-time}: the backend gets an all-up SLA of about 230--300\,ms, so \key{workers get tight deadlines (10--100\,ms)}.
+\item A worker that misses its deadline is \key{left out}, lowering result quality (and revenue). Many requests iterate the pattern, so delays add up. \key{High percentiles (99.9th) matter}: one slow response in 1000 still affects many users.
+\item The resulting requirements: \key{low latency for short flows}, \key{high burst tolerance}, and \key{high utilization for long flows} (background updates keep data fresh).
+\end{itemize}
+
+\subsection{Workload (from a 6000-server production cluster)}
+\begin{itemize}
+\item 99.91\% of traffic is TCP. Three kinds: \key{query traffic} (very short, 1.6--2\,KB, partition/aggregate, highly bursty), \key{short messages} (50\,KB--1\,MB, time-sensitive control state), and \key{background/update flows} (1--50\,MB, throughput-sensitive).
+\item Most background flows are small, but \key{most bytes are in large flows}.
+\item Concurrency: a node typically has dozens of concurrent flows, but the number of concurrent \key{large} flows is tiny (median 1) --- \key{little statistical multiplexing}, yet those flows last many RTTs and can fill buffers.
+\end{itemize}
+
+\section{Why TCP performs badly: three impairments}
+\paperfig[0.45]{dc_fig6_impairments}{Three ways flows interact in a shared-memory switch: (a) incast, (b) queue buildup, (c) buffer pressure.}
+Commodity ToR switches are \key{shared-memory} switches: packets of all ports share one buffer pool, and an MMU dynamically limits how much each port can take (e.g., 4\,MB for 48 ports). Big multi-ported memory is expensive, so buffers are \key{shallow}. TCP's loss-driven behaviour clashes with this in three ways:
+\begin{enumerate}
+\item \key{Incast}: many synchronized flows (e.g., 43 workers answering one aggregator) converge on one port in a short time and overflow its buffer, even if each flow is tiny. A response is only 2 packets, so \key{a single loss usually means a TCP timeout} ($RTO_{min}$ = 300\,ms) --- the response misses its deadline. Developers cap response size and add random \key{jitter} to desynchronize, which lowers the tail but raises the median.
+\item \key{Queue buildup}: long greedy TCP flows grow the bottleneck queue until it drops (sawtooth). Short flows sharing that queue \key{wait behind the long flows' packets}, adding up to milliseconds of delay (intra-rack RTT is only about 100\,$\mu$s), and suffer losses. This is \emph{not} incast; reducing $RTO_{min}$ won't help --- \key{only smaller queues will}.
+\item \key{Buffer pressure}: because the buffer is shared, long flows queuing on \emph{other} ports \key{eat the shared pool}, leaving no room to absorb bursts on this port $\Rightarrow$ losses and timeouts without needing synchronized flows.
+\end{enumerate}
+\paperfig[0.45]{dc_fig7_incast}{A real incast event: queries sent over 0.8\,ms; all but one response return by 13.5\,ms; the lost one is retransmitted only after $RTO_{min}$ (300\,ms).}
+\textbf{Key lesson:} switch buffer occupancy must be \key{persistently low} while long flows still get \key{high throughput}.
+
+\textbf{Why not existing approaches?}
+\begin{itemize}
+\item \key{Delay-based} congestion control (reacting to RTT increase) needs precise RTT measurement; at data-centre speeds a 10-packet queue is only 120\,$\mu$s (1\,Gb/s) or 12\,$\mu$s (10\,Gb/s) --- too noisy to measure.
+\item \key{AQM} (RED, PI) with \emph{standard} TCP: TCP halves its window on any congestion signal, so with few flows and bursty traffic AQM forces a trade-off: big queues (delay) or lost throughput.
+\item Schemes needing new switch hardware (e.g., RCP) were excluded --- DCTCP had to work on existing switches.
+\end{itemize}
+
+\section{The DCTCP algorithm}
+Main idea: \key{react in proportion to the extent of congestion}, not just its presence. Standard TCP halves its window on an ECN mark regardless of how much congestion exists; with few flows this causes a big mismatch between sending rate and capacity, so queues underflow (lost throughput). DCTCP has three components.
+
+\subsection{1. Simple marking at the switch}
+One parameter, the \key{marking threshold $K$}. An arriving packet is marked with \key{CE (Congestion Experienced)} if the \key{instantaneous queue length} $> K$; otherwise not. This quickly tells senders about queue overshoot. Existing RED hardware can do it: set RED's low and high thresholds both to $K$ and mark on instantaneous (not average) queue length.
+
+\subsection{2. ECN-Echo at the receiver}
+Standard ECN (RFC 3168) sets ECN-Echo on all ACKs until the sender confirms (CWR) --- losing \emph{how many} packets were marked. A DCTCP receiver tries to convey \key{exactly which packets were marked}: simplest is to ACK every packet with ECN-Echo set iff that packet was marked. With \key{delayed ACKs} (one ACK per $m$ packets) it uses a \key{two-state machine}:
+\paperfig[0.42]{dc_fig10_ackfsm}{Two-state ACK generation: in each state send one ACK per $m$ packets with ECN-Echo equal to the state; when the CE bit of arriving packets changes, send an immediate ACK for the previous run and switch state.}
+Since the sender knows how many packets each ACK covers, it can reconstruct the runs of marked packets exactly.
+
+\subsection{3. Controller at the sender}
+The sender keeps an estimate $\alpha$ of the \key{fraction of marked packets}, updated once per window of data (about one RTT):
+\[ \alpha \leftarrow (1-g)\,\alpha + g\,F \]
+where $F$ is the fraction of packets marked in the last window and $0<g<1$ is the weight of new samples. Since packets are marked exactly when the queue exceeds $K$, \key{$\alpha$ estimates the probability that the queue is larger than $K$} (a point on the queue-size distribution): $\alpha\approx 0$ means little congestion, $\alpha\approx 1$ means heavy congestion.
+
+On an ECN-marked ACK, instead of halving:
+\[ cwnd \leftarrow cwnd \times \left(1 - \frac{\alpha}{2}\right) \]
+\begin{itemize}
+\item $\alpha$ small $\Rightarrow$ window \key{reduced only slightly} --- senders start backing off \key{gently} as soon as the queue exceeds $K$, so the queue stays near $K$ without draining the link.
+\item $\alpha = 1$ $\Rightarrow$ window \key{halved, like TCP}.
+\item Everything else (slow start, additive increase, loss recovery) is \key{unchanged}; the window is cut at most once per window of data.
+\end{itemize}
+
+\subsection{How DCTCP fixes the three impairments}
+\begin{itemize}
+\item \key{Queue buildup}: senders react as soon as the queue exceeds $K$, so queues stay short; short flows wait less, and there is \key{headroom} for micro-bursts.
+\item \key{Buffer pressure}: congested ports' queues don't grow large, so they don't exhaust the shared pool and hurt other ports.
+\item \key{Incast}: if so many flows burst at once that even one packet each overflows the buffer, no congestion control can help (only scheduling). But usually flows send several packets over several RTTs; since DCTCP marks \key{early and aggressively} (instantaneous queue), senders get marks in the first RTT or two and \key{shrink later bursts} before they overflow.
+\end{itemize}
+
+\section{Analysis}
+\paperfig[0.55]{dc_fig11_sawtooth}{Window size of one DCTCP sender and the resulting queue size: a sawtooth with period $T_C$, window amplitude $D$, queue amplitude $A$ and maximum $Q_{max}$; packets sent in the last RTT before the peak are marked.}
+Model: $N$ long-lived flows, same RTT, one bottleneck of capacity $C$, synchronized sawtooths. Queue: $Q(t) = N\,W(t) - C\times RTT$.
+\begin{itemize}
+\item Marking starts when each window reaches the critical size $W^* = (C\times RTT + K)/N$ (queue $=K$). Senders react one RTT later, when the window is $W^*+1$. So the queue exceeds $K$ for exactly one RTT per period, and $\alpha$ = packets sent in that RTT / packets sent in a whole period. Solving gives
+\[ \alpha^2\left(1-\frac{\alpha}{4}\right) = \frac{2W^*+1}{(W^*+1)^2} \approx \frac{2}{W^*} \quad\Rightarrow\quad \alpha \approx \sqrt{2/W^*}. \]
+\item Window amplitude $D = (W^*+1)\,\alpha/2$; queue amplitude
+\[ A = N D \approx \tfrac{1}{2}\sqrt{2N(C\times RTT + K)}, \qquad T_C = D = \tfrac{1}{2}\sqrt{2(C\times RTT+K)/N}\ \text{RTTs}, \qquad Q_{max} = K + N. \]
+\item \key{Key property}: for small $N$, the queue oscillation is \key{$O(\sqrt{C\times RTT})$}, much smaller than TCP's \key{$O(C\times RTT)$}. So $K$ can be small without losing throughput.
+\end{itemize}
+
+\subsection{Choosing parameters}
+\begin{itemize}
+\item \key{Marking threshold}: require the queue minimum $Q_{min} = Q_{max} - A > 0$ (no underflow) for all $N$:
+\[ K > \frac{C\times RTT}{7} \]
+i.e., marking can start at about 1/7 of the bandwidth-delay product without losing throughput.
+\item \key{Estimation gain}: $g$ small enough that the moving average spans at least one congestion period, $(1-g)^{T_C} > 1/2$, giving (worst case $N=1$) $g < 1.386/\sqrt{2(C\times RTT+K)}$.
+\item In practice, real hosts send bursts (30--40 packets at 10\,Gb/s due to LSO and interrupt moderation), so they used $K=20$ packets at 1\,Gb/s and $K=65$ at 10\,Gb/s, with $g=1/16$.
+\end{itemize}
+
+\section{Discussion}
+\begin{itemize}
+\item \key{AQM is not enough}: AQM with standard TCP must trade throughput against delay in low-multiplexing, bursty environments; the sender's \emph{reaction} must change.
+\item \key{Convergence}: DCTCP converges to fair shares more slowly than TCP (it adjusts gradually, $2$--$3\times$ slower), but data-centre RTTs are tiny, micro-bursts are too short to converge anyway, and big flows can tolerate it.
+\item \key{Synchronization}: on--off marking could synchronize flows, but DCTCP's mild reaction makes this less harmful.
+\item \key{Scope}: designed \emph{only} for data centres (single administrator, homogeneous network, RTTs $\sim$100s of $\mu$s; fairness with Internet TCP is not needed --- external traffic can be separated, e.g., with Ethernet priorities).
+\end{itemize}
+\paperfig[0.45]{dc_fig1_queue}{Switch queue with two long flows: TCP's sawtooth occupies hundreds of KB; DCTCP keeps the queue tiny at the same throughput.}
+\textbf{Results in brief:} same or better throughput than TCP while using \key{about 90\% less buffer}; high burst tolerance and low latency for short flows; handles 10$\times$ more background traffic and largely eliminates incast timeouts.
+
+\section{Revision checklist}
+\begin{itemize}
+\item \textbf{Needs:} low latency for short flows, burst tolerance, high throughput for long flows --- from partition/aggregate with 10--100\,ms deadlines.
+\item \textbf{Impairments:} incast (synchronized responses overflow a port; 300\,ms RTO), queue buildup (short behind long), buffer pressure (shared memory drained by other ports).
+\item \textbf{Switch:} mark CE if instantaneous queue $>K$ (RED with both thresholds $=K$).
+\item \textbf{Receiver:} echo exact marks; two-state machine with delayed ACKs.
+\item \textbf{Sender:} $\alpha \leftarrow (1-g)\alpha + gF$; $cwnd \leftarrow cwnd(1-\alpha/2)$; else standard TCP.
+\item \textbf{Analysis:} $\alpha\approx\sqrt{2/W^*}$; queue amplitude $O(\sqrt{C\cdot RTT})$ vs.\ TCP $O(C\cdot RTT)$; $Q_{max}=K+N$; $K > C\cdot RTT/7$.
+\item \textbf{Why not delay-based / plain AQM:} RTT noise at $\mu$s scale; TCP's halving forces throughput--delay trade-off.
+\end{itemize}

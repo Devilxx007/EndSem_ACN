@@ -1,0 +1,169 @@
+\chapter{The Click Modular Router}
+\paperinfo{R. Morris, E. Kohler, J. Jannotti, M. F. Kaashoek (MIT)}{ACM SOSP 1999}
+
+\begin{keybox}[Click in one paragraph]
+\key{Click} is a software architecture for building \key{flexible, configurable routers}. A Click router is assembled from small packet-processing modules called \key{elements}, each doing one simple job (classification, queueing, scheduling, talking to a device\ldots). A \key{configuration} is a \key{directed graph of elements}; packets flow along the edges. Two features make it powerful: \key{pull processing} (packet flow driven by transmitting interfaces, which makes schedulers easy to compose) and \key{flow-based router context} (lets an element find related elements elsewhere in the graph). Click runs on commodity PCs as a Linux kernel module.
+\end{keybox}
+
+\section{Motivation}
+\begin{itemize}
+\item Routers must do much more than forward: \key{prioritize traffic, translate addresses (NAT), tunnel, filter, act as firewalls}; dropping policies (e.g., RED) and Differentiated Services keep evolving.
+\item But most routers are \key{closed, static and inflexible}: administrators can turn functions on/off but can't specify or even see how functions interact, and third parties can't add new functions because the internal interfaces don't exist, are in the wrong place, or aren't published.
+\item Click's answer: build routers from \key{composable modules}, like UNIX pipes composing simple programs. To extend a router, write new elements or compose existing ones in new ways.
+\end{itemize}
+
+\section{Architecture}
+A Click configuration is a \key{directed graph}: nodes are \key{elements}, edges (\key{connections}) are possible paths for packet transfer. Unlike a flowchart, connections represent \emph{packet} flow, not control flow, and elements are objects with private state. Inside a running router each element is a \key{C++ object} and each connection is a pointer, so passing a packet along a connection costs \key{one virtual function call}.
+
+\subsection{Elements}
+\paperfig[0.4]{ck_fig1_element}{An element, Tee(2): element class, configuration string, input port (triangle) and output ports (rectangles).}
+Every action of the router --- reading/writing devices, queueing, route lookup, counting --- is an element. Key properties:
+\begin{itemize}
+\item \key{Element class}: determines behaviour (like a class in OOP). E.g., \texttt{Tee} copies each input packet to every output.
+\item \key{Input and output ports}: endpoints of connections; any number, possibly with different meanings (e.g., normal vs.\ error output).
+\item \key{Configuration string}: arguments that initialize the element, e.g., the ``2'' in \texttt{Tee(2)} = two outputs. Strings are opaque to the language; the element parses them.
+\end{itemize}
+Packet data is \key{copy-on-write}: \texttt{Tee} copies only the packet header object, not the data.
+
+\subsection{Push and pull connections}
+\paperfig[0.55]{ck_fig3_pushpull}{Push and pull control flow through FromDevice $\to$ Null $\to$ Queue $\to$ Null $\to$ ToDevice. Push moves forward from the receiving device; pull moves backward from the transmitting device; the packet always moves forward.}
+Click has two kinds of connections:
+\begin{itemize}
+\item \key{Push}: the \emph{upstream} element hands a packet to the downstream element. Packet \emph{arrival} starts push processing, which continues until an element discards or stores the packet.
+\item \key{Pull}: the \emph{downstream} element asks the upstream element for a packet. An \emph{output interface that is ready to send} starts pull processing, which flows backward until some element returns a packet (or \texttt{null} if none is ready).
+\end{itemize}
+\textbf{Why pull matters:} decisions that belong at \emph{transmission time} --- e.g., \key{packet scheduling} (which queue to take from next) --- become simple, composable pull elements. Also, a busy interface should not be handed packets (it would have to store them, and the router could no longer drop or reprioritize them); giving the transmitting device a \emph{pull} input lets it ask for packets only when ready.
+
+\subsection{Queues are explicit}
+Elements have \key{no implicit queues} on their ports (avoiding hidden cost and complexity). Queueing is done by a separate \texttt{Queue} element, which \key{converts push to pull}: it accepts pushed packets and returns them when pulled. So the \key{placement of Queues determines the router's execution profile}, and unusual setups are easy (one queue feeding several interfaces, a queue feeding a traffic shaper\ldots). Since a push is just a function call, packet processing can only stop where an element chooses to stop (e.g., at a Queue).
+
+\subsection{Push/pull invariants (checked at initialization)}
+\paperfig[0.5]{ck_fig4_invariants}{Invariant violations (top): push output to pull input, a push output connected twice, a pull input connected twice, and an agnostic element in a mixed context. The bottom configuration (with a Queue in between) is legal.}
+\begin{itemize}
+\item Push outputs connect only to push inputs; pull outputs only to pull inputs.
+\item \key{Agnostic} ports (e.g., \texttt{Null}, \texttt{Counter}) can act as push or pull, but each must be used one way only, and if packets flow inside an element from an agnostic input to an agnostic output, both must be used the same way.
+\item \key{Push outputs and pull inputs must be connected exactly once} (each handoff has a unique destination).
+\end{itemize}
+These rules catch intuitively wrong configurations: connecting \texttt{FromDevice} (push) straight to \texttt{ToDevice} (pull) is illegal --- a \texttt{Queue} is needed in between to store packets until the device is ready.
+
+\textbf{Packet-upstream notification.} When a pull returns nothing, the puller must retry later. Instead of timers, each Queue (using flow-based context) finds the downstream elements interested in ``packet-upstream'' events and \key{notifies them when it becomes non-empty}, so they retry the pull.
+
+\subsection{Flow-based router context}
+\paperfig[0.45]{ck_fig5_context}{Elements downstream of RED found by flow-based router context, with a search filter that stops at Queues (downstream elements in grey).}
+An element sometimes needs elements that are \emph{not directly connected} but related by \key{packet flow} (the transitive closure of connections). Click lets any element ask, e.g., ``which elements are downstream of my first output?'', with an optional \key{filter} that stops the search at certain element types (e.g., stop at Queues). The element can then use the exported variables/methods of what it finds (queue lengths, interface addresses\ldots). This works even with cycles in the graph.
+
+\subsection{Implementation of an element and the language}
+\begin{itemize}
+\item An element class is a C++ subclass of \texttt{Element} ($\approx$20 virtual functions, most with defaults); only \texttt{push} and \texttt{pull} run during forwarding. A do-nothing \texttt{Null} element is under 20 lines; typical elements are about 120.
+\item The \key{Click language} has two constructs: \key{declarations} (create an element) and \key{connections} (\texttt{->}):
+\end{itemize}
+\begin{lstlisting}
+// a trivial router that drops everything
+src :: FromDevice(eth0);
+ctr :: Counter;
+sink :: Discard;
+src -> ctr;
+ctr -> sink;
+// the same, with anonymous elements
+FromDevice(eth0) -> Counter -> Discard;
+\end{lstlisting}
+\begin{itemize}
+\item \key{Compound elements}: users define new element classes by composing existing ones (e.g., \texttt{MyQueue} = Queue + Shaper). They are compile-time only, so they cost nothing at run time.
+\item An \key{optimizer} (pattern-matching preprocessor) can rewrite configurations, e.g., replace groups of elements with a single combined element.
+\end{itemize}
+
+\section{An IP router in Click}
+\paperfig[0.5]{ck_fig8_iprouter}{A two-interface IP router: 16 elements on the forwarding path. Per interface: FromDevice $\to$ Classifier (ARP queries / ARP responses / IP); the IP path goes through Paint, Strip(14), CheckIPHeader, GetIPAddress, LookupIPRoute, then per output DropBroadcasts, CheckPaint, IPGWOptions, FixIPSrc, DecIPTTL, IPFragmenter, ARPQuerier, Queue, ToDevice; error outputs feed ICMPError elements.}
+\begin{itemize}
+\item Tasks needing only \key{local information} map naturally to elements. E.g., \texttt{DecIPTTL}: if TTL expired, emit on its 2nd output (to \texttt{ICMPError}); else decrement TTL, update checksum, emit on the 1st output. One could connect the ``expired'' output to \texttt{Discard} instead, or add a rate limiter.
+\item Information computed in one place and used elsewhere is carried in \key{annotations} --- data attached to a packet but not part of it:
+\begin{itemize}
+\item \key{Destination address}: \texttt{GetIPAddress} copies the IP destination into the annotation; \texttt{LookupIPRoute} replaces it with the next-hop gateway; \texttt{ARPQuerier} maps it to an Ethernet address.
+\item \key{Paint}: \texttt{Paint} marks a packet with its input interface; \texttt{CheckPaint} detects packets leaving on the same interface (to trigger an ICMP redirect).
+\item \key{Link-level broadcast flag}: set by \texttt{FromDevice}; \texttt{DropBroadcasts} drops such packets before forwarding.
+\item \key{ICMP parameter-problem pointer} (set by \texttt{IPGWOptions}) and \key{Fix IP Source flag} (\texttt{ICMPError} doesn't know the output interface, so \texttt{FixIPSrc} later inserts the right source address).
+\end{itemize}
+\item Some information is global (all the router's addresses), so several elements currently take it in their configuration strings.
+\end{itemize}
+
+\textbf{Selected elements:}
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}l X@{}}
+\toprule
+\textbf{Element} & \textbf{Function} \\
+\midrule
+\texttt{Classifier(...)} & Sends a packet to the output of the first pattern it matches \\
+\texttt{CheckIPHeader} & Drops packets with bad IP length or checksum \\
+\texttt{LookupIPRoute} & Routing-table lookup on the destination annotation; picks output, sets next hop \\
+\texttt{DecIPTTL} & Decrements TTL; expired packets to 2nd output \\
+\texttt{IPFragmenter(mtu)} & Fragments large packets; too-large DF packets to 2nd output \\
+\texttt{ARPQuerier} / \texttt{ARPResponder} & Ethernet encapsulation via ARP / answers ARP queries \\
+\texttt{Queue(n)} & Stores up to $n$ packets (push in, pull out) \\
+\texttt{RED} & Random Early Detection dropping \\
+\texttt{PrioSched} / \texttt{RoundRobinSched} & Pull from inputs by strict priority / round robin \\
+\texttt{HashDemux} & Sends to one of $n$ outputs by a hash of packet contents \\
+\texttt{Meter(r)} / \texttt{Shaper(n)} & Split by rate above/below $r$ / pull shaper allowing $n$ packets/s \\
+\texttt{Tee(n)} / \texttt{Discard} & Copy to all $n$ outputs / drop \\
+\texttt{EtherSwitch} / \texttt{EtherSpanTree} & Learning Ethernet switch / IEEE 802.1d spanning tree \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\section{Extensions: scheduling, dropping, queueing, DiffServ}
+\subsection{Scheduling}
+A \key{scheduler is a pull element with many inputs and one output}: when pulled, it picks an input, pulls from it and returns the packet (trying other inputs if the chosen one is empty). \texttt{RoundRobinSched} cycles through inputs; \texttt{PrioSched} always tries input 0 first, then 1, etc.
+
+Queues and schedulers both have one pull output, so \key{downstream they look identical}. This allows \key{virtual queues}: compound elements that look like a queue but behave differently. Example: \key{Stochastic Fairness Queueing} = \texttt{HashDemux} (hash by flow) into several Queues, served by \texttt{RoundRobinSched}, isolating competing flows.
+\paperfig[0.45]{ck_fig10_sfq}{A virtual queue implementing Stochastic Fairness Queueing.}
+
+\subsection{Dropping policies}
+\texttt{Queue} only drops when full. \key{RED} is a separate element containing only the drop decision; it finds \emph{the nearest downstream Queues using flow-based context} and uses their \key{total length}. So by rearranging the graph one gets:
+\begin{itemize}
+\item \key{RED over multiple queues} (RED upstream of several Queues adds their lengths);
+\item \key{weighted RED}: a Classifier sends each priority to its own RED element with different parameters;
+\item \key{drop-from-front RED}: place RED \emph{after} the queue (a pull element looking upstream), which signals congestion to senders sooner.
+\end{itemize}
+\paperfig[0.45]{ck_fig11_wred}{Weighted RED: three RED elements with different parameters for three priorities.}
+
+\subsection{Complex queueing}
+\paperfig[0.35]{ck_fig12_complex}{RED over all queues; Classifier splits two priorities, each a stochastic-fair virtual queue; PrioSched prefers high priority; two ToDevice links pull from the same sources (load balancing).}
+Requirements: load-balance across two T1 links, two priority levels, fairness within each level, and RED based on the total queued packets. Click builds this by composition (figure above), whereas other platforms offer such features only individually or in fixed combinations.
+
+\subsection{Differentiated Services}
+DiffServ border routers classify and tag traffic and police it; core routers queue and schedule by tag. These pieces map directly to elements, so the administrator controls how they are arranged.
+\paperfig[0.4]{ck_fig13_diffserv}{A traffic conditioning block: Classifier by DSCP into four streams --- (1) Meter(7500) drops excess, (2) Shaper(10000) queues excess, (3) Meter(12500) re-marks excess as best effort (SetIPDSCP(4)), (4) best effort; rate-limited streams get priority via PrioSched.}
+
+\subsection{Ethernet switch}
+Click is not limited to IP: an IEEE 802.1d learning bridge uses \texttt{EtherSwitch} (works alone as a learning bridge), plus \texttt{EtherSpanTree} and two \texttt{Suppressor} elements to stop learning/forwarding on ports not on the spanning tree.
+\paperfig[0.4]{ck_fig14_switch}{The Ethernet switch configuration.}
+
+\subsection{Limitations}
+\begin{itemize}
+\item Small elements are preferred, but \key{packet flow as the organizing principle doesn't fit everything}: when control or data flow doesn't follow packet flow (e.g., the 802.1d protocol), a large element is needed.
+\item \key{Shared objects} that don't forward packets (e.g., a routing table shared by several elements) are awkward.
+\item \key{CPU scheduling} among competing push and pull paths is not fully solved (partly left to Linux).
+\end{itemize}
+
+\section{Implementation}
+\begin{itemize}
+\item About 17,000 lines of C++, compiled as a \key{Linux kernel module} (or a user-level program using BPF).
+\item Run-time objects: \key{elements}; the \key{router} (configures elements, checks connections, resolves agnostic ports to push or pull --- which requires global context because chains of agnostic elements must agree; initialization runs in stages so cyclic graphs work); \key{packets} (copy-on-write, equivalent to Linux \texttt{sk\_buff}s, annotations in the header); \key{timers}; and a \key{work list} (a simple CPU scheduler run every 8 input packets, used to delay packet-upstream notification so several packets are enqueued before pulls start --- better i-cache use).
+\item \textbf{Linux integration}: Click runs in a \key{bottom-half handler} (only one at a time, so elements need not be reentrant). On receive, the device interrupts, the packet is queued, and the bottom half hands it to \texttt{FromDevice}, which pushes it through the graph (bypassing Linux's IP stack) until it reaches a Queue. When a device can send, \texttt{ToDevice} pulls a packet and gives it straight to the driver.
+\item Configuration is written to \texttt{/proc/click/config} (and can be changed on the fly); each element gets a \texttt{/proc} directory for statistics and run-time parameters (queue lengths, RED probabilities).
+\end{itemize}
+\textbf{Performance in brief:} modularity is cheap --- the IP router forwards about 90\% as fast as plain Linux on the same PC, adding elements costs little, and most CPU time goes to device interrupts and drivers rather than Click itself. Above the maximum rate it suffers \key{receive livelock} (interrupts starve forwarding), which a polling architecture would fix.
+
+\section{Revision checklist}
+\begin{itemize}
+\item \textbf{Idea:} routers as graphs of small elements; packets flow along connections; one virtual call per hop.
+\item \textbf{Element:} class + ports + configuration string; copy-on-write packets.
+\item \textbf{Push vs.\ pull:} arrival drives push forward; ready transmitter drives pull backward; schedulers are pull elements.
+\item \textbf{Queue:} explicit element converting push to pull; its placement shapes execution.
+\item \textbf{Invariants:} matching push/pull, agnostic used one way, push outputs and pull inputs connected exactly once.
+\item \textbf{Flow-based context:} find related elements by packet flow (with filters); used by RED and packet-upstream notification.
+\item \textbf{Language:} declarations + connections; compound elements (zero run-time cost); optimizer.
+\item \textbf{IP router:} 16 elements; annotations (destination address, paint, broadcast flag, Fix IP Source).
+\item \textbf{Extensions:} virtual queues (SFQ), RED variants by placement, weighted RED, DiffServ conditioning, Ethernet switch.
+\item \textbf{Limits:} non-packet-flow control (802.1d), shared objects, CPU scheduling.
+\end{itemize}

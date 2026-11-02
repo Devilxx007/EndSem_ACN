@@ -1,0 +1,120 @@
+\chapter{Fastpass: A Centralized ``Zero-Queue'' Datacenter Network}
+\paperinfo{J. Perry, A. Ousterhout, H. Balakrishnan, D. Shah (MIT), H. Fugal (Facebook)}{ACM SIGCOMM 2014}
+
+\begin{keybox}[Fastpass in one paragraph]
+Today's networks distribute decisions: endpoints decide \emph{when} to send (congestion control) and switches decide \emph{which path} (routing). This is robust but loses control over delay, and needs queues to absorb bursts. Fastpass instead makes each sender \key{delegate to a logically centralized arbiter} the decision of \key{when each packet is sent} and \key{which path it takes}. The arbiter uses two fast algorithms --- \key{timeslot allocation} (a pipelined \key{maximal matching}) and \key{path selection} (\key{bipartite edge-colouring}) --- so packets arrive at each switch just as the next link is free: \key{near-zero queues}, high utilization, and flexible allocation policies (fairness, short-flow priority). Endpoints talk to the arbiter with the \key{Fastpass Control Protocol (FCP)}, and arbiters are replicated for failover.
+\end{keybox}
+
+\section{Motivation}
+\begin{itemize}
+\item Goal: a network where (1) \key{packets see no queueing}, (2) \key{utilization is high}, and (3) \key{multiple allocation objectives} (between flows, apps, users) are supported.
+\item Distributed control adjusts rates over \emph{many RTTs}; to keep links busy, switches need buffers to absorb bursts, so delays \key{rise and fall} and \key{tail latency} is rarely low.
+\item With a central arbiter, flow rates can match capacity at the time scale of \emph{single packet transmissions}: no persistent congestion, stable small queues, low tail latency, no drops from overflow. Analogy: a central traffic controller telling every car when to leave and which road to take.
+\item Problems it targets: \key{tail latency} (apps issue hundreds of requests; the slowest dominates), \key{false congestion} (packets stuck behind others headed to a different bottleneck), \key{incast}, and \key{sharing among heterogeneous workloads} (latency vs.\ throughput vs.\ completion time).
+\end{itemize}
+
+\section{Architecture}
+\paperfig[0.45]{fp_fig1_arbiter}{The Fastpass arbiter attached to a two-tier (ToR + core) network.}
+\paperfig[0.48]{fp_fig2_structure}{Arbiter structure: the endpoint's FCP client sends destination and size; the arbiter's FCP server, timeslot allocator and path selector return timeslots and paths.}
+When an application calls \texttt{send()}, the OS sends a \key{request} to the arbiter giving the \key{destination and number of bytes}. The arbiter performs:
+\begin{enumerate}
+\item \key{Timeslot allocation}: assign timeslots in which to transmit. A \key{timeslot} = time to send one \key{MTU-sized packet} on the fastest endpoint link (about 1.2\,$\mu$s for 1500\,B at 10\,Gb/s).
+\item \key{Path selection}: choose a path for each packet.
+\end{enumerate}
+Knowing all current and scheduled transfers, the arbiter chooses timeslots and paths so \key{each packet arrives at a switch exactly when the next link toward its destination is free} --- the ``zero-queue'' property.
+\begin{itemize}
+\item \key{FCP} carries demands to the arbiter and allocations back; endpoints \key{aggregate demands over a few $\mu$s} per request packet to cut overhead.
+\item \key{Faults}: since queues are tiny, \key{packet loss is rare and signals a failure}; endpoints report losses so the arbiter can avoid bad links. The arbiter keeps only \key{soft state}, so a secondary can take over in milliseconds.
+\item \key{Timing}: endpoints must send exactly in their timeslots; worst-case queueing is bounded by clock discrepancy (about 1.5\,KB per 1.2\,$\mu$s of skew at 10\,Gb/s).
+\item \key{No switch changes} are needed; NIC features used are commodity; the arbiter is an ordinary server (with fast ports for big clusters).
+\item \key{Latency trade-off}: under moderate/high load, allocations are several timeslots in the future anyway, so arbiter latency is hidden and packets get ideal latency. Under light load, mean latency rises slightly (one arbiter round trip) in exchange for a big cut in tail latency.
+\item \key{Incremental deployment}: traffic leaving the Fastpass boundary uses Fastpass to the boundary; incoming traffic goes through gateways or a lower-priority class.
+\end{itemize}
+
+\section{Timeslot allocation}
+In each timeslot the arbiter chooses a \key{matching}: a set of sender--receiver pairs that may communicate, such that no link's bandwidth is exceeded.
+\begin{itemize}
+\item Fastpass requires each network tier to be \key{rearrangeably non-blocking (RNB)}: any traffic satisfying the bandwidth limits into and out of each tier can be routed without queueing. Then \key{timeslot allocation can be done separately from path selection}, and each tier can be abstracted as a single switch. A full-bisection network is just \key{one big switch}: each endpoint sends at most one and receives at most one packet per timeslot.
+\item Global knowledge allows \key{global policies}: \key{max-min fairness}, \key{minimizing flow completion time}, or limiting a traffic class --- and allocations can change \emph{from one timeslot to the next}, with no slow convergence.
+\item \key{Speed requirement}: about one timeslot per microsecond at 10\,Gb/s. A \emph{maximum} matching is too expensive, so Fastpass computes a \key{maximal matching} greedily (like switch schedulers): process demands in order and allocate a pair if it doesn't violate any constraint; at the end, no remaining demand can be added.
+\end{itemize}
+
+\subsection{Allocation policy by ordering}
+The policy is set by the \key{order in which demands are processed}:
+\begin{itemize}
+\item \key{Max-min fairness}: ``\key{least recently allocated first}'' --- order by the last timeslot each source--destination pair was allocated.
+\item \key{Min-FCT}: ``\key{fewest remaining MTUs first}''.
+\end{itemize}
+\paperfig[0.5]{fp_fig4_maxmin}{Allocating one timeslot for max-min fairness: demands sorted by last allocation; one bit per source and destination tracks availability; 1$\to$3 and 4$\to$2 are allocated, 2$\to$3 is rejected (destination 3 taken), 2$\to$1 and 3$\to$4 are allocated --- a maximal matching.}
+
+\subsection{Pipelined allocator}
+\paperfig[0.5]{fp_fig3_pipeline}{Pipelined allocation: the allocator for timeslot $t$ processes the demands left unsatisfied by the allocator for $t-1$, plus newly received demands.}
+\begin{itemize}
+\item Allocators form a \key{pipeline}: the allocator for timeslot $t$ takes the \emph{remaining} demands after $t-1$. Many timeslots are processed in parallel, so each may take longer while total throughput keeps up.
+\item Demands must be in roughly the right order; for max-min fairness, the allocator for $t+1$ can immediately process all demands last allocated before $t$, holding back only those allocated at $t$.
+\item Batches of 8 timeslots use a \key{bitmap table}: one bitmap per pair, one bit per timeslot; the first free slot = bitwise AND of source and destination bitmaps + ``find first set'' (one x86 instruction).
+\end{itemize}
+\textbf{Guarantee (proved in the paper's appendix):} where allocation and path selection separate, Fastpass's average latency is at most $2\times$ that of an optimal scheduler with half the capacity on its worst-case workload.
+
+\section{Path selection}
+\begin{itemize}
+\item Goal: assign packets (already given timeslots) to paths so that \key{no link carries more than one packet per timeslot} --- guaranteeing no queueing. Timeslot allocation already guarantees this on endpoint links.
+\item Existing load balancing falls short: \key{ECMP} hashes flows and can collide several on one path (skew); Hedera reroutes only elephant flows.
+\item In a two-tier network, a path between two ToRs is identified by a \key{core switch}. So: assign each packet a core switch such that no two packets with the \key{same source ToR or same destination ToR} get the \key{same core switch}.
+\item This is \key{bipartite edge-colouring}: vertices = ToRs (sources on one side, destinations on the other), edges = packets in this timeslot, colours = core switches. A proper colouring (no two edges of the same colour at a vertex) gives a conflict-free path assignment.
+\end{itemize}
+\paperfig[0.5]{fp_fig5_pathsel}{Path selection: (a) input matching of endpoints, (b) bipartite multigraph of ToRs, (c) edge-coloured ToR graph (colours = core switches), (d) resulting path per packet.}
+\begin{itemize}
+\item \key{Heterogeneous link speeds}: replace a high-capacity switch with several virtual low-capacity switches (e.g., one 40G = four 10G) and colour that virtual network.
+\item \key{Oversubscribed / multi-tier networks}: only traffic crossing a higher tier needs colouring; with ToR/Agg/Core, colour hierarchically (ToR graph $\to$ Agg switches, then Agg graph $\to$ Core switches).
+\item \key{Fast edge-colouring} ($O(nd\log d)$ for $n$ racks, $d$ nodes per rack) uses the \key{Euler split}: find an \key{Eulerian cycle} of a $2d$-regular graph and give alternate edges to two new $d$-regular graphs; repeat. $d-1$ splits of a degree-$d$ (power of 2) graph yield $d$ perfect matchings = $d$ colours. A compact bitmap representation fits in a 32\,KB L1 cache for about 6000 nodes.
+\end{itemize}
+
+\section{Handling faults}
+\subsection{Arbiter failures}
+\begin{itemize}
+\item One \key{primary} and some \key{secondary} arbiters all join an \key{IP multicast group} to which endpoints send requests; only the primary answers (responses are unicast).
+\item The primary multicasts \key{watchdog} packets every $T_w$ (e.g., 100\,$\mu$s); if a secondary hears none for $T_d$ (e.g., 1\,ms), it takes over (secondaries in a pre-set rank order).
+\item The new arbiter needs current demands; FCP keeps only \key{soft state} at the arbiter, so endpoints resynchronize in 1--2 RTTs.
+\item To avoid conflicting old/new allocations, timeslots are allocated only about 65\,$\mu$s ahead --- far less than the 1\,ms detection time --- so \key{no old allocations remain} when the secondary takes over, and arbiters need not share state.
+\end{itemize}
+\subsection{Network failures}
+Persistent, correlated loss (rather than sporadic bit errors) indicates a failed component. Endpoints know each packet's path and report drops to a separate \key{fault-isolation service}, which pinpoints the faulty link/switch and tells the arbiter to avoid it --- detection and mitigation in milliseconds.
+
+\subsection{Fastpass Control Protocol (FCP)}
+\begin{itemize}
+\item Requests and allocations can be lost. TCP-style retransmission is a poor fit: by the time a request/allocation is retransmitted it is \key{stale} (queue changed; timeslot passed).
+\item FCP sends \key{aggregate counts}: the endpoint sends the \key{total number of timeslots requested so far} for each destination; the arbiter allocates the difference from its last record. Counts are \key{idempotent} (receiving one twice allocates nothing extra), allowing \key{aggressive timeouts}. Endpoints also detect lost allocations from the arbiter's aggregate counts and re-request.
+\item After failover, the new arbiter's counts are out of sync; a \key{random nonce} folded into the checksum causes checksum failures that trigger \key{re-synchronization}: the arbiter resets counts to zero and the endpoint recomputes them from its current queues (one RTT).
+\end{itemize}
+
+\section{Implementation}
+\begin{itemize}
+\item \key{Arbiter}: built on Intel \key{DPDK} (direct user-space NIC queue access). \key{Endpoints}: a Linux kernel module; FCP is a transport protocol over IP; a \key{Fastpass qdisc} queues outgoing packets, extracts the destination, requests timeslots, and releases packets at their allocated times. It does not parse TCP/UDP headers.
+\item TCP is unmodified: since loss is rare, \texttt{cwnd} grows until it no longer limits throughput --- TCP congestion control is effectively switched off (modifying TCP would help short flows).
+\item The client may send several small packets to the same destination in one timeslot (if their total time fits).
+\item \key{Multicore arbiter} with three core types: \key{comm-cores} (talk to endpoints, each handles a subset), \key{alloc-cores} (pipelined timeslot allocation) and \key{pathsel-cores} (path selection, embarrassingly parallel across timeslots).
+\end{itemize}
+\paperfig[0.55]{fp_fig6_multicore}{Multicore arbiter: allocation cores assign timeslots (in batches), path-selection cores assign paths, communication cores send allocations to endpoints.}
+\textbf{Timing.} Endpoints must transmit exactly when told, else packets collide at switch egress. Clocks are synchronized to \key{sub-microsecond} accuracy with \key{IEEE 1588 PTP}, using NIC hardware timestamps; Fastpass's small, stable queues make PTP work well even without PTP-capable switches. The client uses Linux high-resolution timers and may send slightly late (up to a threshold), re-requesting overly late allocations.
+
+\section{Discussion and limitations}
+\begin{itemize}
+\item \key{Large deployments}: one arbiter handles hundreds to thousands of endpoints; beyond that, a \key{hierarchy} (cluster arbiters + a core arbiter allocating timeslots in bulk to clusters) or FPGA/ASIC arbiters.
+\item \key{Routing packets along chosen paths}: IP source routing is too slow in routers; static/VLAN policy routing may conflict with BGP; \key{tunnelling} (IP-in-IP, GRE) works in hardware; or \key{ECMP spoofing}: set header fields (e.g., source port) so the known ECMP hash sends the packet along the desired path, and restore them at the receiver.
+\item \key{NIC support}: a ``send-at'' field in packet descriptors would remove timer overhead and OS jitter.
+\item \key{Small packets}: allocation is per MTU-sized timeslot, so sending tiny amounts to many destinations wastes bandwidth (could subdivide timeslots).
+\end{itemize}
+\textbf{Results in brief:} throughput within 1.6\% of TCP while median switch queue fell from about 4.35\,MB to 18\,KB, ping RTT under load dropped about 15$\times$, per-flow throughput became far more consistent (fair), an 8-core arbiter scheduled about 2.2\,Tb/s, and a production service saw 2.5$\times$ fewer TCP retransmissions.
+
+\section{Revision checklist}
+\begin{itemize}
+\item \textbf{Idea:} centralized arbiter decides when (timeslot) and where (path) every packet goes $\Rightarrow$ zero queues.
+\item \textbf{Timeslot:} one MTU on the fastest endpoint link ($\sim$1.2\,$\mu$s at 10G).
+\item \textbf{Allocation:} greedy maximal matching per timeslot; RNB lets tiers be abstracted as one switch; policy via ordering (least recently allocated = max-min fair; fewest remaining = min-FCT); pipelined allocators; bitmap table.
+\item \textbf{Path selection:} bipartite edge-colouring of ToR graph, colours = core switches; Euler splits; hierarchical for multi-tier.
+\item \textbf{Faults:} multicast requests, watchdog failover, soft state, allocations only $\sim$65\,$\mu$s ahead; loss-based fault isolation.
+\item \textbf{FCP:} idempotent aggregate counts, aggressive timeouts, nonce-triggered resync.
+\item \textbf{Implementation:} DPDK arbiter (comm/alloc/pathsel cores); kernel qdisc client; PTP clock sync.
+\item \textbf{Limits:} arbiter scale, enforcing paths (tunnels, ECMP spoofing), timer jitter, small-packet waste.
+\end{itemize}
