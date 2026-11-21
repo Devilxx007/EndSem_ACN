@@ -1,0 +1,286 @@
+\chapter{TIMELY: RTT-based Congestion Control for the Datacenter}
+\paperinfo{R. Mittal, V. T. Lam, N. Dukkipati, E. Blem, H. Wassel, M. Ghobadi, A. Vahdat, Y. Wang, D. Wetherall, D. Zats (Google; UC Berkeley; Microsoft)}{ACM SIGCOMM 2015}
+
+\begin{keybox}[TIMELY in one paragraph]
+Conventional wisdom said delay is useless as a congestion signal in datacenters, because RTTs are only microseconds and host noise swamps them. TIMELY shows the opposite: with \key{NIC hardware timestamps} and \key{NIC-generated ACKs}, the \key{RTT} measured at the host tracks switch queueing very closely, needs \key{no switch support}, and carries \key{more information than ECN}. TIMELY is \key{rate-based}: per flow it measures one RTT per \key{completion event} (a segment of up to 64\,KB), computes the \key{RTT gradient} (is the queue growing or shrinking?), and paces segments at a target rate. Below a low threshold $T_{low}$ it increases additively; above a high threshold $T_{high}$ it decreases multiplicatively; in between it follows the gradient: \key{increase by $\delta$ if the gradient $\le 0$, decrease by $\beta \times$ gradient if positive}. It is implemented in host software over RDMA NICs and was the first delay-based datacenter congestion control.
+\end{keybox}
+
+\section{Motivation: what makes a good congestion signal?}
+\begin{itemize}
+\item Datacenter applications are tightly coupled: thousands of back-end machines may serve one user request within about \key{100\,ms}, so transports need high bandwidth (Gb/s) \emph{and} low latency (much less than 1\,ms), and \key{tail latency} matters because a few late operations slow everything.
+\item Previous designs used \key{switch support} (ECN in DCTCP), flow abstractions, or a central scheduler. TIMELY looks for something \key{simpler and immediately deployable}.
+\end{itemize}
+An ideal congestion signal is:
+\begin{enumerate}
+\item \key{fine-grained and timely}, to tell senders quickly how much congestion there is;
+\item \key{discriminative}, so it works with multiple traffic classes;
+\item \key{easy to deploy}.
+\end{enumerate}
+\key{RTT} meets all three: it comes with \emph{every} acknowledgement, it is naturally inflated for lower-priority traffic waiting behind higher-priority traffic, and it needs \key{nothing from switches}.
+
+\subsection{Why delay was avoided before}
+\begin{itemize}
+\item \key{Wide-area problems}: delay-based schemes (TCP Vegas and successors) \key{compete poorly with loss-based TCP}, and delay estimates are inaccurate (delayed ACKs, paths with different delays). So delay was used only in hybrid schemes.
+\item \key{Datacenter problem}: RTTs are about 1000$\times$ smaller than in the WAN, and host effects (interrupts, kernel scheduling, offloads such as TSO/GSO and GRO/LRO, delayed ACKs) are large enough to \key{swamp} propagation and queueing delays. DCTCP explicitly rejected delay: ``accurate measurement of such small increases in queueing delay is a daunting task''.
+\end{itemize}
+\textbf{TIMELY's insight:} modern NICs give \key{hardware timestamps} and \key{hardware ACKs}, so datacenter RTTs \emph{can} be measured precisely; and the WAN pitfalls do not apply, because a datacenter operator \key{controls all host software} (no competing loss-based stacks) and all paths have \key{similar, small propagation delays}.
+
+\section{RTT as a congestion signal}
+\subsection{Why RTT beats ECN}
+\begin{center}
+\begin{tabularx}{\linewidth}{@{}lXX@{}}
+\toprule
+\textbf{Property} & \textbf{ECN mark} & \textbf{RTT} \\
+\midrule
+What it measures & Queue at \emph{one} switch exceeded a threshold & \key{End-to-end latency} inflated by queueing, the quantity we actually care about \\
+Information & \key{1 bit} & \key{Multi-bit}: the full extent of queueing \\
+Multiple QoS queues & A threshold cannot be converted to one latency; low-priority traffic can wait long \emph{without} building a big queue of its own & Directly shows the delay low-priority traffic suffers \\
+Multiple congested switches & Cannot tell them apart & \key{Sums queueing along the whole path} \\
+NIC congestion & Ignored & \key{Included} \\
+Lossless (PFC) fabrics & Queue occupancy may not reflect congestion (paused traffic) & Still works \\
+Switch support & Needed & \key{None} \\
+\bottomrule
+\end{tabularx}
+\end{center}
+DCTCP turns a \emph{sequence} of 1-bit marks into a multi-bit estimate, but \key{64\,KB segmentation offload} breaks this: a burst at wire speed tends to be marked all-or-nothing, so the marks are not independent samples. In contrast, one accurate high RTT \key{immediately} shows the extent of congestion; with a burst on one path, the \key{last packet's RTT} reflects the maximum delay, since earlier packets push later ones back.
+
+\subsection{Evidence that RTT tracks queueing}
+\paperfig[0.45]{tm_fig2_rttqueue}{Incast of 100 flows into a 10\,Gb/s link: the CDF of RTTs measured at the hosts matches the switch queue (sampled every microsecond, shown in time units).}
+\begin{itemize}
+\item \key{Hardware vs.\ kernel timestamps} on an idle network (16\,KB ping-pong): NIC timestamps give a nearly vertical CDF (tiny variance); kernel TCP RTTs are larger and much noisier.
+\item \key{RTT vs.\ queue}: in the incast above (64\,KB messages, one RTT sample per message), host RTTs and switch queue occupancy have almost identical CDFs.
+\item \key{ECN vs.\ RTT}: with an 80\,KB marking threshold, the fraction of ECN-marked packets per round correlates only \key{weakly} with the RTT.
+\end{itemize}
+
+\subsection{Limitations of RTT, and the fixes}
+\paperfig[0.45]{tm_fig4_ackprio}{Reverse-path congestion: ACKs of one incast wait behind data of another. Putting ACKs in a higher-priority QoS queue removes the delay.}
+\begin{itemize}
+\item \key{RTT mixes both directions}: congestion on the reverse path (delaying ACKs) looks like forward congestion. Fix: \key{send ACKs at higher priority}. With prioritized ACKs, the RTTs were indistinguishable from runs with no reverse congestion. This suffices when data flows mainly one way.
+\item Future option: measure \key{one-way delay changes} by putting a send timestamp in each packet; the change in queueing is the change in (arrival time $-$ send time). This needs only clocks that \key{run at the same rate}, not synchronized clocks.
+\item \key{Paths with different delays}: less of a problem in datacenters, where all paths have small propagation delays.
+\end{itemize}
+
+\section{The TIMELY framework}
+\paperfig[0.5]{tm_fig6_overview}{Three components: RTT measurement (from timestamps), rate computation (RTT signal to allowed rate), and pacing (inserts delays between segments).}
+TIMELY does \key{rate control only}; it is independent of the transport's reliability mechanism. Three components, one independent instance \key{per flow}, in host software with NIC support:
+\begin{enumerate}
+\item \key{RTT measurement engine}: produces RTT samples.
+\item \key{Rate computation engine}: runs the congestion control algorithm on each RTT and outputs a target rate.
+\item \key{Rate control (pacing) engine}: inserts delays between segments to achieve that rate.
+\end{enumerate}
+
+\subsection{RTT measurement engine}
+\paperfig[0.48]{tm_fig7_rtt}{Completion time = serialization of the whole segment + RTT. TIMELY subtracts the serialization delay.}
+\begin{itemize}
+\item A \key{segment} (several packets, up to 64\,KB) is sent as one burst and \key{ACKed as a unit}. The ACK produces a \key{completion event} with its receive time. So there is \key{one RTT per segment}, not one per 1--2 packets as in TCP.
+\item The \key{completion time} $t_{completion} - t_{send}$ (from sending the first packet to receiving the ACK) contains four parts:
+\begin{enumerate}
+\item \key{serialization} of all packets in the segment (deterministic: size / line rate);
+\item \key{round-trip wire delay} (propagation, including store-and-forward at switches): fixed per flow, the minimum RTT;
+\item \key{turnaround} time at the receiver to produce the ACK: about zero with NIC-generated ACKs;
+\item \key{queueing} in both directions: the only \key{variable} part, and the congestion signal.
+\end{enumerate}
+\item TIMELY defines RTT as propagation + queueing:
+\[ RTT = t_{completion} - t_{send} - \frac{\text{segment size}}{\text{NIC line rate}} \]
+Subtracting serialization makes RTT \key{independent of segment size}.
+\item Scale at 10\,Gb/s: serializing 64\,KB takes \key{51\,$\mu$s}; propagation is 10--100\,$\mu$s; \key{1500\,B of queueing is only 1.2\,$\mu$s}.
+\end{itemize}
+
+\textbf{Worked example.} A 64\,KB segment on a 10\,Gb/s NIC is posted at $t_{send}=0$; its completion arrives at $t_{completion} = 131\,\mu$s; the known propagation (minimum) RTT is 20\,$\mu$s.
+\begin{center}
+\begin{tabular}{@{}lr@{}}
+\toprule
+Completion time & 131\,$\mu$s \\
+$-$ serialization (64\,KB at 10\,Gb/s) & $-51\,\mu$s \\
+= RTT used by TIMELY & \key{80\,$\mu$s} \\
+$-$ propagation (minimum RTT) & $-20\,\mu$s \\
+= queueing delay & 60\,$\mu$s $\approx$ 50 full-size packets queued \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Two NIC features are required:}
+\begin{itemize}
+\item \key{ACK timestamps}: the NIC supplies $t_{completion}$ (OS timestamps vary with scheduling and interrupts and hide the signal). $t_{send}$ is the NIC's hardware time read by software just before posting the segment.
+\item \key{Prompt ACK generation}: the NIC generates ACKs, so turnaround can be ignored. (Measuring host turnaround with timestamps would need the difference to be carried in the transport's wire format.)
+\end{itemize}
+
+\subsection{Rate computation engine}
+Input: one RTT (in $\mu$s) per completion event. Output: a new target rate for the flow. No per-packet work: normally one completion per segment of up to 64\,KB.
+
+\subsection{Rate control (pacing) engine}
+\begin{enumerate}
+\item A message is split into \key{segments} (at most 64\,KB; smaller if the flow only has small messages).
+\item A \key{single scheduler for all flows} computes each segment's send time from its size, the flow's rate, and the flow's last transmission time, and puts it in a \key{priority queue}.
+\item Segments whose send time has passed are served \key{round-robin}; future ones wait.
+\item When due, the segment goes to the NIC and is sent as a \key{burst of packets} at line rate.
+\end{enumerate}
+\textbf{Why rate-based, not window-based:} with NIC offload the bandwidth-delay product is only a few bursts (51\,$\mu$s at 10\,Gb/s is \emph{one} 64\,KB message), so a window gives no fine control. It is easier to control the \key{gap between bursts} by a target rate. As a safeguard, outstanding data is capped at a static worst-case limit.
+
+\section{TIMELY congestion control}
+\subsection{Goals}
+\begin{itemize}
+\item Primary metrics: \key{tail (99th percentile) RTT} and \key{aggregate throughput} (short RPCs finish fast with low RTT, long RPCs with high throughput).
+\item When they conflict, TIMELY \key{prefers low RTT}, giving up a little bandwidth: bandwidth is plentiful, while RTT directly delays short transfers.
+\item Secondary: fairness and loss. A \key{stable} design is preferred over a higher but oscillating rate.
+\end{itemize}
+
+\subsection{Why the gradient, not a target delay}
+\begin{itemize}
+\item Vegas, FAST and Compound TCP treat RTT above a baseline as congestion and try to hold the \key{queue at a fixed threshold}.
+\item But (Kelly et al.) you \key{cannot control a queue that is shorter, in time, than the control loop}. In a datacenter the loop for a 64\,KB message is at least 51\,$\mu$s, while one packet of queue lasts about 1\,$\mu$s. At best you can shape the \emph{distribution} of the queue.
+\item Choosing one threshold is also hard when several queues can be the bottleneck.
+\end{itemize}
+\textbf{TIMELY reacts to the delay gradient instead.} Model: total input rate $y(t)$ into a bottleneck that drains at $C$, queueing delay $q(t)$. If $y > C$ the queue grows at $y - C$ and drains at $C$, so
+\[ \frac{dq(t)}{dt} = \frac{y(t) - C}{C} = \frac{d(RTT)}{dt} \]
+\begin{itemize}
+\item Positive gradient: input exceeds capacity, the queue is \key{building}, and its value says \emph{how much} too fast we are.
+\item Negative gradient: the queue is \key{draining}.
+\item Zero: no queue, or a queue that is not changing.
+\end{itemize}
+The gradient is a \key{measure of rate mismatch}. Explicit rate-mismatch feedback (RCP, XCP, PI, QCN) is known to be more stable than feedback based on queue size; those schemes compute it \emph{at a switch queue}, while TIMELY gets it \key{end-to-end from RTTs}. It reacts to queue growth \key{before a standing queue forms}.
+
+\subsection{The algorithm}
+\begin{lstlisting}[mathescape]
+on each completion event with new_rtt:
+  new_rtt_diff = new_rtt - prev_rtt
+  prev_rtt     = new_rtt
+  rtt_diff     = (1 - $\alpha$) * rtt_diff + $\alpha$ * new_rtt_diff     # EWMA
+  normalized_gradient = rtt_diff / minRTT
+
+  if new_rtt < T_low:                     # far below congestion
+      rate = rate + $\delta$                       # additive increase
+      return
+  if new_rtt > T_high:                    # latency too high
+      rate = rate * (1 - $\beta$ * (1 - T_high / new_rtt))
+      return
+  if normalized_gradient <= 0:            # queue steady or draining
+      rate = rate + N * $\delta$     # N = 5 after 5 negative gradients in a row (HAI), else 1
+  else:                                   # queue growing
+      rate = rate * (1 - $\beta$ * normalized_gradient)
+\end{lstlisting}
+\paperfig[0.48]{tm_fig8_zone}{Three operating zones: additive increase below $T_{low}$, gradient-based increase/decrease between $T_{low}$ and $T_{high}$, multiplicative decrease above $T_{high}$.}
+
+\textbf{Step by step:}
+\begin{enumerate}
+\item \key{Gradient}: difference of two consecutive RTTs, \key{normalized by the minimum RTT} (dimensionless), then smoothed by an \key{EWMA} to follow the trend and ignore small fluctuations. The exact minimum RTT does not matter (only the sign and rough size do), so a \key{fixed constant}, the known datacenter propagation delay, is used. TIMELY does \emph{not} need to measure the minimum RTT.
+\item \key{Gradient $\le 0$}: the network keeps up, so probe for bandwidth: $R \leftarrow R + \delta$.
+\item \key{Gradient $> 0$}: too fast; decrease in proportion to the gradient: $R \leftarrow R\,(1 - \beta \cdot g)$.
+\item \key{Fairness}: the gradient comes from total input vs.\ capacity, so all flows on the path see the \emph{same} gradient. A multiplicative decrease takes more from faster flows, while every flow gets the same additive increase, so the usual \key{AIMD} argument gives fairness.
+\end{enumerate}
+
+\subsection{Why the two thresholds}
+\begin{itemize}
+\item \key{$T_{low}$ filters burst spikes.} Rates are enforced per segment (up to 64\,KB), so bursts collide occasionally and cause short RTT spikes even without congestion. Without $T_{low}$ the gradient would turn positive and the flow would back off needlessly. Below $T_{low}$, TIMELY just increases. $T_{low}$ is a (nonlinear) \key{increasing function of segment size}, because bigger segments make queues burstier; finer pacing at hosts reduces the need for it.
+\item \key{$T_{high}$ bounds tail latency.} In theory the gradient can be zero while the queue sits at a \emph{high, constant} level. $T_{high}$ caps the tolerable end-to-end queueing delay: above it the rate is cut regardless of the gradient,
+\[ R \leftarrow R\left(1 - \beta\left(1 - \frac{T_{high}}{RTT}\right)\right) \]
+The bigger the overshoot, the bigger the cut. It uses the \key{instantaneous} RTT, not an average: one large RTT reliably signals congestion, and averaging adds feedback delay, so the queue would already have grown by the time the average rose (a known failing of RED's averaged queue).
+\item \key{Hyperactive increase (HAI)}: if the gradient has been negative for \key{5 consecutive completions}, the new fair share is probably much higher (load dropped), so increase by $N\delta$ with $N=5$. Inspired by max-probing in BIC/CUBIC and QCN.
+\end{itemize}
+
+\subsection{Worked example}
+Assumed values (for illustration): rate $2$\,Gb/s, minRTT $= 20\,\mu$s, $\beta=0.8$, $\delta=10$\,Mb/s, EWMA weight $\alpha = 0.5$, $T_{low}=50\,\mu$s, $T_{high}=500\,\mu$s, previous RTT $60\,\mu$s, rtt\_diff $= 0$.
+\begin{center}
+\small
+\begin{tabular}{@{}cccccll@{}}
+\toprule
+\textbf{\#} & \textbf{new\_rtt} & \textbf{new diff} & \textbf{rtt\_diff} & \textbf{gradient} & \textbf{Rule} & \textbf{Rate (Gb/s)} \\
+\midrule
+1 & 64 & $+4$ & $+2$ & $+0.1$ & gradient $>0$: $\times(1-0.8\cdot0.1)$ & 1.84 \\
+2 & 62 & $-2$ & $0$ & $0$ & gradient $\le 0$: $+\delta$ & 1.85 \\
+3 & 58 & $-4$ & $-2$ & $-0.1$ & gradient $\le 0$: $+\delta$ & 1.86 \\
+4 & 45 & $-13$ & $-7.5$ & --- & RTT $< T_{low}$: $+\delta$ & 1.87 \\
+5 & 600 & $+555$ & $+273.75$ & --- & RTT $> T_{high}$: $\times(1-0.8(1-\tfrac{500}{600}))$ & 1.62 \\
+\bottomrule
+\end{tabular}
+\end{center}
+Note that rtt\_diff is updated on \emph{every} event, even when a threshold rule decides the rate, so the gradient stays current.
+
+\subsection{Gradient vs.\ queue-size (target delay) control}
+If $T_{low} = T_{high} = T_{target}$, TIMELY becomes a \key{queue-size scheme} like FAST (a scaled, improved Vegas): additive increase below the target, multiplicative decrease scaled by how far the RTT is above it.
+\paperfig[0.48]{tm_fig9_target}{Incast: a 50\,$\mu$s target gives low RTT but loses throughput; a 500\,$\mu$s target gives full throughput but high RTT; the gradient approach (thresholds 50/500\,$\mu$s) gets full throughput with RTT close to the low target.}
+\paperfig[0.48]{tm_fig10_rates}{Per-connection rates: smooth around the 500\,Mb/s fair share with the gradient approach (top), oscillating with the queue-size approach (bottom).}
+\begin{center}
+\begin{tabularx}{\linewidth}{@{}lXX@{}}
+\toprule
+ & \textbf{Queue-size (target) approach} & \textbf{Gradient approach} \\
+\midrule
+Low target (50\,$\mu$s) & Low latency, but throughput suffers (queue sometimes empty) & \key{High throughput and low tail latency}: reacts to the \emph{rising and falling} queue, i.e.\ predicts congestion onset \\
+High target (500\,$\mu$s) & Full throughput, but a standing queue raises latency & (same: one setting, $T_{low}$/$T_{high}$ = 50/500\,$\mu$s, gets both) \\
+Rates & Oscillate as RTT is driven up and down around the target & \key{Smooth} around the fair share \\
+\bottomrule
+\end{tabularx}
+\end{center}
+\textbf{Take-away:} $T_{low}$ and $T_{high}$ keep the delay in a target \emph{range} (like the target occupancy of an AQM), and the gradient adds \key{stability} within that range.
+
+\section{Implementation}
+TIMELY runs on \key{10\,Gb/s NICs with OS bypass}, which support multi-packet segments with \key{hardware ACKs and timestamps}. It is built for \key{RDMA}: RDMA Write and Read take a message from local memory and send it as a burst; the remote NIC acknowledges the complete message and places it directly in remote memory; the local host is notified on completion.
+
+\begin{itemize}
+\item \key{Transport interface}: TIMELY handles only congestion control, not reliability or the application interface. The interface is just \key{message send and receive}; a message is split into segments, each passed to the NIC and ACKed as a whole. This fits anything from RPCs to byte streams like TCP.
+\item \key{RTT from NIC completions (clock calibration)}: the NIC records only the \emph{completion} timestamp, so software records a \key{host CPU timestamp when posting} work, and a \key{linear mapping} converts NIC clock to host clock. This is as accurate as pure NIC timestamps, because being interrupted between taking the timestamp and handing work to the NIC is rare. (Pure software timestamps have large variance that grows with host load; TIMELY does not spin, so interrupts and wakeups would be included.)
+\item \key{NIC queueing counts as congestion}: it is deliberately included in the RTT and handled by the same rate control.
+\item \key{RDMA Reads}: the \emph{receiver} issues read requests and the remote side DMAs the data, so TIMELY cannot pace the data directly. It \key{paces the read requests} instead, counting the bytes each request will fetch.
+\item \key{Application-limited flows}: if an application does not have enough data, the network looks uncongested and the target rate could grow without bound. So the target rate may increase \key{only if the application sends at more than 80\% of it}, and it is \key{capped at 10\,Gb/s}. The 20\% headroom lets the application speed up without waiting when it does have data.
+\item \key{Rate update frequency}: the update rule assumes at most one completion per RTT. A 64\,KB segment takes 51\,$\mu$s to send, more than a minimum RTT of 20\,$\mu$s, so that holds; but small segments give \emph{several} completions per minimum RTT. TIMELY still updates on every completion (newest information), but \key{scales each update by the number of completions per minimum RTT} so new information is not over-weighted.
+\item \key{Lazy rate enforcement}: when a segment's send time arrives, the scheduler checks the current rate; if it has \emph{decreased}, it recomputes the send time and re-queues the segment; otherwise the segment goes to the NIC.
+\item \key{Hybrid pacing}: by default the NIC sends a segment as a line-rate burst. Hardware rate limiters can send the burst \emph{below} line rate, but cannot be reconfigured every few RTTs. So TIMELY uses \key{software pacing between segments} plus \key{fixed hardware pacing within a segment} (e.g.\ 5\,Gb/s on a 10\,Gb/s link) to insert gaps so bursts mix at switches without latency spikes. The rate engine treats this as a lower line rate. NIC pacing is \key{optional}: it trades lower tail latency against the CPU cost of software pacing with small segments.
+\end{itemize}
+
+\section{Parameters and what sets them}
+Defaults: segment \key{16\,KB}, $T_{low}$ \key{50\,$\mu$s}, $T_{high}$ \key{500\,$\mu$s}, $\delta$ \key{10\,Mb/s}, $\beta$ \key{0.8}, HAI after \key{5} negative gradients.
+\begin{center}
+\begin{tabularx}{\linewidth}{@{}lX@{}}
+\toprule
+\textbf{Knob} & \textbf{How it should be set, and why} \\
+\midrule
+RTT accuracy & Added noise of 50\,$\mu$s on average already cuts throughput visibly, and software timestamps easily have that much noise. \key{Accurate NIC timestamps are the cornerstone} of TIMELY. \\
+$T_{low}$ & Grows with segment size (burstiness): about 50\,$\mu$s for 16\,KB, 100\,$\mu$s for 32\,KB, 200--300\,$\mu$s for 64\,KB (a 64\,KB segment is at least 40 back-to-back packets). Too low a value cuts throughput; lower values reduce delay. \\
+NIC pacing & Reduces burstiness so lower $T_{low}$ works: for 64\,KB segments, pacing at 700\,Mb/s raised throughput from about 11 to about 19\,Gb/s, but then caps a single flow at 700\,Mb/s unless the pacing rate is adjusted dynamically. \\
+$T_{high}$ & Matters only for large RTTs, more so with many connections. Values down to about \key{200\,$\mu$s} cut tail latency without hurting throughput; 50\,$\mu$s is too low. \\
+HAI & Lets a flow claim a sudden 10$\times$ larger fair share quickly; 5 successive RTTs balances convergence and stability. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\section{How TIMELY relates to other schemes}
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}lXXX@{}}
+\toprule
+ & \textbf{DCTCP} & \textbf{DCQCN} & \textbf{TIMELY} \\
+\midrule
+Signal & ECN marks (1 bit per packet, single switch) & ECN marks $\to$ CNPs & \key{RTT gradient} (multi-bit, whole path, includes NIC) \\
+Switch support & ECN marking & RED/ECN marking & \key{None} \\
+Where & Host kernel & NIC & \key{Host software} + NIC timestamps/ACKs \\
+Control & Window & Rate & \key{Rate} (pacing segments) \\
+Network & Lossy & Lossless (PFC) & Works on PFC fabrics (keeps PFC pauses rare) and is applicable to OS-based transports too \\
+\bottomrule
+\end{tabularx}
+\end{center}
+\begin{itemize}
+\item \key{Vegas, FAST, Compound}: window-based, keep the queue near a target above the minimum RTT. TIMELY is \key{rate-based}, uses the \key{gradient}, and does \key{not rely on measuring the minimum RTT}.
+\item \key{DX}: also delay-based for datacenters (DPDK timestamps, Linux TCP), but a conventional window AIMD with decrease proportional to average queueing delay.
+\item \key{CDG} (CAIA Delay Gradient): a delay-gradient TCP for the \emph{WAN}, focused on coexisting with loss-based TCP.
+\item Load-aware routing (CONGA, FlowBender) spreads load, but \key{host congestion control is still needed} to match offered load to capacity.
+\end{itemize}
+
+\begin{keybox}[Exam one-liner]
+TIMELY uses precise RTTs, measured per segment completion with NIC hardware timestamps and NIC-generated ACKs (RTT $=$ completion $-$ send $-$ serialization), as a no-switch-support congestion signal; per flow it paces segments at a rate updated by the normalized, EWMA-smoothed RTT gradient (increase $\delta$ if $\le 0$, decrease $\beta\cdot$gradient if $> 0$), with $T_{low}$ to ignore burst spikes, $T_{high}$ to cap tail latency, and HAI for fast ramp-up, giving high throughput with low tail latency.
+\end{keybox}
+
+\section{Revision checklist}
+\begin{itemize}
+\item \textbf{Ideal signal:} fine-grained/timely, discriminative, deployable; RTT has all three and needs no switch help.
+\item \textbf{Why now:} NIC hardware timestamps + NIC ACKs; datacenter controls host software; similar path delays.
+\item \textbf{RTT vs ECN:} multi-bit, end-to-end, multi-switch, includes NIC, handles QoS queues and PFC; TSO bursts make ECN marks correlated.
+\item \textbf{Limitations:} reverse-path congestion $\to$ prioritize ACKs; one-way delay needs only same-rate clocks.
+\item \textbf{Framework:} RTT measurement $\to$ rate computation $\to$ pacing; one instance per flow.
+\item \textbf{RTT:} $t_{completion}-t_{send}-$size/line rate; one RTT per segment ($\le$64\,KB); 64\,KB = 51\,$\mu$s at 10\,G; 1500\,B queue = 1.2\,$\mu$s.
+\item \textbf{Why rate-based:} BDP is about one 64\,KB burst; control gaps between bursts; static cap on outstanding data.
+\item \textbf{Gradient:} $dq/dt=(y-C)/C$ = rate mismatch; normalized by a fixed minRTT, EWMA-smoothed; can't control a queue shorter than the control loop (Kelly).
+\item \textbf{Algorithm:} RTT $<T_{low}$: $+\delta$; RTT $>T_{high}$: $\times(1-\beta(1-T_{high}/RTT))$ on instantaneous RTT; gradient $\le0$: $+N\delta$ (HAI $N=5$ after 5 negatives); gradient $>0$: $\times(1-\beta g)$; AIMD gives fairness.
+\item \textbf{Gradient vs target:} $T_{low}=T_{high}$ gives FAST-like control: one target can't get both low latency and high throughput, and rates oscillate.
+\item \textbf{Implementation:} RDMA Write/Read; host-to-NIC clock calibration; NIC queueing counted; pace Read requests; increase only if app $>$80\% of target, cap 10\,G; scale updates by completions per minRTT; lazy enforcement; hybrid software + fixed NIC pacing.
+\item \textbf{Defaults:} 16\,KB segments, $T_{low}$ 50\,$\mu$s, $T_{high}$ 500\,$\mu$s, $\delta$ 10\,Mb/s, $\beta$ 0.8.
+\end{itemize}
