@@ -160,6 +160,7 @@ Each expiry runs one increase step; which step depends on $T$ and $BC$ compared 
 \subsection{Worked example: one cut and the recovery}
 Flow at $R_C = 20$\,Gb/s with $\alpha = 0.5$ and $g = 1/256$. A CNP arrives, then no more CNPs.
 \begin{center}
+\small
 \begin{tabular}{@{}llccc@{}}
 \toprule
 \textbf{Event} & \textbf{Rule} & $R_T$ & $R_C$ (Gb/s) & $\alpha$ \\
@@ -251,7 +252,7 @@ Test: two flows, one starting at 40\,Gb/s and one at 0; do they converge to 20/2
 \end{enumerate}
 
 \begin{center}
-\begin{tabular}{@{}lll@{}}
+\begin{tabularx}{\linewidth}{@{}llX@{}}
 \toprule
 \textbf{Parameter} & \textbf{Deployed value} & \textbf{Why} \\
 \midrule
@@ -264,7 +265,7 @@ $g$ & \key{1/256} & Low, stable queue \\
 $\alpha$ update interval $\tau'$ & 55\,$\mu$s & Must exceed the CNP interval; insensitive (110\,$\mu$s barely matters) \\
 $F$, $R_{AI}$ & 5, 40\,Mb/s & Trade convergence speed against oscillation; no buffer starvation at 16:1 incast (halving $R_{AI}$ handles 32:1 but converges slower) \\
 \bottomrule
-\end{tabular}
+\end{tabularx}
 \end{center}
 \textbf{Note:} the timer and $\tau'$ are set 5\,$\mu$s above the CNP interval so that a flow does not increase its rate in the gap between two CNPs it is still receiving. If the feedback delay differs a lot (e.g.\ larger RTTs), the values must change.
 

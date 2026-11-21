@@ -1,0 +1,222 @@
+\chapter{Salsify: Low-Latency Network Video by Integrating the Codec and the Transport}
+\paperinfo{S. Fouladi, J. Emmons, E. Orbay, C. Wu, R. S. Wahby, K. Winstein (Stanford University; Saratoga High School)}{USENIX NSDI 2018}
+
+\begin{keybox}[Salsify in one paragraph]
+Real-time video (video calls, cloud gaming, teleoperation) is normally built from two separate boxes: a \key{transport} that estimates the network's \emph{average} rate, and a \key{video codec} that runs its own loop, choosing a \key{frame rate and bit rate} to match that average about once a second. When a frame overshoots the network's capacity it is sent anyway, causing \key{packet loss or queueing delay}. \key{Salsify} merges the two control loops into one: \key{before every frame}, the transport says how many bytes the network can take right now (\key{max frame size}); a \key{purely functional VP8 codec}, whose state can be saved and restored, encodes the frame at \key{two quality levels} from the same state; Salsify sends whichever fits (preferring the better one), or \key{skips the frame} if neither fits. Its transport is \key{video-aware}: a \key{grace period} lets the receiver's packet-rate estimate ignore the sender's pauses between frames. The same functional codec gives \key{loss recovery} by encoding new frames from a state the receiver has \key{acknowledged}.
+\end{keybox}
+
+\section{The problem with today's design}
+\begin{itemize}
+\item Applications: videoconferencing, cloud gaming, remote control of robots and vehicles: video must be \key{encoded and sent with low delay}.
+\item Systems such as Skype, FaceTime, Hangouts and \key{WebRTC} combine:
+\begin{itemize}
+\item a \key{transport protocol}: sends compressed video, processes ACKs and congestion signals, and estimates the \key{average data rate};
+\item a \key{video codec}: a separate module with its \key{own control loop}, choosing a frame rate and quality so that its \key{average bit rate} matches that estimate.
+\end{itemize}
+\item In WebRTC the encoder reads camera frames at a fixed frame rate aiming at a target bit rate, and the transport updates these on a \key{roughly one-second timescale}.
+\item \key{Reactive}: if the codec produces a frame larger than the network can take right now, the transport \key{sends it anyway} (causing loss or bloated buffers), and only afterwards tells the codec to pause until congestion clears.
+\item \key{Root difficulty}: no encoder can compress a single frame to a pre-specified size. It learns the size only after compressing. So existing systems track capacity only \key{on average}.
+\end{itemize}
+
+\subsection{Target regime}
+Salsify targets today's \key{Internet access networks} (especially cellular), where:
+\begin{itemize}
+\item loss and queueing delay are \key{caused by the application's own traffic} (it overflows a bottleneck buffer);
+\item the bottleneck rate can \key{drop quickly};
+\item losses are bursty, so \key{forward error correction} works poorly.
+\end{itemize}
+This differs from classic \key{joint source-channel coding}, which assumes a fixed or slowly varying rate and random, independent losses, and adds FEC to survive them. Salsify's aim is to \key{not provoke} loss and delay in the first place. It is not a cross-layer scheme either: it sends ordinary \key{UDP datagrams}.
+
+\textbf{None of the pieces is new:} the VP8 format (2008), a functional VP8 codec (from ExCamera), loss recovery related to \key{Mosh}, and rate control based on \key{Sprout}(-EWMA). The contribution is the \key{architecture} that integrates them.
+
+\section{Architecture: one control loop}
+\begin{center}
+\begin{tabularx}{\linewidth}{@{}lXX@{}}
+\toprule
+ & \textbf{Conventional (WebRTC, Skype, \ldots)} & \textbf{Salsify} \\
+\midrule
+Control loops & Two: transport (rate estimate) and codec (frame rate + bit rate) & \key{One}, fused \\
+Codec target & Average bit rate over time & \key{Size of each individual frame} \\
+Update timescale & About 1\,s & \key{Every frame} \\
+Frame size control & Predict encoder settings up front & \key{Encode twice, pick after the fact} \\
+Frame rate & Fixed; can only pause \emph{input} to the encoder & \key{Variable}: can skip a frame \emph{after} encoding it \\
+Overshoot & Sent anyway, then react & Not sent \\
+Loss recovery & Retransmit, or re-encode slices & Encode from a state the receiver has \key{acknowledged} \\
+\bottomrule
+\end{tabularx}
+\end{center}
+\textbf{Per-frame loop:}
+\begin{enumerate}
+\item The transport estimates how many bytes the network can accept now without loss or excess queueing: \key{max\_frame\_size}.
+\item The codec encodes the new camera image \key{twice} from the \key{same source state}: one quality step \key{above} and one \key{below} the quality of the last sent frame.
+\item Salsify sends the \key{higher-quality} version if it fits, else the \key{lower} one if it fits, else \key{nothing} (skip).
+\item The codec state produced by the chosen frame becomes the source state for both encodings of the next frame.
+\end{enumerate}
+Two versions: \key{Salsify-1c} encodes the two versions one after the other on one core; \key{Salsify-2c} encodes them in parallel on two cores.
+
+\section{The purely functional video codec}
+\subsection{What the codec state is}
+\begin{itemize}
+\item About 11,000 lines of C++, encoding/decoding standard \key{VP8}.
+\item Codec \key{state} = copies of previously decoded frames (\key{reference images}) + \key{probability tables} for entropy coding. At 1280$\times$720 the decoder state is about \key{4\,MiB}.
+\item The encoder compresses a new image by exploiting its similarity to the reference images in the state.
+\item The decoder is an \key{automaton}: start in a source state, consume a compressed frame, output an image, move to a target state.
+\end{itemize}
+\textbf{Normal codecs} hide this state inside: they take a stream of images, produce a bitstream, and \key{cannot undo} an encode. \textbf{Salsify's codec} uses \key{explicit state passing}: encoder and decoder are \key{pure functions} with no side effects:
+\begin{lstlisting}
+decode(state, frame)           -> (state', image)
+encode(state, image, quality)  -> frame
+\end{lstlisting}
+This lets the application (1) \key{try several qualities} for the same frame from the same state and keep one, and (2) \key{choose which state} to encode from, for loss recovery.
+
+\subsection{Encoding to match the network}
+\begin{itemize}
+\item Two encoders, initialised with the \key{same state} and \key{different quality settings}, produce two candidate frames.
+\item The decision of which to send is delayed \key{as late as possible}, until the exact compressed sizes are known.
+\item Because state is explicit, the encoder is then \key{resynchronised} to the state produced by the chosen frame.
+\item The two qualities for the next frame \key{bracket} the last successful one (one higher, one lower), so quality tracks capacity.
+\item \key{Third option: skip.} If both are too big, send neither; the next frame is encoded from the \key{same state} as before. So the frame rate adapts to the network. Conventional encoders cannot do this: once a frame is encoded, the encoder's state has moved on, and dropping that frame would corrupt the decoder. They can only stop feeding images in.
+\end{itemize}
+
+\subsection{Loss recovery by choosing the source state}
+\begin{enumerate}
+\item \key{Normally}, each frame is encoded from the target state of the previous frame, \emph{even if not yet acknowledged}: the sender assumes packets in flight will arrive.
+\item If packets are lost, the receiver ends up in a different state than the sender assumes, and decoding would be corrupted.
+\item When the sender learns of a loss (from ACKs), it enters \key{loss recovery mode} (for 5\,s) and encodes new frames from \key{known\_receiver\_codec\_state}, a state the receiver has \key{explicitly acknowledged}. Such frames decode correctly even if packets in between are lost (``prophylactic retransmission'': no old data is resent).
+\item Both sides must \key{keep old states} until safe to delete: when the receiver gets a frame based on state $S$, it discards all states older than $S$; when the sender gets an ACK for state $S$, it discards all older ones.
+\end{enumerate}
+\textbf{Reordering:} if a fragment of a \emph{new} frame arrives before the current frame is complete, the receiver decodes the incomplete frame (its decoder becomes invalid) and moves on; the sender sees this as loss and recovers as above. Reordering \emph{among the fragments of one frame} is harmless: the receiver waits for all fragments before decoding.
+
+\textbf{Why this recovers fast:} after a network outage, WebRTC retransmits the lost packets, causing a delay spike before new video flows. Salsify immediately encodes new frames against reference images the receiver already has.
+
+\section{The video-aware transport protocol}
+\subsection{Packets and acknowledgements}
+\begin{itemize}
+\item About 2,000 lines of C++. Frames go over \key{UDP}, split into \key{MTU-sized fragments}.
+\item Each frame's header: \key{frame number}, \key{fragment index}, \key{hash of the source state}, \key{hash of the target state}. A frame is therefore an \key{idempotent operator}: it turns the named source state into the named target state (and outputs a picture). The receiver keeps target states in memory for possible loss recovery.
+\item The receiver \key{ACKs every fragment} with the frame number, fragment index, its \key{current decoder state hash}, and its estimate of the \key{mean inter-arrival time}.
+\end{itemize}
+
+\subsection{Capacity estimation with a grace period}
+\paperfig[0.55]{sf_fig2_grace}{The receiver averages packet inter-arrival times $t_i$. The sender pauses between frames, so it stamps each fragment with a ``grace period'' (its own gap since the previous fragment) that the receiver subtracts.}
+\begin{itemize}
+\item As in \key{Sprout-EWMA} and WebRTC, the receiver treats arriving packets as a \key{packet train}: the average gap between arrivals reveals the bottleneck rate.
+\item Problem: a video sender is \key{not ``full throttle''}; it pauses between frames. The gap between the last fragment of frame $i$ and the first of frame $i+1$ reflects that pause, not the network, so the estimate would be \key{too pessimistic}.
+\item Fix: each fragment carries a \key{grace period}: how long the sender waited between sending this fragment and the previous one. The receiver subtracts it:
+\[ \tau_i \leftarrow \alpha\,\big(T_i - T_{i-1} - \text{grace}_i\big) + (1-\alpha)\,\tau_{i-1}, \qquad \alpha = 0.1 \]
+where $T_i$ is the arrival time of fragment $i$. $\alpha = 0.1$ is roughly a moving average over the last 10 arrivals.
+\end{itemize}
+\textbf{Worked example:} fragments arrive 1\,ms apart within a frame ($\tau = 1$\,ms). Between frames, the sender paused 29\,ms and the next fragment arrived 30\,ms after the previous one.
+\begin{center}
+\begin{tabularx}{\linewidth}{@{}llX@{}}
+\toprule
+ & \textbf{Sample used} & \textbf{New $\tau$} \\
+\midrule
+Without grace period & 30\,ms & $0.1(30) + 0.9(1) = 3.9$\,ms (capacity looks about 4$\times$ smaller) \\
+With grace period & $30 - 29 = 1$\,ms & $0.1(1) + 0.9(1) = 1$\,ms (correct) \\
+\bottomrule
+\end{tabularx}
+\end{center}
+Removing the grace period made Salsify underestimate capacity and send low-quality, low-bitrate video.
+
+\subsection{Sender: how big may the next frame be?}
+\begin{itemize}
+\item $N_i$ = upper bound on packets \key{already in flight} = index of last sent packet $-$ index of last acknowledged packet.
+\item To keep end-to-end delay under $d$ (\key{100\,ms}, for interactivity), at most $d/\tau_i$ packets may be in flight.
+\item So the frame may use the rest:
+\[ \text{max\_frame\_size} = \left(\frac{d}{\tau_i} - N_i\right) \times \text{MTU} \]
+\end{itemize}
+
+\begin{lstlisting}[mathescape]
+on receiving ACK:
+  update mean_interarrival_time, known_receiver_codec_state,
+         num_packets_outstanding from the ACK
+  if ACK indicates loss: enter loss-recovery mode for the next 5 seconds
+  max_frame_size = MTU * (100 ms / mean_interarrival_time
+                          - num_packets_outstanding)
+
+send next frame:
+  image  = next image from camera
+  source = loss_recovery_mode ? known_receiver_codec_state
+                              : last_sent_frame.target_state
+  lower  = encode(source, image, last_sent_frame.quality - DECR)
+  higher = encode(source, image, last_sent_frame.quality + INCR)
+  if higher.length < max_frame_size:          send higher
+  elif lower.length < max_frame_size
+       or consecutive_skips >= 4:             send lower
+  else:                                       skip; consecutive_skips++
+  (on send: consecutive_skips = 0; last_sent_frame = sent frame)
+\end{lstlisting}
+\textbf{Why ``send lower after 4 skips'':} if Salsify kept skipping, nothing would be sent and \key{no new feedback} (ACKs, rate estimates) would arrive, so it could never learn that capacity has returned.
+
+\textbf{Worked example:} $\tau = 1$\,ms (about 12\,Mb/s with 1500-byte packets), $N = 40$ packets in flight, MTU 1500\,B.
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+\toprule
+Packets allowed in flight & $100\text{ ms} / 1\text{ ms} = 100$ \\
+Room for this frame & $100 - 40 = 60$ fragments $= 90$\,KB \\
+Higher-quality version & 110\,KB: too big \\
+Lower-quality version & 70\,KB: fits $\Rightarrow$ \key{send lower} \\
+Next frame & qualities bracket the lower version's setting \\
+\bottomrule
+\end{tabular}
+\end{center}
+If capacity collapsed so that both versions exceeded 90\,KB, the frame would be skipped, and the next camera frame would be encoded from the same state.
+
+\section{Why both pieces are needed}
+Removing components one at a time:
+\begin{itemize}
+\item \key{No grace period}: the capacity estimate is too low; video quality and bitrate fall.
+\item \key{Conventional codec} (state hidden; settings predicted up front by a binary search on a downscaled frame to hit the target size): much worse, because (1) the transport \key{no longer has a choice} of frames at sending time, so if the capacity estimate changes while the frame is being compressed, Salsify either adds delay or misses a chance to send better quality; and (2) it is hard for any codec to \key{hit a target size} up front, so it under- or overshoots.
+\item Removing both gives a system that behaves like conventional videoconferencing.
+\end{itemize}
+
+\section{Measuring real-time video (the testbed, in brief)}
+\begin{itemize}
+\item Treats sender and receiver as \key{black boxes}: the testbed appears to the sender as a \key{USB webcam} playing a repeatable 720p60 clip, and captures the receiver's \key{HDMI} output; a network emulator (Cellsim, replaying cellular traces) sits between them, synchronised to the video.
+\item Each frame carries two \key{barcodes} (64-bit random numbers) so captured frames can be matched to sent frames. All timestamps come from one hardware clock.
+\item \key{Quality} = SSIM vs.\ the source frame. \key{Delay} = display time $-$ capture time; frames never sent or never shown are charged the arrival time of the \emph{next} frame shown, so the metric \key{penalises low frame rates} as well as late frames.
+\end{itemize}
+
+\section{Limitations}
+\begin{itemize}
+\item \key{No audio}; adding it raises open questions (audio is usually delayed in a jitter buffer; should video wait to stay in sync?).
+\item \key{Most codecs cannot save/restore state}, including the \key{hardware codecs} needed on power-limited devices. Salsify hopes implementers will expose state.
+\item Better conventional codecs that can hit a target frame size would \key{shrink the benefit} of the functional codec.
+\item Gains are largest on \key{highly variable paths} (cellular while moving); on steadier networks Salsify is close to existing systems.
+\item No end-to-end scheme can keep video delay low if the bottleneck queue is shared with \key{bufferbloating cross traffic}.
+\end{itemize}
+
+\section{Salsify vs.\ Pensieve: two kinds of video}
+\begin{center}
+\begin{tabularx}{\linewidth}{@{}lXX@{}}
+\toprule
+ & \textbf{Pensieve (on-demand streaming)} & \textbf{Salsify (real-time video)} \\
+\midrule
+Video & Pre-encoded chunks at fixed bitrates & Encoded live, frame by frame \\
+Decision unit & Bitrate of the next \key{chunk} (seconds) & Size and quality of the next \key{frame} (tens of ms) \\
+Delay budget & Seconds of playback buffer & About \key{100\,ms} end to end \\
+Transport & HTTP/TCP from a CDN & Own UDP protocol, integrated with the codec \\
+Adapts by & Learned policy (deep RL) over observations & Measuring capacity per frame and encoding to fit \\
+Main risk avoided & Rebuffering & Loss and queueing delay caused by its own frames \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{keybox}[Exam one-liner]
+Salsify fuses the codec's and transport's rate control into one per-frame loop: a video-aware transport (receiver inter-arrival EWMA with the sender's grace period subtracted) sets max\_frame\_size $=(100\,\text{ms}/\tau - N)\times$MTU, a purely functional VP8 codec encodes each frame at two qualities from the same saved state and the largest one that fits is sent (or the frame is skipped, sending the low one after 4 skips), and losses are recovered by encoding from a receiver-acknowledged state; the result is lower delay and higher quality without provoking loss or queueing.
+\end{keybox}
+
+\section{Revision checklist}
+\begin{itemize}
+\item \textbf{Problem:} separate transport and codec loops; codec matches an \emph{average} rate on a 1\,s timescale; overshooting frames are sent anyway; encoders cannot hit an exact frame size.
+\item \textbf{Regime:} access/cellular links where your own traffic causes loss and delay; FEC is weak against bursty loss.
+\item \textbf{Functional codec:} VP8; state = reference images + probability tables (about 4\,MiB at 720p); \texttt{decode(state, frame)}$\to$(state$'$, image), \texttt{encode(state, image, quality)}$\to$frame.
+\item \textbf{Per frame:} encode at last quality $\pm$ step from the same state; send higher if it fits, else lower, else skip; after 4 skips send lower; next qualities bracket the last.
+\item \textbf{Loss recovery:} encode from known\_receiver\_codec\_state for 5\,s after loss; keep states until ACKed/superseded; reordered new frame $\Rightarrow$ treated as loss.
+\item \textbf{Transport:} UDP, MTU fragments; header has frame no., fragment index, source/target state hashes (idempotent); per-fragment ACK with decoder hash and inter-arrival estimate.
+\item \textbf{Estimate:} $\tau_i = \alpha(T_i - T_{i-1} - \text{grace}_i) + (1-\alpha)\tau_{i-1}$, $\alpha = 0.1$.
+\item \textbf{Frame budget:} $(d/\tau - N)\times$MTU with $d = 100$\,ms, $N$ = last sent $-$ last ACKed.
+\item \textbf{Ablation:} no grace period $\Rightarrow$ underestimate; conventional codec $\Rightarrow$ no choice at send time and poor size prediction.
+\item \textbf{Limits:} no audio; codecs (esp.\ hardware) lack save/restore; gains largest on variable paths; shared bufferbloated queues.
+\end{itemize}
