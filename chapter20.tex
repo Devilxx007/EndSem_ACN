@@ -1,245 +1,278 @@
 \chapter{Pensieve: Neural Adaptive Video Streaming}
 \paperinfo{H. Mao, R. Netravali, M. Alizadeh (MIT CSAIL)}{ACM SIGCOMM 2017}
 
-\begin{keybox}[Pensieve in one paragraph]
-A video player must pick a \key{bitrate for every chunk} of video (an \key{ABR}, adaptive bitrate, algorithm). Existing ABR algorithms use \key{fixed rules} built on simplified models (``predict throughput'', ``keep the buffer at a level'', or MPC's optimisation over a short horizon with a throughput forecast), so they cannot be best for every network and every QoE goal. \key{Pensieve} instead \key{learns} the ABR policy with \key{deep reinforcement learning}: a \key{neural network} maps raw observations (past chunk throughputs and download times, next chunk sizes, buffer level, chunks left, last bitrate) to a probability for each bitrate, and is trained with \key{A3C} (actor-critic) so that the cumulative \key{QoE reward} is maximised. Training runs in a fast \key{chunk-level simulator} over many network traces (100 hours of video in 10 minutes); \key{masking} lets one model serve videos with different bitrate ladders; at run time the model sits on an \key{ABR server} that clients query for each chunk.
+\begin{keybox}[The paper in three sentences]
+A video player must choose a quality (bitrate) for every few-second chunk of video, trading picture quality against the risk of the video
+freezing. Every existing adaptive-bitrate (ABR) algorithm is a hand-designed rule built on a simplified model, and each one fails in some
+network or for some viewer preference. Pensieve instead \key{learns} the rule: a neural network looks at what the player has observed and
+outputs a bitrate. It is trained with reinforcement learning (A3C) in a fast simulator over thousands of network traces, so that it
+maximises the viewer's quality of experience over the whole video.
 \end{keybox}
 
-\section{Background: HTTP adaptive streaming (DASH)}
-\paperfig[0.6]{ps_fig1_dash}{HTTP adaptive streaming: the player gets a manifest, then requests chunks from a CDN one by one; the ABR controller chooses each chunk's quality from throughput estimates and buffer occupancy.}
-\begin{itemize}
-\item Video is delivered over \key{HTTP} (standardised as \key{DASH}): providers reuse existing \key{CDNs}, keep \key{stateless} back-ends, and work with browsers and apps.
-\item A video is split into \key{chunks} of a few seconds. Each chunk is encoded at several \key{discrete bitrates}; higher bitrate means higher quality and a larger chunk. Chunks are \key{aligned across bitrates}, so the player can switch quality at any chunk boundary without redundant bits or skipped video.
-\item Session flow: the player sends an \key{authentication token} to the provider; gets back a \key{manifest} listing the CDN and the available bitrates; then requests chunks one by one, choosing each chunk's bitrate with the ABR algorithm.
-\item A chunk can only be \key{played after it is completely downloaded}. Downloaded video waits in the \key{playback buffer}; if the buffer empties, playback stalls (\key{rebuffering}).
-\end{itemize}
+% ------------------------------------------------------------------
+\section{How a video player streams, and what the ABR decides}
 
-\subsection{Why ABR is hard}
+\paperfig[0.6]{ps_fig1_dash}{HTTP adaptive streaming. The player gets a manifest, then fetches chunks one at a time from a CDN. Before each
+fetch, the ABR controller chooses that chunk's bitrate from throughput estimates and the buffer level.}
+
+Almost all online video is delivered over plain HTTP (the DASH standard). The video is cut into \textbf{chunks} of a few seconds, and every
+chunk is encoded at several \textbf{bitrates}, for example 0.3, 0.75, 1.2, 1.85, 2.85 and 4.3\,Mb/s. Higher bitrate means better picture and a
+bigger file. The chunks line up across bitrates, so the player can switch quality at any chunk boundary.
+
+The playback loop is:
 \begin{enumerate}
-\item \key{Variable networks}: throughput fluctuates and differs across environments. On cellular links throughput prediction is often wrong, so stable signals such as \key{buffer occupancy} should get more weight there.
-\item \key{Conflicting QoE goals}: high bitrate, little rebuffering, and smoothness (few quality switches) pull against each other, and users weigh them differently.
-\item \key{Cascading effects}: a high bitrate now can drain the buffer and force low bitrates (or stalls) later; with a smoothness goal, today's choice also biases tomorrow's.
-\item \key{Coarse decisions}: only a few bitrates exist. If throughput is just below one level but well above the next, the algorithm must gamble between quality and rebuffering risk.
+  \item The player downloads a \textbf{manifest} listing the CDN location and the available bitrates.
+  \item Before each chunk, the \textbf{ABR algorithm} chooses its bitrate.
+  \item The player downloads the chunk over HTTP/TCP. A chunk can only be played once it has fully arrived.
+  \item Downloaded video waits in the \textbf{playback buffer}. While the next chunk downloads, the buffer drains at one second of video per
+        second. If it empties before the download finishes, the video freezes: \textbf{rebuffering}.
 \end{enumerate}
+So each decision is a gamble. Choose high and you may not finish downloading before the buffer runs out. Choose low and the picture is worse than
+it needed to be.
 
-\subsection{Existing ABR algorithms}
-\begin{center}
-\begin{tabularx}{\linewidth}{@{}lXX@{}}
-\toprule
-\textbf{Family} & \textbf{Rule} & \textbf{Weakness} \\
-\midrule
-\key{Rate-based} (e.g.\ FESTIVE) & Predict throughput (e.g.\ \key{harmonic mean of the last 5 chunks}); pick the highest bitrate below it & Throughput estimates over HTTP are biased and noisy; best at start-up and on stable links \\
-\key{Buffer-based} (BBA, BOLA) & Choose bitrate from buffer level only, e.g.\ BBA: \key{reservoir 5\,s}, cushion 10\,s (highest bitrate once the buffer exceeds 15\,s); BOLA uses \key{Lyapunov optimisation} and can abandon a chunk download & Robust in steady state, but ignores useful throughput information \\
-\key{MPC} / robustMPC & Use throughput forecast + buffer to \key{maximise QoE over a horizon of 5 future chunks}; robustMPC divides the forecast by the max prediction error of the last 5 chunks & Needs an \key{accurate model} (throughput forecast); sensitive to prediction errors and to the horizon length \\
-Tabular RL & Learn a table of values for every (state, action) & Table cannot scale; forced to assume e.g.\ \key{Markovian bandwidth} (only one past sample) \\
-\bottomrule
-\end{tabularx}
-\end{center}
-\textbf{Two failure examples of robustMPC (from the paper):}
+\subsection{Why the decision is hard}
 \begin{itemize}
-\item \textbf{Highly variable link (mean about 4.5\,Mb/s):} robustMPC's conservative estimate hovered near 2\,Mb/s, so it never used the high bitrates even as the buffer kept growing. The learned policy saw the high average and, once the buffer was large enough, switched to the top bitrate.
-\item \textbf{HD-loving QoE metric:} the right strategy is to first build a big buffer at the lowest bitrate (300\,kb/s), then jump to HD (1850\,kb/s) and stay there. robustMPC kept a medium buffer and chose in-between bitrates because its 5-chunk horizon was too short to see the payoff. The learned policy did exactly the long-term plan (stayed at HD for nearly 80\,s).
-\end{itemize}
-\textbf{Lesson:} fixed heuristics or simplified models cannot (1) account for throughput fluctuations and prediction errors, or (2) choose the right planning horizon. Learning from the actual outcomes of decisions can.
-
-\section{The QoE objective}
-For a video of $N$ chunks, with $R_n$ the bitrate of chunk $n$, $q(\cdot)$ the perceived quality of a bitrate, and $T_n$ the rebuffering time caused by downloading chunk $n$:
-\[ QoE = \underbrace{\sum_{n=1}^{N} q(R_n)}_{\text{quality}} \;-\; \mu \underbrace{\sum_{n=1}^{N} T_n}_{\text{rebuffering}} \;-\; \underbrace{\sum_{n=1}^{N-1} \big| q(R_{n+1}) - q(R_n) \big|}_{\text{smoothness}} \]
-\begin{center}
-\begin{tabularx}{\linewidth}{@{}lXl@{}}
-\toprule
-\textbf{Metric} & \textbf{Quality $q(R)$} & \textbf{Rebuffer penalty $\mu$} \\
-\midrule
-$QoE_{lin}$ (used by MPC) & $R$ (Mb/s) & 4.3 \\
-$QoE_{log}$ (used by BOLA) & $\log(R/R_{min})$: diminishing returns at high bitrate & 2.66 \\
-$QoE_{hd}$ & 0.3$\to$1, 0.75$\to$2, 1.2$\to$3, 1.85$\to$12, 2.85$\to$15, 4.3$\to$20 (HD gets a big jump) & 8 \\
-\bottomrule
-\end{tabularx}
-\end{center}
-\textbf{Worked example ($QoE_{lin}$):} four chunks at 1.2, 1.85, 1.85, 0.75\,Mb/s; chunk 3 causes 0.5\,s of rebuffering.
-\begin{center}
-\begin{tabular}{@{}lr@{}}
-\toprule
-Quality: $1.2 + 1.85 + 1.85 + 0.75$ & $5.65$ \\
-Rebuffering: $4.3 \times 0.5$ & $-2.15$ \\
-Smoothness: $|1.85-1.2| + 0 + |0.75-1.85|$ & $-1.75$ \\
-\midrule
-QoE & \key{1.75} \\
-\bottomrule
-\end{tabular}
-\end{center}
-Pensieve gives this per-chunk QoE to the learner as the \key{reward} $r_t$, so changing the metric changes the learned policy with no change to the algorithm.
-
-\section{ABR as a reinforcement-learning problem}
-\paperfig[0.6]{ps_fig2_rl}{RL for bitrate adaptation: the agent observes bandwidth, bitrate and buffer signals, the neural network outputs a bitrate, and the resulting QoE comes back as the reward.}
-\begin{itemize}
-\item At each step $t$ the \key{agent} observes a \key{state} $s_t$, takes an \key{action} $a_t$, the environment moves to $s_{t+1}$, and the agent gets a \key{reward} $r_t$.
-\item Goal: maximise the expected cumulative \key{discounted} reward $\mathbb{E}\left[\sum_{t\ge0} \gamma^t r_t\right]$, $\gamma \in (0,1]$.
-\item For ABR: one step = one chunk. State = player and network observations; action = bitrate of the next chunk; reward = that chunk's QoE.
-\item The policy is \key{not hand-written}; it is a neural network trained from experience. It can learn, for a given network, how much buffer is needed against rebuffering, how much to trust throughput vs.\ buffer signals, and how far ahead to plan.
+  \item \textbf{The network varies.} Throughput swings, especially on cellular links, so predictions are often wrong. There the buffer level is a
+        more reliable signal than the throughput forecast.
+  \item \textbf{The goals conflict.} Viewers want high quality, no freezes, and few jarring quality changes, and different viewers weigh these
+        differently.
+  \item \textbf{Decisions cascade.} A high bitrate now drains the buffer and may force low bitrates, or a freeze, several chunks later.
+  \item \textbf{Choices are coarse.} If throughput is 1.8\,Mb/s, the options are 1.2 (safe but wasteful) or 1.85 (slightly too big): every
+        choice is a compromise.
 \end{itemize}
 
-\section{Training environment: a chunk-level simulator}
-Training on real players is too slow (a browser must download every chunk before the model can update). Pensieve uses a simple simulator that still captures the player's dynamics.
+\subsection{The existing rules, and where they break}
+\begin{itemize}
+  \item \textbf{Rate-based} (e.g.\ FESTIVE): predict throughput, for example as the harmonic mean of the last 5 chunks, and choose the highest bitrate
+        below it. Throughput measured from chunk downloads is noisy and biased, so this is mainly good at start-up.
+  \item \textbf{Buffer-based} (BBA, BOLA): ignore throughput and choose by buffer level. BBA keeps a 5\,s ``reservoir'' and goes to the top bitrate
+        once the buffer exceeds 15\,s. BOLA derives its rule from Lyapunov optimisation. These are stable, but throw away useful throughput information.
+  \item \textbf{MPC / robustMPC}: forecast throughput, then search over the next 5 chunks for the bitrate sequence that maximises QoE. robustMPC divides the
+        forecast by the worst recent prediction error to be safe. It is only as good as its forecast, and it only looks 5 chunks ahead.
+\end{itemize}
 
-\textbf{Per chunk download, the simulator:}
+Two cases from the paper show these limits:
+\begin{itemize}
+  \item \textbf{A highly variable link averaging about 4.5\,Mb/s.} robustMPC's cautious estimate hovered around 2\,Mb/s, so it never chose the high
+        bitrates, even as its buffer grew huge. The learned policy noticed that the buffer had become large enough to ride out the dips and moved to the
+        top bitrate.
+  \item \textbf{A viewer who strongly values HD.} The best plan is to build a large buffer at the lowest bitrate first, then jump to HD and stay there. robustMPC
+        chose middle bitrates, because the payoff of that plan lies beyond its 5-chunk horizon. The learned policy followed exactly the long-term plan and
+        stayed at HD for about 80\,s.
+\end{itemize}
+The lesson: any fixed rule or simplified model bakes in assumptions (how to treat forecast error, how far to plan) that are right for some networks and
+wrong for others. Learning from the actual results of decisions avoids having to choose those assumptions by hand.
+
+% ------------------------------------------------------------------
+\section{What ``good'' means: the QoE score}
+
+For a video of $N$ chunks, with $R_n$ the bitrate of chunk $n$, $q(R)$ the quality a viewer perceives at bitrate $R$, and $T_n$ the freeze time
+caused while downloading chunk $n$:
+\[
+  QoE = \sum_{n=1}^{N} q(R_n) \;-\; \mu \sum_{n=1}^{N} T_n \;-\; \sum_{n=1}^{N-1} \big|q(R_{n+1}) - q(R_n)\big|
+\]
+That is: reward quality, penalise freezing (weighted by $\mu$), and penalise changes in quality. Different choices of $q$ and $\mu$ describe different viewers:
+\begin{itemize}
+  \item $QoE_{lin}$: $q(R) = R$ in Mb/s, $\mu = 4.3$, so one second of freeze costs as much as the top bitrate is worth for one chunk.
+  \item $QoE_{log}$: $q(R) = \log(R/R_{min})$, $\mu = 2.66$. Each extra Mb/s is worth less at high bitrates.
+  \item $QoE_{hd}$: low bitrates score 1--3, while HD (1.85\,Mb/s and above) scores 12--20, $\mu = 8$. This viewer cares a lot about HD.
+\end{itemize}
+
+\textbf{Example ($QoE_{lin}$).} Four chunks at 1.2, 1.85, 1.85 and 0.75\,Mb/s, with chunk 3 causing a 0.5\,s freeze:
+quality $= 5.65$, freeze penalty $= 4.3 \times 0.5 = 2.15$, change penalty $= 0.65 + 0 + 1.10 = 1.75$, so $QoE = 5.65 - 2.15 - 1.75 = 1.75$.
+
+Pensieve hands each chunk's share of this score to the learner as its \textbf{reward}. To optimise for a different kind of viewer, you only change the
+score; the algorithm stays the same.
+
+% ------------------------------------------------------------------
+\section{The idea: learn the rule by trial and error}
+
+\paperfig[0.6]{ps_fig2_rl}{Bitrate adaptation as reinforcement learning. The agent observes the player and network state, the neural network picks a
+bitrate, and the resulting QoE comes back as a reward.}
+
+Reinforcement learning (RL) frames the problem as an agent repeatedly acting in an environment:
 \begin{enumerate}
-\item Computes the \key{download time} from the chunk's size (its bitrate) and the \key{throughput trace}.
-\item \key{Drains} the playback buffer by that download time (video keeps playing while downloading).
-\item Records \key{rebuffering} if the download time exceeds the buffer at the start of the download.
-\item \key{Adds} the chunk's playback duration to the buffer.
-\item If the buffer cannot fit another chunk, \key{waits 500\,ms} and retries (the default DASH retry rate).
-\item Reports to the agent: buffer level, rebuffering time, download time, next chunk's sizes at all bitrates, chunks remaining.
+  \item It observes a \textbf{state} $s_t$: here, what the player knows after downloading chunk $t$.
+  \item It takes an \textbf{action} $a_t$: here, the bitrate for the next chunk.
+  \item The environment responds: the chunk downloads, the buffer changes, perhaps the video freezes.
+  \item The agent receives a \textbf{reward} $r_t$: that chunk's QoE contribution.
 \end{enumerate}
-Result: \key{100 hours of video in 10 minutes} of training.
+The goal is not to maximise the next reward but the total over the future, $\sum_t \gamma^t r_t$. The discount $\gamma = 0.99$ means a choice is
+judged by roughly its next 100 chunks of consequences, far more than MPC's 5. That is how the agent can learn that building buffer now pays off later.
 
-\textbf{Worked example} (4\,s chunks):
+Nobody writes the rule. The rule (the \textbf{policy}) is a neural network that outputs a probability for each bitrate. Training repeatedly plays
+videos, sees which choices led to high total QoE, and adjusts the network to make such choices more likely. Along the way it learns things a human
+would have had to guess: how much buffer this kind of network needs, how much to trust throughput versus buffer level, and how far ahead to plan.
+
+% ------------------------------------------------------------------
+\section{The training ground: a chunk-level simulator}
+
+Training needs millions of decisions. Real video players are far too slow for that, because each chunk must actually download before the model can learn from
+it. So Pensieve trains in a simulator that models just what matters: chunk sizes, a recorded throughput trace, and the buffer.
+
+\textbf{For each chunk, the simulator:}
+\begin{enumerate}
+  \item computes the \textbf{download time} from the chunk's size at the chosen bitrate and the throughput in the trace;
+  \item \textbf{drains the buffer} by that download time (the video keeps playing during the download);
+  \item records a \textbf{freeze} if the download took longer than the buffer that was there at the start;
+  \item \textbf{adds} the chunk's duration to the buffer;
+  \item if the buffer is full, \textbf{waits 500\,ms} before requesting again (as real DASH players do);
+  \item returns to the agent: buffer level, freeze time, download time, the next chunk's sizes at every bitrate, and chunks remaining.
+\end{enumerate}
+This runs about \textbf{100 hours of video in 10 minutes}.
+
+\textbf{Example} (4-second chunks, buffer starts at 6\,s):
 \begin{center}
 \begin{tabular}{@{}lccccc@{}}
 \toprule
-\textbf{Chunk} & \textbf{Size} & \textbf{Throughput} & \textbf{Download} & \textbf{Rebuffer} & \textbf{Buffer after} \\
+Chosen bitrate & Chunk size & Throughput & Download time & Freeze & Buffer after\\
 \midrule
-start & & & & & 6.00\,s \\
-1.85\,Mb/s & 7.4\,Mb & 2.5\,Mb/s & 2.96\,s & 0 & $6 - 2.96 + 4 = 7.04$\,s \\
-4.3\,Mb/s & 17.2\,Mb & 2.0\,Mb/s & 8.60\,s & $8.6 - 7.04 = 1.56$\,s & $0 + 4 = 4.00$\,s \\
+1.85\,Mb/s & 7.4\,Mb & 2.5\,Mb/s & 2.96\,s & 0 & $6 - 2.96 + 4 = 7.04$\,s\\
+4.3\,Mb/s & 17.2\,Mb & 2.0\,Mb/s & 8.60\,s & $8.60 - 7.04 = 1.56$\,s & $0 + 4 = 4.00$\,s\\
 \bottomrule
 \end{tabular}
 \end{center}
+The second choice was greedy: it froze the video for 1.56\,s, and its reward will be low (with $QoE_{lin}$: $4.3 - 4.3\times1.56 - |4.3-1.85| \approx -4.9$).
+That is exactly the feedback the learner needs.
 
-\subsection{The transport-layer catch: slow-start restart}
-\paperfig[0.48]{ps_fig4_ssr}{Per-chunk throughput on a 6\,Mb/s link. With TCP slow-start restart (a), low-bitrate (small) chunks get much less throughput; with it disabled (b), every bitrate gets about 6\,Mb/s.}
+\subsection{A transport-layer trap: slow-start restart}
+\paperfig[0.48]{ps_fig4_ssr}{Per-chunk throughput on a 6\,Mb/s link. With TCP slow-start restart on (a), small low-bitrate chunks get much less
+throughput. With it off (b), every bitrate gets about 6\,Mb/s.}
+The simulator assumes each chunk download gets the full throughput in the trace. Real players do not. When the buffer is full, the player pauses, and
+after the idle period TCP restarts in slow start. A small chunk finishes before TCP is back up to speed, so low bitrates see lower throughput. Worse, the
+throughput then depends on the ABR algorithm itself (an algorithm that fills the buffer fast pauses more often), which no trace can capture. The fix is
+to \textbf{turn off slow-start restart on the video server} (a Linux setting). Then real downloads behave like the simulator's. More generally, the
+simulator does not have to be perfect, as long as training covers a wide enough variety of networks.
+
+% ------------------------------------------------------------------
+\section{The neural network and how it learns (A3C)}
+
+\paperfig[0.62]{ps_fig5_a3c}{Pensieve's two networks. The state is fed through 1D convolutions (for the past throughputs, download times and next
+chunk sizes) and a fully connected layer. The actor outputs a probability per bitrate; the critic outputs one number, the value of the state.}
+
+\subsection{What the network sees}
+After chunk $t$ finishes, the state is $s_t = (\vec{x}_t, \vec{\tau}_t, \vec{n}_t, b_t, c_t, l_t)$:
 \begin{itemize}
-\item A player does not always request the next chunk immediately (e.g.\ the buffer is full). After such idle time TCP goes back to \key{slow start} (\key{slow-start restart}), so small chunks never reach full speed.
-\item Then throughput depends on the \emph{ABR algorithm itself} (algorithms that fill the buffer fast pause more and get more slow starts), which a trace-driven simulator cannot model.
-\item Fix: \key{disable slow-start restart on the video server} (Linux: \texttt{net.ipv4.tcp\_slow\_start\_after\_idle}). Then each chunk uses the full trace throughput, as the simulator assumes. This can make traffic burstier; standards work on pacing the first burst after idle addresses that.
-\item No simulator is perfect, but Pensieve learns good policies from an imperfect one \key{as long as training covers a wide variety of network conditions} (it generalises well).
+  \item $\vec{x}_t$: the throughput of each of the last $k = 8$ chunk downloads, which shows the network's recent behaviour and variability;
+  \item $\vec{\tau}_t$: how long each of those downloads took, which says over what interval each throughput was measured (a measurement over 0.2\,s is
+        less trustworthy than one over 4\,s);
+  \item $\vec{n}_t$: the size of the \emph{next} chunk at every bitrate. Chunk sizes vary from chunk to chunk (an action scene is bigger), so the
+        real cost of each choice is the size, not the nominal bitrate;
+  \item $b_t$: the current buffer, i.e.\ how much safety margin is left;
+  \item $c_t$: chunks remaining. Near the end of the video there is no point building buffer;
+  \item $l_t$: the last bitrate, needed to account for the smoothness penalty.
+\end{itemize}
+These are raw observations. The network learns for itself how to combine them, so nobody has to design features such as ``harmonic mean of 5 samples''.
+
+\subsection{Two networks: the actor and the critic}
+\begin{itemize}
+  \item The \textbf{actor} is the policy $\pi_\theta(s, a)$: for state $s$, the probability of choosing each bitrate $a$. It makes the decisions.
+  \item The \textbf{critic} estimates $V(s)$: the total future reward to expect from state $s$ under the current policy. It is used only during
+        training, to judge the actor's choices, and is discarded afterwards.
 \end{itemize}
 
-\section{The learning algorithm: A3C (actor-critic)}
-\paperfig[0.62]{ps_fig5_a3c}{Pensieve's two networks. The state goes through 1D-CNNs (past throughputs, download times, next chunk sizes) and fully connected layers. The actor outputs a probability for each bitrate; the critic outputs the value of the state.}
-
-\subsection{State (input), after chunk $t$ is downloaded}
-\[ s_t = (\vec{x}_t,\ \vec{\tau}_t,\ \vec{n}_t,\ b_t,\ c_t,\ l_t) \]
-\begin{center}
-\begin{tabular}{@{}ll@{}}
-\toprule
-$\vec{x}_t$ & throughput measured for the past $k$ chunks \\
-$\vec{\tau}_t$ & download times of the past $k$ chunks (the time span of each throughput sample) \\
-$\vec{n}_t$ & sizes of the next chunk at each of the $m$ bitrates \\
-$b_t$ & current buffer level \\
-$c_t$ & number of chunks left in the video \\
-$l_t$ & bitrate of the last chunk \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-\subsection{Policy (actor)}
-The \key{policy} $\pi_\theta(s_t, a_t) \in [0,1]$ is the probability of choosing bitrate $a_t$ in state $s_t$. States are continuous (throughput, buffer), so a table is impossible; a \key{neural network} with parameters $\theta$ represents the policy. NNs need \key{no hand-crafted features}: they take raw signals.
-
-\subsection{Training the actor: policy gradient}
-The gradient of the expected discounted reward is
-\[ \nabla_\theta\, \mathbb{E}_{\pi_\theta}\Big[\sum_{t} \gamma^t r_t\Big] = \mathbb{E}_{\pi_\theta}\big[\nabla_\theta \log \pi_\theta(s,a)\, A^{\pi_\theta}(s,a)\big] \]
-where the \key{advantage} $A(s,a)$ = how much better action $a$ is than the policy's average action in state $s$. The update after a sampled trajectory:
-\[ \theta \leftarrow \theta + \alpha \sum_t \nabla_\theta \log \pi_\theta(s_t,a_t)\, A(s_t,a_t) \;+\; \beta\, \nabla_\theta H\big(\pi_\theta(\cdot \mid s_t)\big) \]
-\begin{itemize}
-\item $\nabla_\theta \log \pi_\theta(s_t,a_t)$ is the direction that makes action $a_t$ \key{more likely} in $s_t$; the step size is the advantage. Net effect: \key{reinforce actions that turned out better than average}, discourage the others.
-\item The \key{entropy} term $H$ pushes towards more random policies to keep \key{exploring}. $\beta$ starts large and \key{decays from 1 to 0.1 over $10^5$ iterations}, shifting from exploration to exploitation.
-\end{itemize}
-
-\subsection{Training the critic: temporal difference}
-The \key{critic} learns the \key{value} $V(s)$ (expected total reward from $s$ under the policy):
-\[ \theta_v \leftarrow \theta_v - \alpha' \sum_t \nabla_{\theta_v} \big(r_t + \gamma V(s_{t+1};\theta_v) - V(s_t;\theta_v)\big)^2 \]
-and the advantage is estimated as $A(s_t,a_t) \approx r_t + \gamma V(s_{t+1}) - V(s_t)$.
-
-\textbf{Worked example:} $r_t = 2$, $\gamma = 0.99$, $V(s_{t+1}) = 10$, $V(s_t) = 11$. Then $A = 2 + 9.9 - 11 = 0.9 > 0$: the chosen bitrate did better than expected, so its probability is pushed up. Had the chunk caused rebuffering ($r_t = -3$), $A = -4.1$ and the probability would be pushed down.
-
-\textbf{Only the actor is used after training}; the critic exists just to train it.
-
-\subsection{Parallel, asynchronous training}
-\begin{itemize}
-\item \key{16 agents} run in parallel, each on different network traces.
-\item Each sends its \{state, action, reward\} tuples to a \key{central agent}, which computes the actor-critic gradient, updates the model, and pushes the new model back to that agent.
-\item Fully \key{asynchronous} (no locking between agents).
-\item Why A3C: state of the art, and its asynchronous structure fits a future where \key{many real clients} send experience concurrently.
-\end{itemize}
-
-\section{One model for many videos}
-\paperfig[0.48]{ps_fig6_mask}{Canonical input and output: chunk sizes are placed at the index of the closest canonical bitrate (unsupported ones are 0), and a 0-1 mask removes unsupported bitrates from the softmax.}
-Videos differ in how many bitrates they offer and in their chunk sizes, but an NN has fixed-size inputs and outputs. Training one model per video type does not scale. Two changes:
+\subsection{One learning step}
 \begin{enumerate}
-\item \key{Canonical input}: fix a maximum number of bitrate levels (e.g.\ \key{13} covers all DASH reference videos). Put each chunk size at the index of the \key{closest bitrate}; \key{zero} the rest.
-\item \key{Masked softmax output}: with mask $m_i \in \{0,1\}$ (1 if the video supports bitrate $i$) and network outputs $z_i$,
-\[ p_i = \frac{m_i\, e^{z_i}}{\sum_j m_j\, e^{z_j}} \]
-The mask depends only on the video, not on $\theta$, so $p_i$ stays differentiable and training is unchanged.
+  \item \textbf{Act.} In state $s_t$ the actor outputs probabilities, say 0.2 / 0.5 / 0.3 for low / medium / high. The agent \emph{samples} one, say high.
+        Sampling rather than always taking the most likely bitrate makes the agent occasionally try things, which is how it discovers better strategies.
+  \item \textbf{Observe.} The simulator downloads the chunk and returns reward $r_t$ and the next state $s_{t+1}$.
+  \item \textbf{Judge the choice (advantage).} Was ``high'' better or worse than what the agent usually achieves from $s_t$? The critic provides the
+        comparison:
+        \[ A(s_t, a_t) \approx r_t + \gamma V(s_{t+1}) - V(s_t) \]
+        This is the reward actually received plus the value of where we ended up, minus what was expected from where we started.
+  \item \textbf{Update the actor.}
+        \[ \theta \leftarrow \theta + \alpha \sum_t \nabla_\theta \log \pi_\theta(s_t, a_t)\, A(s_t, a_t) \;+\; \beta\, \nabla_\theta H(\pi_\theta(\cdot \mid s_t)) \]
+        $\nabla_\theta \log \pi_\theta(s_t, a_t)$ is the direction that makes the chosen bitrate more likely in that state. Stepping along it in proportion
+        to $A$ makes choices that beat expectations more likely, and choices that fell short (negative $A$) less likely.
+  \item \textbf{Update the critic} so that its prediction $V(s_t)$ moves towards $r_t + \gamma V(s_{t+1})$ (temporal-difference learning), making its
+        future judgements more accurate.
 \end{enumerate}
-\textbf{Worked example:} mask $(1,1,0,1,0)$, outputs $z = (1.0,\ 2.0,\ 3.0,\ 0.5,\ 4.0)$.
-\begin{center}
-\begin{tabular}{@{}lccccc@{}}
-\toprule
-Index $i$ & 1 & 2 & 3 & 4 & 5 \\
-\midrule
-$m_i e^{z_i}$ & 2.718 & 7.389 & 0 & 1.649 & 0 \\
-$p_i$ (sum = 11.756) & 0.231 & \key{0.629} & 0 & 0.140 & 0 \\
-\bottomrule
-\end{tabular}
-\end{center}
-Without the mask, index 5 ($z=4$) would get most of the probability although this video does not offer that bitrate.
 
-\section{Implementation and deployment}
-\begin{center}
-\begin{tabularx}{\linewidth}{@{}lX@{}}
-\toprule
-\textbf{Item} & \textbf{Setting} \\
-\midrule
-History & $k = 8$ past throughput samples \\
-Throughput input & 1D-CNN, \key{128 filters of size 4}, stride 1 \\
-Chunk sizes input & another 1D-CNN of the same shape \\
-Merge & hidden layer of \key{128 neurons}, then softmax over bitrates (actor) \\
-Critic & same structure, final output one \key{linear} neuron \\
-Discount $\gamma$ & \key{0.99} (an action is influenced by about 100 future steps) \\
-Learning rates & actor $10^{-4}$, critic $10^{-3}$ \\
-Entropy weight $\beta$ & 1 $\to$ 0.1 over $10^5$ iterations \\
-Software & TensorFlow (TFLearn API) \\
-\bottomrule
-\end{tabularx}
-\end{center}
-Performance was found to be insensitive to these hyperparameters over a wide range, so no sophisticated tuning was used.
+\textbf{Example.} $r_t = 2$, $\gamma = 0.99$, $V(s_{t+1}) = 10$, $V(s_t) = 11$. Then $A = 2 + 9.9 - 11 = 0.9 > 0$: choosing ``high'' worked out better
+than expected, so its probability in similar states goes up. If the chunk had caused a freeze ($r_t = -3$), $A = -4.1$ and the probability would be pushed down.
 
-\textbf{Deployment: an ABR server.}
+\textbf{Why the critic is needed.} A reward on its own is misleading: a mediocre choice on a fast network still earns a high reward. Comparing the
+outcome to what was \emph{expected from that state} isolates the effect of the choice itself.
+
+\textbf{Why the entropy term.} $H$ measures how spread out the action probabilities are. Rewarding entropy keeps the policy from settling too early on
+one habit. Its weight $\beta$ starts at 1 (explore a lot) and decays to 0.1 over $10^5$ iterations (then mostly exploit what has been learned).
+
+\subsection{Many learners in parallel}
+Pensieve runs \textbf{16 agents} at once, each streaming over different network traces. Each sends its (state, action, reward) experience to a
+central learner, which computes the update, changes the model, and sends the new model back to that agent. All of this happens asynchronously,
+without locking (the ``A'' in A3C). The same structure would allow, in future, real clients to feed their experience into one shared learner.
+
+\subsection{Network shape and settings}
+The 8 past throughputs and the next-chunk sizes each go through a 1D convolution layer (128 filters of size 4), which picks out patterns across the
+sequence. Download times are treated the same way. The results are combined with the scalar inputs in a 128-neuron layer, then a softmax over bitrates
+(actor) or a single linear output (critic). Learning rates are $10^{-4}$ (actor) and $10^{-3}$ (critic), and $\gamma = 0.99$. Performance was insensitive
+to these settings over a wide range.
+
+% ------------------------------------------------------------------
+\section{One model for videos with different bitrate ladders}
+
+\paperfig[0.48]{ps_fig6_mask}{Supporting many videos. Chunk sizes are placed at the slot of the nearest standard bitrate (unused slots are 0), and a
+0/1 mask removes the bitrates this video does not offer from the softmax.}
+
+A neural network has a fixed number of inputs and outputs, but videos offer different numbers of bitrates. Training a separate model for every
+kind of video would not scale. Pensieve uses one model:
 \begin{enumerate}
-\item The trained actor runs on a standalone \key{ABR server} (Python \texttt{BaseHTTPServer}).
-\item Each client chunk request \key{carries the observations} (last chunk's throughput and download time, buffer, video being streamed, \ldots).
-\item The server runs the actor NN and replies with the \key{bitrate for the next chunk}.
-\item The client fetches that chunk from the CDN.
+  \item \textbf{Fixed input slots.} Use a standard set of bitrate levels (13 covers every video in the DASH reference set). Put each of this video's
+        chunk sizes into the slot of the nearest standard bitrate, and fill the other slots with zero.
+  \item \textbf{Masked output.} Multiply the softmax by a 0/1 mask $m$ that is 1 only for bitrates the video offers:
+        \[ p_i = \frac{m_i e^{z_i}}{\sum_j m_j e^{z_j}} \]
+        The mask depends only on the video, not on the network's weights, so training works exactly as before.
 \end{enumerate}
-\begin{itemize}
-\item The server stays \key{stateless}: everything it needs is in the request.
-\item Clients with little compute (TVs, phones) need not run a neural network; the observations still come from the client, so it reacts as quickly as a client-side ABR. Adding 100\,ms RTT to reach the server cost only about 3.5\% QoE.
-\item The model could also run inside players (compressed NNs, or JavaScript).
-\end{itemize}
 
-\section{Discussion and limits}
+\textbf{Example.} Mask $(1,1,0,1,0)$ and raw outputs $z = (1.0, 2.0, 3.0, 0.5, 4.0)$:
+$m_i e^{z_i} = (2.718,\ 7.389,\ 0,\ 1.649,\ 0)$, which sum to 11.756, so $p = (0.231,\ 0.629,\ 0,\ 0.140,\ 0)$.
+Without the mask, slot 5 ($z = 4$) would take most of the probability, even though this video has no such bitrate.
+
+% ------------------------------------------------------------------
+\section{Deployment: an ABR server}
+After training, only the actor is kept, and it runs on a small \textbf{ABR server} (a Python HTTP server):
+\begin{enumerate}
+  \item The player's request for a chunk is extended to carry its observations: the last chunk's throughput and download time, buffer level, which video, and so on.
+  \item The server feeds them through the actor and replies with the bitrate for the next chunk.
+  \item The player fetches that chunk from the CDN as usual.
+\end{enumerate}
+The server keeps no per-client state, since every request carries what it needs. Weak devices (TVs, phones) do not have to run a neural network. Because the
+observations still come from the player, decisions react as quickly as a player-side ABR would. Adding 100\,ms of RTT to reach the server cost only
+about 3.5\% QoE. The model could also run inside the player.
+
+\section{Training data and results in brief}
+The training traces came from broadband (FCC) and 3G (Norway, HSDPA) measurements, 320\,s each. Traces where the choice is trivial (always the top
+bitrate, or nothing works) were excluded. Pensieve matched or beat the best existing scheme for every QoE metric tested, improving average QoE by
+12--25\%. It also generalised: a model trained only on synthetic traces still did well on real networks.
+
+\section{Discussion}
 \begin{itemize}
-\item \key{Periodic or online training}: models could be retrained as new data arrives. Training \emph{on the client} is harder: it costs client compute and needs algorithms that learn from little data quickly.
-\item \key{Why not tabular RL}: a table needs few, quantized states, which forces assumptions like Markovian bandwidth (only the last throughput sample). One sample is not enough to infer the distribution of future bandwidth; a neural network can use the whole history.
-\item \key{Optimality}: there is still a gap to the \emph{offline} optimum, but that optimum knows future bandwidth exactly. Against the optimal \emph{online} policy (computable by dynamic programming for a known Markov model of download times), Pensieve comes much closer.
-\item Training data: throughput traces (broadband and 3G/HSDPA); traces where the choice is trivial (always max bitrate, or nothing feasible) were excluded. A model trained only on \key{synthetic traces} still generalised to real networks.
+  \item \textbf{Why not a table instead of a neural network?} Earlier RL-for-ABR work used a table of values per (state, action). That needs a small,
+        quantised state, which forces assumptions such as ``future bandwidth depends only on the last sample''. One sample is not enough to judge how
+        the network behaves; a neural network can use the whole history.
+  \item \textbf{How far from optimal?} There is still a gap to the \emph{offline} optimum, but that optimum knows the future bandwidth. Against the best
+        possible \emph{online} policy, computable for simple network models, Pensieve comes much closer.
+  \item \textbf{Retraining} as conditions change is possible. Training on clients themselves would be harder (compute, and learning from little data).
 \end{itemize}
 
 \begin{keybox}[Exam one-liner]
-Pensieve replaces hand-tuned ABR rules with a policy learned by deep RL: an actor-critic (A3C) network takes past throughputs and download times, next-chunk sizes, buffer, chunks left and last bitrate, outputs a probability per bitrate, and is trained in a chunk-level simulator to maximise per-chunk QoE (quality $-$ $\mu\cdot$rebuffering $-$ switches); masking gives one model for many bitrate ladders, and an ABR server serves decisions to clients.
+Pensieve replaces hand-written ABR rules with a policy learned by deep RL. An actor-critic (A3C) network takes the last 8 throughputs and download
+times, the next chunk's sizes, the buffer, the chunks left and the last bitrate, outputs a probability per bitrate, and is trained in a fast chunk-level
+simulator to maximise total QoE (quality $-$ $\mu \cdot$ freezes $-$ changes) with $\gamma = 0.99$. Masking lets one model serve any bitrate ladder,
+and a stateless ABR server answers each chunk request with the next bitrate.
 \end{keybox}
 
 \section{Revision checklist}
 \begin{itemize}
-\item \textbf{DASH:} chunks of a few seconds, several aligned bitrates, manifest $\to$ CDN, ABR picks each chunk's bitrate, playback only after full download.
-\item \textbf{Challenges:} variable throughput, conflicting QoE goals, cascading effects, coarse choices.
-\item \textbf{Baselines:} rate-based (harmonic mean of 5), buffer-based (BBA 5\,s reservoir; BOLA Lyapunov), MPC (5-chunk horizon, needs forecasts), tabular RL (Markov assumption).
-\item \textbf{QoE:} $\sum q(R_n) - \mu\sum T_n - \sum|q(R_{n+1})-q(R_n)|$; lin ($\mu$ 4.3), log ($\mu$ 2.66), hd ($\mu$ 8).
-\item \textbf{Simulator:} download time from size/trace, drain buffer, count rebuffer, add chunk, 500\,ms wait if full; 100\,h in 10\,min; disable TCP slow-start restart.
-\item \textbf{State:} $(\vec x, \vec\tau, \vec n, b, c, l)$, $k=8$.
-\item \textbf{A3C:} actor $\pi_\theta$ updated by $\nabla\log\pi\cdot A$ + entropy (1$\to$0.1); critic by TD; $A \approx r + \gamma V(s') - V(s)$; only actor used at run time; 16 async agents.
-\item \textbf{NN:} 1D-CNN 128 filters size 4; 128-neuron hidden layer; softmax; $\gamma=0.99$; LR $10^{-4}$/$10^{-3}$.
-\item \textbf{Many videos:} 13 canonical levels, nearest-bitrate mapping, masked softmax $p_i = m_i e^{z_i}/\sum m_j e^{z_j}$.
-\item \textbf{Deployment:} stateless ABR server; observations in each request; reply = next bitrate.
+  \item DASH loop: manifest, ABR chooses per chunk, download, buffer drains; freeze if buffer empties.
+  \item Why hard: variable network, conflicting goals, cascading effects, coarse choices.
+  \item Fixed rules: rate-based (harmonic mean of 5), buffer-based (BBA 5\,s reservoir / 15\,s top; BOLA), robustMPC (5-chunk horizon, cautious forecast).
+        Two failures: variable 4.5\,Mb/s link, HD-loving viewer.
+  \item QoE $= \sum q(R) - \mu \sum T - \sum |\Delta q|$; lin $\mu = 4.3$, log 2.66, hd 8; per-chunk QoE is the reward.
+  \item RL: state, action (bitrate), reward; maximise discounted total ($\gamma = 0.99$, about 100 chunks).
+  \item Simulator: download time from size and trace, drain, freeze, add chunk, 500\,ms wait; 100\,h in 10\,min; disable TCP slow-start restart.
+  \item State: past 8 throughputs and download times, next sizes, buffer, chunks left, last bitrate.
+  \item A3C: actor samples, advantage $= r + \gamma V(s') - V(s)$, raise probability of better-than-expected actions; critic by TD; entropy 1 $\to$ 0.1; 16 async agents.
+  \item Many videos: 13 slots, nearest-bitrate mapping, masked softmax.
+  \item Deployment: stateless ABR server; 100\,ms extra RTT costs about 3.5\% QoE.
 \end{itemize}
