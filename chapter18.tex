@@ -1,287 +1,355 @@
 \chapter{DCQCN: Congestion Control for Large-Scale RDMA Deployments}
 \paperinfo{Y. Zhu, H. Eran, D. Firestone, C. Guo, M. Lipshteyn, Y. Liron, J. Padhye, S. Raindel, M. Haj Yahia, M. Zhang (Microsoft, Mellanox, UC Santa Barbara)}{ACM SIGCOMM 2015}
 
-\begin{keybox}[DCQCN in one paragraph]
-Microsoft wanted \key{RDMA} in its IP-routed datacenters: 40\,Gb/s with almost no CPU and a few microseconds of latency. RDMA over Ethernet (\key{RoCEv2}) needs a \key{lossless} network, which is provided by \key{PFC} (Priority-based Flow Control): a switch tells its upstream neighbour to \key{PAUSE}. PFC works per \emph{port and priority}, not per flow, so it causes \key{unfairness} and \key{congestion spreading} (innocent ``victim'' flows get paused). \key{DCQCN} (Datacenter QCN) adds \key{per-flow, end-to-end, rate-based congestion control} so that PFC is rarely triggered. Switches only do standard \key{RED/ECN marking}; the receiver NIC turns marks into \key{Congestion Notification Packets (CNPs)}; the sender NIC cuts its rate DCTCP-style ($R_C \leftarrow R_C(1-\alpha/2)$) and recovers QCN-style with a \key{timer and a byte counter}. There is \key{no slow start}. The paper also shows how to set switch buffer thresholds so that \key{ECN always fires before PFC}, and uses a \key{fluid model} to choose the parameters.
+\begin{keybox}[The paper in three sentences]
+To run RDMA over its ordinary IP/Ethernet datacenter (RoCEv2), Microsoft needs a network that never drops packets, and the tool for that,
+PFC, does it with a blunt per-link ``PAUSE'' that makes flows unfair and spreads congestion to flows that are not even involved. DCQCN
+adds per-flow congestion control on the NICs: switches ECN-mark packets, the receiver NIC turns marks into Congestion Notification
+Packets (CNPs), and the sender NIC cuts and then re-grows its \emph{rate}, so queues rarely get long enough to trigger PFC at all. The paper also
+works out how to set switch buffer thresholds so that ECN always fires before PFC, and uses a fluid model to choose parameters that make
+flows converge to a fair share.
 \end{keybox}
 
-\section{Background: why RDMA, and why it needs a lossless network}
-\subsection{Why not TCP?}
+% ------------------------------------------------------------------
+\section{Why RDMA, and why it needs a lossless network}
+
+Microsoft wanted two things that TCP could not give. The first was 40\,Gb/s for storage traffic without burning CPU: at 40\,Gb/s, TCP
+used over 20\% of all cores just moving data, and in a cloud a core spent on TCP is a core that cannot be sold as a VM. The second was
+latency of a few microseconds for caches and machine learning: a 2\,KB TCP transfer took 25.4\,$\mu$s, versus 1.7\,$\mu$s with RDMA.
+
+With \key{RDMA}, the application registers a memory buffer with the NIC, and the NIC itself moves data directly between that memory and the
+remote machine's memory. The whole transport protocol runs in NIC hardware, so the CPU is almost idle (under 3\% for the RDMA client) and the
+kernel is bypassed. To keep that hardware simple, RDMA's transport assumes \textbf{the network does not drop packets}. Its loss recovery is
+crude (go-back-N, see Section~\ref{sec:dqpractical}), and it falls apart if losses become common.
+
+RDMA traditionally ran on InfiniBand, a separate network technology. Microsoft runs IP and Ethernet, and will not build a second network.
+\key{RoCEv2} keeps InfiniBand's transport layer but carries it in \textbf{UDP/IP over Ethernet}: IP so that packets can be routed, and UDP so
+that switches can spread flows over equal-cost paths (ECMP) by hashing the UDP ports. Ethernet, however, drops packets when buffers fill. To
+make it lossless, RoCEv2 relies on \key{PFC}.
+
+% ------------------------------------------------------------------
+\section{How PFC works, and how it goes wrong}
+
+\subsection{The mechanism}
+Every switch (and NIC) watches its \emph{ingress} queues, which hold packets that came in on a given port. When one grows past a threshold, the
+switch sends a \textbf{PAUSE} frame back on that port to whoever is directly upstream (another switch or a host NIC). The upstream device
+stops transmitting on that link until it receives a RESUME, which is sent when the queue has drained. A switch never drops for lack of buffer,
+because it stops the sender before the buffer runs out. PFC has 8 priority classes, and a PAUSE applies to one class on one link.
+
+The key weakness: \textbf{PAUSE stops a whole link (for one class), not a flow.} Every flow on that link stops, whether or not it is causing
+the congestion. Two experiments on a 3-tier Clos testbed (ToRs T1--T4, leaves L1--L4, spines S1--S2, all 40\,Gb/s) show what that does.
+
+\subsection{Problem 1: unfairness}
+\paperfig[0.42]{dq_fig3_unfair}{PFC unfairness. H1--H4 all send to R, so the link T4$\to$R is the bottleneck. H4's flow enters T4 alone on
+port P2, while H1--H3 share ports P3 and P4 (as ECMP happens to hash them).}
+
+Four hosts send to R, so each should get 10\,Gb/s. T4's buffer fills, and T4 pauses its incoming ports P2, P3 and P4 in turn, so each
+\emph{port} gets roughly an equal share of the time. But P2 carries only H4's flow, while P3 and P4 carry H1, H2 and H3 between them. H4 gets
+a whole port's share to itself, and the other three split the remaining two. Measured: H4 got up to 20\,Gb/s, and H4's \emph{worst} run was better
+than the \emph{best} run of any of H1--H3. PFC divides capacity between ports, not between flows.
+
+\subsection{Problem 2: victim flows (congestion spreading)}
+\paperfig[0.42]{dq_fig4_victim}{The victim-flow problem. H11--H14 (under T1) send to R (under T4). The flow VS$\to$VR shares only T1's uplinks
+with them and is not going to the congested link, yet its throughput collapses.}
+
+H11--H14 all send to R. T4$\to$R is congested, so T4 pauses its incoming links from L3 and L4. Now \emph{their} queues for T4 fill, so they pause
+\emph{their} incoming links from S1 and S2. The spines fill and pause L1 and L2, and L1 and L2 pause T1's uplinks. T1 then has to stop its own
+senders. The pause has climbed back, hop by hop, across the whole network.
+
+The victim flow VS$\to$VR also leaves T1 over those uplinks. It is going somewhere uncongested, but it sits behind the paused packets and
+stops too (head-of-line blocking). It should get 20\,Gb/s; it got 10. When two more senders (H31, H32, under T3) also sent to R, through paths
+sharing \emph{no link at all} with the victim, they lengthened the pauses at L3/L4 and the spines, and the victim fell to 4.5\,Gb/s.
+
+\subsection{Why the obvious fixes do not work}
 \begin{itemize}
-\item Cloud storage needs \key{40\,Gb/s or more}; distributed memory caches and machine learning need \key{under 10\,$\mu$s per hop}.
-\item TCP/IP stacks burn CPU: at 40\,Gb/s with 4\,MB messages, TCP used \key{over 20\% of CPU cycles} across all cores, and at small messages the CPU, not the link, became the bottleneck. In a cloud, \emph{a core spent on TCP is a core that cannot be sold as a VM}.
-\item Latency of a 2\,KB transfer: TCP \key{25.4\,$\mu$s}, RDMA \key{1.7\,$\mu$s} (Read/Write) or 2.8\,$\mu$s (Send). The RDMA client used under 3\% CPU; the RDMA server used almost none.
+  \item \textbf{ECMP} was already on in these experiments, and it did not help.
+  \item \textbf{More PFC priorities}: there are only 8, the experiments can be made worse just by adding senders, and flows inside one class still
+        hit the same problem.
+  \item \textbf{QCN} (an IEEE standard for exactly this) sends congestion feedback from the switch directly to the source, which it identifies by the
+        packet's \emph{Ethernet} addresses. In an IP-routed network the Ethernet header is rewritten at every router hop, so the switch does not know
+        who the source is. Fixing that needs new switch ASICs, which takes months to years.
+  \item \textbf{DCTCP / iWarp / TCP-Bolt} have slow start, which hurts bursty storage traffic, or run in host software (CPU cost), or put a full TCP
+        stack in the NIC (complex, and slow to recover from loss).
 \end{itemize}
+The real fix is \textbf{per-flow congestion control}: slow each flow down \emph{before} the queues get long enough to trigger PFC. PFC then
+stays as a rarely used safety net.
 
-\subsection{What RDMA is}
-\begin{itemize}
-\item With \key{Remote Direct Memory Access}, the \key{NIC} moves data in and out of \key{pre-registered memory buffers} at both hosts. The whole network protocol runs \key{on the NIC}, bypassing the host networking stack. Hence very low CPU use and latency.
-\item To keep the NIC protocol simple, RDMA \key{assumes a lossless network}.
-\item \key{InfiniBand (IB)} is the traditional RDMA network: a custom stack with \key{hop-by-hop, credit-based flow control} at L2 (a sender transmits only when the next hop has granted buffer credits), so packets are never dropped for lack of buffer. IB supports \key{single-sided operations}: a server registers a buffer with its NIC, and clients READ/WRITE it without involving the server's CPU.
-\item IB is incompatible with IP/Ethernet datacenters, and operators will not run two separate networks.
-\end{itemize}
-
-\subsection{RoCE and RoCEv2}
-\begin{center}
-\begin{tabularx}{0.92\linewidth}{@{}lXX@{}}
-\toprule
-\textbf{Layer} & \textbf{InfiniBand} & \textbf{RoCEv2} \\
-\midrule
-L4 transport & IB transport & \key{IB transport (kept)} \\
-L3 network & IB network layer & \key{IP + UDP} (IP for routing, \key{UDP for ECMP} hashing) \\
-L2 link & IB link with credit-based flow control & \key{Ethernet}, made lossless with \key{PFC} \\
-\bottomrule
-\end{tabularx}
-\end{center}
-RoCE was the first standard (Ethernet only); RoCEv2 adds IP/UDP so RDMA can cross \key{L3-routed} datacenter fabrics.
-
-\section{PFC and its problems}
-\subsection{How PFC works}
+% ------------------------------------------------------------------
+\section{What DCQCN had to satisfy}
 \begin{enumerate}
-\item Switches and NICs track their \key{ingress queues}.
-\item When an ingress queue exceeds a threshold, the device sends a \key{PAUSE} frame to the \key{immediate upstream} device (a switch or a host NIC).
-\item The upstream device stops sending \emph{on that link, for that priority}, until it gets a \key{RESUME}.
-\item PFC supports up to \key{8 priority classes}; each PAUSE/RESUME names the class it applies to.
+  \item Work on \textbf{L3-routed, lossless} networks.
+  \item \textbf{Run on the NIC}, with low CPU cost.
+  \item \textbf{Hyper-fast start}: most transfers are small and the network is usually idle, so a new flow should start at full speed, not ramp up
+        slowly.
+  \item Converge quickly to a fair share, keep queues short and stable, and keep links fully used.
+  \item \textbf{No custom switch features}: only what every switch already has (RED and ECN marking).
 \end{enumerate}
-\textbf{Key weakness:} PAUSE is \key{per port (and priority), not per flow}. Every flow sharing that port and class stops, whether or not it caused the congestion.
 
-\subsection{Problem 1: unfairness (the parking-lot problem)}
-\paperfig[0.42]{dq_fig3_unfair}{PFC unfairness: H1--H4 all send to R; T4$\to$R is the bottleneck. H4's port P2 carries one flow, while P3/P4 carry H1--H3 (as ECMP decides). PAUSEs are per port, so H4 gets far more than its 1/4 share.}
-\begin{itemize}
-\item Four senders write to one receiver R; ideally each gets 1/4 of the T4$\to$R link.
-\item T4 pauses its \emph{incoming ports} P2, P3, P4 equally. P2 carries only H4's flow, but P3 and P4 are shared by H1, H2 and H3.
-\item So H4 gets a whole port's share while H1--H3 split the rest: H4 got up to \key{20\,Gb/s}, and H4's \emph{minimum} throughput was higher than the \emph{maximum} of H1--H3.
-\end{itemize}
+% ------------------------------------------------------------------
+\section{The DCQCN control loop}
 
-\subsection{Problem 2: victim flows and congestion spreading (head-of-line blocking)}
-\paperfig[0.42]{dq_fig4_victim}{Victim flow: H11--H14 incast to R under T4; VS$\to$VR shares only T1's uplinks with them, yet its throughput falls from the expected 20\,Gb/s to 10\,Gb/s, and to 4.5\,Gb/s when H31, H32 (under T3) also send to R.}
-\begin{enumerate}
-\item T4 is the incast bottleneck, so it PAUSEs its incoming links.
-\item Their queues fill, so L3 and L4 pause \emph{their} incoming links, and so on upstream.
-\item Eventually L1/L2 pause T1's uplinks, and T1 pauses its senders.
-\item Every flow on those uplinks stops, \key{regardless of destination}. The victim VS$\to$VR is paused although its own path is not congested.
-\end{enumerate}
-Adding H31, H32 (whose paths share \emph{no link} with VS$\to$VR) makes it worse: they compete with H11--H14 at L3/L4, causing longer PAUSEs of S1/S2 and hence of T1.
-
-\subsection{Why the obvious fixes fail}
+DCQCN borrows its marking and its $\alpha$ estimate from DCTCP, and its rate-increase machinery from QCN. It has three roles (names from QCN):
 \begin{center}
-\begin{tabularx}{\linewidth}{@{}lX@{}}
+\begin{tabular}{@{}lll@{}}
 \toprule
-\textbf{Fix} & \textbf{Why it is not enough} \\
+Role & Runs on & Job\\
 \midrule
-ECMP spreading & The experiments above already use ECMP; it does not prevent the problems. \\
-PFC priorities & Only \key{8 classes}; the topologies above can be made arbitrarily worse with more senders, and flows \emph{within} a class still suffer. \\
-\key{QCN} (IEEE L2 standard) & Flows are defined by \key{source/destination MAC + flow id}. In an IP-routed network the \key{Ethernet header is rewritten at every hop}, so a congested switch cannot tell where to send feedback. Extending it to IP needs the 5-tuple and IP/UDP headers on notification packets, i.e.\ \key{new switch ASICs} (months to years). \\
-DCTCP, iWarp & Have \key{slow start} (bad for bursty storage traffic); DCTCP runs in host software (\key{CPU cost}). \\
-TCP-Bolt & Essentially DCTCP without slow start, but still in \key{host software}, and ignores the interplay of PFC and ECN thresholds. \\
-iWarp & Full TCP stack in NIC hardware: complex, lags RoCEv2 (40\,G vs 100\,G NICs), TCP-style end-to-end loss recovery prevents ultra-low latency, incast problems. \\
-\bottomrule
-\end{tabularx}
-\end{center}
-\textbf{The fundamental fix:} \key{flow-level congestion control}. If each flow is slowed down before queues build, \key{PFC is rarely triggered}, and its side effects disappear.
-
-\subsection{QCN in brief (what DCQCN borrows)}
-In QCN, a switch computes a \key{congestion metric} on each packet arrival from the difference between the instantaneous and the desired equilibrium queue size. With a probability that grows with congestion, it sends a \key{quantized} value of that metric back to the \emph{source} of the packet. The source reduces its rate on feedback. Since there is \emph{no} feedback when there is no congestion, the source \key{increases its rate using its own timers and byte counters}.
-
-\section{Requirements}
-\begin{enumerate}
-\item Work over \key{lossless, L3-routed} datacenter networks.
-\item \key{Low CPU} overhead on hosts (so: run in the NIC).
-\item \key{Hyper-fast start} in the common case of no congestion (so: no slow start).
-\end{enumerate}
-Also: fast convergence to fairness, no oscillation around the stable point, low queues, high utilization. Practical constraints: \key{no custom switch functionality}, and a design simple enough for NIC hardware.
-
-\section{The DCQCN algorithm}
-DCQCN is a \key{rate-based, end-to-end} protocol built from \key{QCN} (rate increase machinery) and \key{DCTCP} (ECN marking and the $\alpha$ estimate). It has three roles, named as in QCN:
-\begin{center}
-\begin{tabular}{@{}llll@{}}
-\toprule
-\textbf{Role} & \textbf{QCN name} & \textbf{Where} & \textbf{Job} \\
-\midrule
-Switch & \key{Congestion Point (CP)} & switch egress queue & ECN-mark packets (RED) \\
-Receiver & \key{Notification Point (NP)} & receiver NIC & turn marks into CNPs \\
-Sender & \key{Reaction Point (RP)} & sender NIC & cut and recover the sending rate \\
+\key{Congestion Point (CP)} & switch egress queue & ECN-mark packets when the queue is long\\
+\key{Notification Point (NP)} & receiver NIC & turn ECN marks into CNPs back to the sender\\
+\key{Reaction Point (RP)} & sender NIC & cut the sending rate on a CNP, re-grow it otherwise\\
 \bottomrule
 \end{tabular}
 \end{center}
 
-\subsection{CP: RED/ECN marking at the switch}
-\paperfig[0.36]{dq_fig5_red}{Switch marking: probability 0 below $K_{min}$, rising linearly to $P_{max}$ at $K_{max}$, and 1 above $K_{max}$.}
-On arrival at an egress queue of length $q$, a packet is ECN-marked with probability
-\[ p(q) = \begin{cases} 0 & q \le K_{min} \\[2pt] \dfrac{q-K_{min}}{K_{max}-K_{min}}\,P_{max} & K_{min} < q \le K_{max} \\[6pt] 1 & q > K_{max} \end{cases} \]
-This is ordinary \key{RED} supported by every modern switch. Setting $K_{min}=K_{max}=K$ and $P_{max}=1$ gives DCTCP's ``cut-off'' marking, but we will see that a \emph{probabilistic} setting is better for DCQCN.
+\textbf{One congestion event, end to end:}
+\begin{enumerate}
+  \item A flow is sending at line rate. Others join, and the queue at a switch port starts to grow.
+  \item \textbf{CP:} the switch starts ECN-marking packets leaving that queue (more marks the longer the queue).
+  \item \textbf{NP:} the receiver's NIC sees a marked packet and sends a CNP to the sender, at most one per 50\,$\mu$s for that flow.
+  \item \textbf{RP:} the sender's NIC receives the CNP and cuts the flow's rate. How hard it cuts depends on how much congestion it has
+        seen recently ($\alpha$).
+  \item The queue drains. No more marks, no more CNPs.
+  \item \textbf{RP:} with no CNPs arriving, the sender raises its rate in steps driven by a timer and a byte counter: first quickly back towards
+        the old rate, then slowly probing above it.
+  \item If the queue builds again, marks resume and the cycle repeats.
+\end{enumerate}
+The rest of this section explains each step.
 
-\subsection{NP: generating CNPs at the receiver}
-\paperfig[0.33]{dq_fig6_np}{NP state machine (per flow): send a CNP immediately on the first marked packet, then at most one CNP per 50\,$\mu$s while marked packets keep arriving.}
+\subsection{Step 1: the switch marks (CP)}
+\paperfig[0.36]{dq_fig5_red}{The switch's marking curve: no marking below $K_{min}$, probability rising linearly to $P_{max}$ at $K_{max}$,
+everything marked above $K_{max}$.}
+When a packet leaves an egress queue of length $q$, the switch ECN-marks it with probability
+\[
+  p(q)=\begin{cases}0 & q\le K_{min}\\[2pt] \dfrac{q-K_{min}}{K_{max}-K_{min}}\,P_{max} & K_{min}<q\le K_{max}\\[6pt] 1 & q>K_{max}\end{cases}
+\]
+This is plain RED, which every switch supports. DCTCP uses a ``cliff'' ($K_{min}=K_{max}=K$, $P_{max}=1$: mark everything above $K$).
+DCQCN ends up using a long, gentle slope instead ($K_{min}$ = 5\,KB, $K_{max}$ = 200\,KB, $P_{max}$ = 1\%). Section~\ref{sec:dqparams}
+explains why that matters.
+
+\subsection{Step 2: the receiver sends CNPs (NP)}
+\paperfig[0.33]{dq_fig6_np}{The NP state machine, per flow: send a CNP immediately for the first marked packet, then at most one CNP every
+50\,$\mu$s, as long as some packet in that window was marked.}
+DCTCP echoes every mark back in an ACK. DCQCN cannot afford that: handling marked packets and building CNPs is expensive work for the NIC.
+So the receiver NIC rate-limits its feedback per flow:
 \begin{itemize}
-\item RoCEv2 defines explicit \key{Congestion Notification Packets (CNPs)}; the NP decides when to send them.
-\item Per flow: if a marked packet arrives and no CNP was sent for that flow in the last $N$ microseconds, send a CNP \key{immediately}. After that, send \key{at most one CNP every $N$\,$\mu$s} if any packet in that window was marked. Deployment uses \key{$N=50\,\mu$s}.
-\item Why so coarse: processing marked packets and generating CNPs are expensive NIC operations, so the work per marked packet is minimised. Consequence: feedback is \emph{timer-driven} (at most one CNP per 50\,$\mu$s), not one per marked packet.
-\item No congestion $\Rightarrow$ no marks $\Rightarrow$ \key{no CNPs at all}.
+  \item a marked packet arrives and no CNP has gone to this flow in the last 50\,$\mu$s: send a CNP \textbf{now};
+  \item after that, send \textbf{at most one CNP per 50\,$\mu$s}, and only if at least one packet in that window was marked.
 \end{itemize}
+A CNP therefore carries one bit of information: ``you were marked at least once in the last 50\,$\mu$s''. It says nothing about how
+\emph{many} packets were marked. If there is no congestion, there are no marks and no CNPs at all. CNPs are sent at high priority, so they are
+not stuck behind the congestion they report.
 
-\subsection{RP: rate control at the sender}
-\paperfig[0.62]{dq_fig7_rp}{RP state machine. A CNP cuts the rate and resets everything; timer and byte-counter expiries drive the increase phases; a separate alpha timer decays $\alpha$.}
-The RP keeps, per flow: current rate $R_C$, target rate $R_T$, the estimate $\alpha$ (initially \key{1}), a \key{timer}, a \key{byte counter}, the counts $T$ (timer expiries) and $BC$ (byte-counter expiries), and an \key{alpha timer}.
+\subsection{Step 3: the sender cuts its rate (RP)}
+\paperfig[0.62]{dq_fig7_rp}{The RP state machine. A CNP cuts the rate and resets all counters. Expiries of the rate timer and the byte counter
+drive the increase phases. A separate alpha timer decays $\alpha$.}
 
-\textbf{On receiving a CNP (rate decrease):}
-\[ R_T \leftarrow R_C, \qquad R_C \leftarrow R_C\left(1-\frac{\alpha}{2}\right), \qquad \alpha \leftarrow (1-g)\,\alpha + g \]
+For each flow it is rate-limiting, the sender NIC keeps a \textbf{current rate} $R_C$ (what it sends at), a \textbf{target rate} $R_T$ (the rate it
+is trying to get back to), and \textbf{$\alpha$}, an estimate of how congested the flow has recently been, starting at 1. On a CNP:
+\[
+  R_T \leftarrow R_C,\qquad R_C \leftarrow R_C\Big(1-\frac{\alpha}{2}\Big),\qquad \alpha \leftarrow (1-g)\,\alpha + g
+\]
+In words:
 \begin{itemize}
-\item Remember the current rate as the \key{target} to recover towards later.
-\item Cut the rate by $\alpha/2$, exactly like DCTCP cuts its window.
-\item Push $\alpha$ \emph{up} (a CNP is a ``marked'' sample, $F=1$ in DCTCP's terms).
-\item Reset the timer, byte counter, $T$, $BC$ and the alpha timer.
+  \item \textbf{Remember where we were} ($R_T$), so we know what to climb back towards.
+  \item \textbf{Cut by $\alpha/2$.} If $\alpha$ is near 1 (CNPs keep coming), the rate is halved. If $\alpha$ is small (this is a rare CNP), the cut
+        is gentle. This is exactly DCTCP's idea: cut in proportion to how persistent the congestion is.
+  \item \textbf{Raise $\alpha$} a little, because we just saw congestion. $g$ is the averaging weight; the deployed value is $1/256$.
 \end{itemize}
+It also resets the increase counters (below). Separately, every 55\,$\mu$s in which \emph{no} CNP arrives, $\alpha$ decays:
+$\alpha \leftarrow (1-g)\alpha$. That interval must be longer than the 50\,$\mu$s CNP interval. Otherwise $\alpha$ would decay in the gap between two
+CNPs of a flow that is in fact still congested.
 
-\textbf{If no CNP arrives for $K$ time units (alpha timer, $K=55\,\mu$s):}
-\[ \alpha \leftarrow (1-g)\,\alpha \]
-$K$ must be \key{larger than the CNP interval} (50\,$\mu$s), otherwise $\alpha$ would decay between two CNPs of a flow that is still congested.
-
-\textbf{Rate increase (identical to QCN):} two independent triggers.
+\subsection{Step 4: the sender re-grows its rate (RP)}
+Because silence means ``no congestion'', the sender has to decide by itself when to speed up. It has two triggers, both from QCN:
 \begin{itemize}
-\item \key{Byte counter}: expires every $B$ bytes sent, then $BC\!+\!+$.
-\item \key{Timer}: expires every $T$ time units, then $T\!+\!+$. The timer lets a flow recover even when its rate is so low that the byte counter would take ages.
+  \item a \textbf{timer} that fires every $T$ (deployed: 55\,$\mu$s), and
+  \item a \textbf{byte counter} that fires every $B$ bytes sent (deployed: 10\,MB).
 \end{itemize}
-Each expiry runs one increase step; which step depends on $T$ and $BC$ compared with $F=5$:
+The timer matters when the rate is very low: a flow cut to a trickle would take ages to send $B$ bytes, so the byte counter alone would
+leave it stuck. Each firing performs one increase step. The NIC counts how many times each trigger has fired since the last CNP (counts $T$ and $BC$),
+and the counts decide which kind of step is taken, with $F = 5$:
 \begin{center}
-\begin{tabularx}{\linewidth}{@{}lll X@{}}
+\begin{tabularx}{\linewidth}{@{}lllX@{}}
 \toprule
-\textbf{Phase} & \textbf{Condition} & \textbf{Update} & \textbf{Meaning} \\
+Phase & When & Update & Purpose\\
 \midrule
-\key{Fast recovery} & $\max(T,BC) < F$ & $R_C \leftarrow (R_T + R_C)/2$ & Jump halfway back to the rate before the cut; 5 steps recover most of it \\
-\key{Additive increase} & $\max \ge F$, $\min \le F$ &$R_T \leftarrow R_T + R_{AI}$; $R_C \leftarrow (R_T + R_C)/2$ & Probe gently above the old rate ($R_{AI}=40$\,Mb/s) \\
-\key{Hyper increase} & $\min(T,BC) > F$ & target grows in larger steps (QCN) & Both triggers report a long quiet period: ramp up fast \\
+\key{Fast recovery} & both counts $< 5$ & $R_C \leftarrow (R_T+R_C)/2$ & close half the gap back to the rate before the cut, each step\\
+\key{Additive increase} & one count $\ge 5$ & $R_T \leftarrow R_T + R_{AI}$, then $R_C \leftarrow (R_T+R_C)/2$ & probe gently above the old rate ($R_{AI}=40$\,Mb/s)\\
+\key{Hyper increase} & both counts $> 5$ & larger target steps (as in QCN) & a long quiet period: ramp up fast\\
 \bottomrule
 \end{tabularx}
 \end{center}
 
-\textbf{No slow start.} A new flow starts at \key{full line rate} (or the local QoS rate if the host has other active flows). Most transfers are small and the network is usually uncongested, so this optimises the common case.
-
-\subsection{Worked example: one cut and the recovery}
-Flow at $R_C = 20$\,Gb/s with $\alpha = 0.5$ and $g = 1/256$. A CNP arrives, then no more CNPs.
+\textbf{Worked example.} A flow is at $R_C = 20$\,Gb/s with $\alpha = 0.5$ ($g = 1/256$). One CNP arrives, then no more.
 \begin{center}
 \small
 \begin{tabular}{@{}llccc@{}}
 \toprule
-\textbf{Event} & \textbf{Rule} & $R_T$ & $R_C$ (Gb/s) & $\alpha$ \\
+Event & What happens & $R_T$ & $R_C$ (Gb/s) & $\alpha$\\
 \midrule
-CNP arrives & $R_T{=}R_C$; $R_C{\times}(1-0.5/2)$; $\alpha{=}(255/256)0.5{+}1/256$ & 20 & 15 & $\approx 0.502$ \\
-Increase 1 & fast recovery: $(20+15)/2$ & 20 & 17.5 & \\
-Increase 2 & fast recovery & 20 & 18.75 & \\
-Increase 3 & fast recovery & 20 & 19.375 & \\
-Increase 4 & fast recovery & 20 & 19.69 & \\
-Increase 5 & fast recovery & 20 & 19.84 & \\
-Increase 6 & additive: $R_T{+}0.04$, then average & 20.04 & 19.94 & \\
-Every 55\,$\mu$s & no CNP: $\alpha \leftarrow (255/256)\alpha$ & & & decays slowly \\
+CNP & $R_T{=}20$; $R_C = 20(1-0.25)$; $\alpha$ nudged up & 20 & 15 & 0.502\\
+increase 1 & fast recovery: $(20+15)/2$ & 20 & 17.5 & \\
+increase 2 & fast recovery & 20 & 18.75 & \\
+increase 3 & fast recovery & 20 & 19.38 & \\
+increase 4 & fast recovery & 20 & 19.69 & \\
+increase 5 & fast recovery & 20 & 19.84 & \\
+increase 6 & additive: $R_T$ up 0.04, then average & 20.04 & 19.94 & \\
+every 55\,$\mu$s & no CNP: $\alpha$ decays & & & slowly falls\\
 \bottomrule
 \end{tabular}
 \end{center}
-\textbf{Read it as:} a gentle cut proportional to how congested the flow has been ($\alpha$), a fast halving of the gap back to the old rate, then slow probing above it.
+The shape is: a cut sized by recent congestion, a quick return to just below the old rate, then a slow climb above it. If the climb
+causes a queue again, a CNP arrives and the cycle repeats around the fair rate.
 
-\subsection{Why each design choice}
+\subsection{No slow start}
+A new flow starts at \textbf{full line rate} (or at the local QoS rate if the host already has active flows). Most transfers are small and the network
+is usually idle, so this makes the common case as fast as possible. It is also why \textbf{PFC is still needed}: a burst of line-rate starts can
+overflow a buffer before any CNP has had time to arrive, and PFC catches that.
+
+\subsection{Why a rate and not a window, and the hardware cost}
+A window-based design (like TCP) needs per-ACK bookkeeping. A rate is easier to enforce in hardware: the NIC already has rate limiters that pace
+every packet, so DCQCN only adjusts their settings. Because the rate does not depend on measuring RTTs, DCQCN is not confused by congestion
+on the reverse path. Per rate-limited flow, the NIC keeps one timer, one counter, $\alpha$ and a few rates, all on the NIC chip. The ConnectX-3
+Pro can build one CNP every 1--5\,$\mu$s. At 40\,Gb/s about 166 full-size packets arrive per 50\,$\mu$s, so it can serve CNPs for 10--20
+congested flows at once (ConnectX-4: over 200).
+
+% ------------------------------------------------------------------
+\section{Switch buffer settings: making ECN act before PFC}
+
+DCQCN only helps if switches mark packets (and senders slow down) \emph{before} PFC pauses anything. If PFC fires first, all the
+unfairness and spreading come back. There are three thresholds on the switch (Arista 7050QX32: 32 ports of 40\,Gb/s, a 12\,MB buffer shared by all
+ports, 8 priorities):
 \begin{itemize}
-\item \key{Rate-based, not window-based}: simpler to implement in the NIC and gives finer control; the NIC has \key{hardware rate limiters} that pace per packet.
-\item \key{CNPs sent at high priority}: so they are not delayed and convergence is fast. DCQCN is \key{insensitive to reverse-path congestion} anyway, because it does not depend on accurate RTT estimates (unlike TIMELY).
-\item \key{Not QCN, not DCTCP}: unlike QCN there is \key{no quantized feedback} (a CNP only says ``congested''); unlike DCTCP there is \key{no per-ACK feedback} (one CNP per 50\,$\mu$s at most). So their recommended parameters cannot be reused blindly.
-\item \key{PFC is still needed}: flows start at line rate, so without PFC the first bursts would cause losses. DCQCN makes PFC \emph{rare}, not unnecessary.
+  \item \textbf{Headroom $t_{flight}$.} After a switch sends PAUSE, packets keep arriving for a while: those already on the wire, plus whatever the
+        upstream device sends before it processes the PAUSE (it cannot stop in the middle of a packet). Buffer must be reserved for them on every
+        port and priority, or they would be dropped. With a 1500-byte MTU this comes to \textbf{22.4\,KB} per port per priority.
+  \item \textbf{PFC threshold $t_{PFC}$}, on an \emph{ingress} queue: PAUSE is sent when the queue exceeds it. Whatever is left after the headroom,
+        divided over all ports and priorities, gives at most \textbf{24.47\,KB}. RESUME is sent when the queue falls two MTUs below it.
+  \item \textbf{ECN threshold $t_{ECN}$} ($= K_{min}$), on an \emph{egress} queue: marking starts above it.
 \end{itemize}
 
-\subsection{Hardware implementation}
-\begin{itemize}
-\item NP and RP state machines run \key{on the NIC} (Mellanox ConnectX-3 Pro).
-\item RP state per rate-limited flow: \key{one timer, one counter}, $\alpha$ and a little more, kept \key{on the NIC die}. Rate limiting is at \key{per-packet granularity}.
-\item CNP generation capacity: ConnectX-3 Pro makes one CNP every 1--5\,$\mu$s. At 40\,Gb/s the receiver gets about \key{166 full-size packets per 50\,$\mu$s}, so it can serve \key{10--20 congested flows}; ConnectX-4 handles over 200.
-\end{itemize}
+\textbf{The catch: PFC watches ingress queues, ECN watches egress queues.} Worst case: everything waiting in the switch's 32 egress queues
+arrived through \emph{one} ingress port. That ingress queue then holds the sum of all of them. For ECN to start on at least one egress queue
+before this one ingress queue reaches $t_{PFC}$, we need $32 \times t_{ECN} < t_{PFC}$, which forces $t_{ECN}$ below one kilobyte (the paper
+gets 0.85\,KB). That is smaller than a single packet, so it is impossible.
 
-\section{Switch buffer settings: ECN must fire before PFC}
-Two conflicting requirements:
-\begin{enumerate}
-\item PFC must \key{not fire too early}, i.e.\ before ECN has had a chance to slow senders.
-\item PFC must \key{not fire too late}, or buffers overflow and packets drop.
-\end{enumerate}
-Calculations are for an Arista 7050QX32 (Broadcom Trident II): \key{32 ports} of 40\,Gb/s, \key{12\,MB shared buffer}, \key{8 PFC priorities}.
+\textbf{The fix: a dynamic PFC threshold.} The buffer is shared, so a fixed per-queue limit wastes it. When most of the buffer is empty,
+there is no hurry to pause anyone. The switch chip (Broadcom Trident II) can set the PFC threshold from the buffer that is currently free:
+\[
+  t_{PFC} = \frac{\beta\,(B - 8n\,t_{flight} - s)}{8}
+\]
+where $s$ is the buffer currently occupied. When the buffer is nearly empty, the threshold is large, and it shrinks as the buffer fills. Just before
+ECN fires anywhere, the occupancy is at most $s \le n\,t_{ECN}$. Substituting that, and requiring ECN to come first, gives the paper's condition
+\[
+  t_{ECN} < \frac{\beta\,(B - 8n\,t_{flight})}{8n(\beta+1)},
+\]
+which with $\beta = 8$ gives $t_{ECN} < $ \textbf{21.75\,KB}, comfortably more than one packet. A larger $\beta$ leaves more room for $t_{ECN}$
+and makes PFC fire less often.
 
+This is a worst-case analysis (all 8 priorities in use). It does not promise that PFC never fires, only that at each switch \textbf{PFC never fires
+before ECN}. Between the first mark and the sender's reaction, PFC may still pause briefly, and that is the job it is kept for.
+
+% ------------------------------------------------------------------
+\section{Choosing the parameters: why the obvious settings fail}\label{sec:dqparams}
+
+The authors wrote a \key{fluid model}: differential equations for the queue, $\alpha$, $R_T$ and $R_C$ of $N$ flows sharing one bottleneck of capacity
+$C$, with a 50\,$\mu$s feedback delay. Its equilibrium is $R_C = C/N$ (everyone gets a fair share), with a marking probability below 1\%, so the
+queue settles just above $K_{min}$. The model matched the real NIC's behaviour closely, so they used it to test parameter choices. The test:
+\textbf{one flow is at 40\,Gb/s and a second starts at 0. Do they converge to 20 and 20?}
+
+\subsection{First try: QCN's and DCTCP's own defaults, and why they fail}
+Byte counter $B = 150$\,KB, timer $T = 1.5$\,ms, DCTCP cliff marking at 40\,KB, $g = 1/16$. \textbf{The flows never converge.}
+
+The reason is the byte counter. With $T = 1.5$\,ms the timer hardly ever fires, so increases are driven by bytes sent, and a faster flow sends
+bytes faster:
 \begin{center}
-\begin{tabularx}{\linewidth}{@{}l l X@{}}
+\begin{tabular}{@{}lll@{}}
 \toprule
-\textbf{Threshold} & \textbf{Applies to} & \textbf{Meaning and value} \\
+Flow & Time to send 150\,KB & Increase steps per ms\\
 \midrule
-$t_{flight}$ (headroom) & per ingress port, per priority & Buffer reserved for packets that keep arriving after PAUSE is sent: those already in flight plus those the upstream sends while processing the PAUSE (it cannot abort a packet already being sent). With 1500\,B MTU: \key{22.4\,KB}. \\
-$t_{PFC}$ & \key{ingress} queue & Queue size at which PAUSE is sent. Static bound: $t_{PFC} \le (B - 8n\,t_{flight})/(8n) = $ \key{24.47\,KB}. RESUME is sent when the queue falls \key{two MTUs} below $t_{PFC}$. \\
-$t_{ECN}$ ($=K_{min}$) & \key{egress} queue & Queue size at which ECN marking starts. \\
+fast flow, 30\,Gb/s & 40\,$\mu$s & 25\\
+slow flow, 10\,Gb/s & 120\,$\mu$s & about 8\\
 \bottomrule
-\end{tabularx}
+\end{tabular}
 \end{center}
+The fast flow climbs three times as often, so it grabs back whatever it gives up and the gap never closes. QCN gets away with this because its
+feedback is probabilistic per packet; DCQCN's timer-driven CNPs are not.
 
-\textbf{The catch: ECN is per egress queue, PFC is per ingress queue.} Worst case: the packets waiting on \emph{all} $n$ egress queues came in through \emph{one} ingress queue. To be sure ECN fires on some egress before PFC fires on that ingress:
-\[ t_{PFC} > n \cdot t_{ECN} \;\Rightarrow\; t_{ECN} < \frac{24.47\text{ KB}}{32} \approx 0.85\text{ KB} \]
-Less than one MTU, so \key{impossible with a static PFC threshold}.
+\subsection{Fix 1: let the timer drive the increase}
+Make the timer fast, $T = 55$\,$\mu$s, so that both flows get an increase step every 55\,$\mu$s regardless of their rate. Then make the byte
+counter large (10\,MB, which takes 2.7\,ms even at 30\,Gb/s), so it rarely fires and does not push flows into hyper increase too early.
+Now both flows get the \emph{same} increases and proportional cuts. The faster flow loses more in absolute terms on each cut and gains the same,
+so the gap shrinks. The timer cannot be shorter than the 50\,$\mu$s CNP interval, or a flow would increase between two CNPs it is still
+receiving. Hence 55\,$\mu$s: 50 plus a 5\,$\mu$s margin.
 
-\textbf{The fix: a dynamic PFC threshold.} The buffer is shared, so when most of it is free we can wait longer before pausing. Trident II supports
-\[ t_{PFC} = \frac{\beta\,(B - 8n\,t_{flight} - s)}{8} \]
-where $s$ is the buffer currently occupied. Larger $\beta$ = PFC fires less often. Just before ECN fires anywhere, $s \le n\cdot t_{ECN}$. Requiring ECN first gives
-\[ t_{ECN} < \frac{\beta\,(B - 8n\,t_{flight})}{8n(\beta+1)} \]
-With \key{$\beta = 8$}: \key{$t_{ECN} < 21.75$\,KB} (that is $\tfrac{8}{9}$ of the 24.47\,KB static bound). Larger $\beta$ leaves more room for $t_{ECN}$.
+\subsection{Fix 2: let bigger flows hear about congestion more often}
+With cliff marking, once the queue is above $K$ \emph{every} packet is marked, so every flow gets a CNP every 50\,$\mu$s, big or small. The
+feedback does not discriminate. With a gentle RED slope and a small $P_{max}$, a packet is marked only occasionally (say $p = 0.5\%$). A flow
+then gets a CNP in a given 50\,$\mu$s window only if \emph{at least one} of its packets in that window was marked, and a bigger flow has more
+packets in the window:
+\begin{center}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Flow & 1500\,B packets per 50\,$\mu$s & P(some packet marked) $= 1-(1-0.005)^{n}$ & CNPs\\
+\midrule
+30\,Gb/s & 125 & $1 - 0.995^{125} \approx 0.47$ & in about half the windows\\
+10\,Gb/s & 42 & $1 - 0.995^{42} \approx 0.19$ & in about 1 window in 5\\
+\bottomrule
+\end{tabular}
+\end{center}
+(The 0.5\% is illustrative; the paper only states that $p < 1\%$ at equilibrium.) The big flow is cut about 2.5 times as often, so it
+backs off faster, which pushes the flows together. The deployed setting uses \textbf{both} fixes. Probabilistic marking alone made throughput
+jumpy in the testbed, but the combination worked best, especially with multiple bottlenecks.
 
+\subsection{The remaining knobs}
 \begin{itemize}
-\item The analysis is \key{conservative} (worst case, all 8 priorities in use); fewer priorities or bigger buffers give different values.
-\item It does \key{not} guarantee PFC never fires. It only guarantees that at each switch \key{PFC does not fire before ECN}. Senders need time to react to CNPs, and PFC may fire in that time; that is how line-rate starts are kept lossless.
+  \item \textbf{$g$}: smaller $g$ makes $\alpha$ change more slowly, which gave lower and steadier queues in 2:1 to 16:1 incast, at the price of slightly
+        slower convergence. Chosen: $1/256$.
+  \item \textbf{$K_{min} = 5$\,KB} looks very shallow, but the marking probability just above it is tiny, so the queue actually settles about ten times
+        higher, which is enough to keep the link 100\% busy. DCTCP needs a deep threshold (around 160\,KB at 40\,Gb/s) because software sending is bursty;
+        DCQCN's hardware pacing is smooth, so a shallow queue works. In a 20:1 incast, the 95th-percentile queue was 76.6\,KB for DCQCN against
+        162.9\,KB for DCTCP.
+  \item \textbf{$R_{AI}$ and $F$} trade convergence speed against oscillation. With the chosen values there is no buffer starvation at 16:1 incast;
+        halving $R_{AI}$ would handle 32:1 but converge more slowly.
 \end{itemize}
-
-\section{Fluid model and parameter selection}
-\subsection{The model}
-$N$ greedy flows share one bottleneck of capacity $C$; PFC is ignored (DCQCN is assumed to act first). Main variables: $R_C$, $R_T$, $\alpha$, queue $q$, marking probability $p$. Key equations:
-\begin{itemize}
-\item Marking probability $p(t)$: the RED curve above, as a function of $q(t)$.
-\item Queue: $\dfrac{dq}{dt} = N\,R_C(t) - C$ (all flows at equal rate).
-\item $\alpha$: $\dfrac{d\alpha}{dt} = \dfrac{g}{\tau'}\Big[\big(1-(1-p(t-\tau^*))^{\tau' R_C(t-\tau^*)}\big) - \alpha(t)\Big]$, i.e.\ $\alpha$ moves towards the probability that at least one packet in an interval $\tau'$ was marked.
-\item $R_T$ and $R_C$: one term for the cut on CNPs, and one term each for the increases driven by the \key{byte counter} and by the \key{timer} (hyper increase is ignored).
-\item $\tau^*$ is the control-loop delay (RTT plus CNP interval), taken as \key{50\,$\mu$s}; $\tau'$ is the $\alpha$ update interval.
-\end{itemize}
-\textbf{Fixed point:} setting the derivatives to zero gives a unique solution with
-\[ R_C = \frac{C}{N} \]
-(every flow at its fair share). Solving numerically, the marking probability there is \key{below 1\%}, so the queue settles \key{close to $K_{min}$}. For two flows with different rates, each flow gets its own $\alpha$, $R_T$, $R_C$ equations, coupled through the queue: $dq/dt = R_{C1} + R_{C2} - C$.
-
-\subsection{From strawman to final parameters}
-Test: two flows, one starting at 40\,Gb/s and one at 0; do they converge to 20/20?
-\begin{enumerate}
-\item \textbf{Strawman (QCN/DCTCP defaults):} $B=150$\,KB, $T=1.5$\,ms, $K_{min}=K_{max}=40$\,KB, $P_{max}=1$, $g=1/16$. \key{Does not converge.} The \key{byte counter dominates} the increase, and a faster flow sends more bytes, so it gets \emph{more} increase steps and grows faster. QCN avoids this with probabilistic feedback, which DCQCN lacks.
-\item \textbf{Fix 1, timer-dominated increase:} slowing the byte counter helps but makes convergence slow; \key{speeding up the timer} is better (increase steps become rate-independent). The timer cannot be below the 50\,$\mu$s CNP interval. Set the \key{byte counter large (10\,MB)} so hyper increase is not triggered too early.
-\item \textbf{Fix 2, RED-like probabilistic marking with small $P_{max}$:} CNPs are \emph{timer-driven} (at most one per 50\,$\mu$s per flow). With cut-off marking, once the queue exceeds $K$ \emph{every} flow gets a CNP every 50\,$\mu$s, whatever its rate. With probabilistic marking, a flow sending more packets is \key{more likely to have a marked packet in each window}, so the \key{bigger flow gets more CNPs and backs off faster}.
-\item \textbf{$g$:} smaller $g$ gives \key{lower and steadier queues} (tested 2:1 to 16:1 incast) at the price of slightly slower convergence.
-\end{enumerate}
 
 \begin{center}
 \begin{tabularx}{\linewidth}{@{}llX@{}}
 \toprule
-\textbf{Parameter} & \textbf{Deployed value} & \textbf{Why} \\
+Parameter & Deployed & Reason\\
 \midrule
-Rate-increase timer & \key{55\,$\mu$s} & Fast, rate-independent increase; just above the 50\,$\mu$s CNP interval \\
-Byte counter & \key{10\,MB} & Large, so the timer dominates and hyper increase starts late \\
-$K_{max}$ & \key{200\,KB} & Wide RED slope \\
-$K_{min}$ & \key{5\,KB} & Enough for 100\% throughput; stable queue is about 10$\times$ larger \\
-$P_{max}$ & \key{1\%} & Probabilistic marking: bigger flows get more CNPs \\
-$g$ & \key{1/256} & Low, stable queue \\
-$\alpha$ update interval $\tau'$ & 55\,$\mu$s & Must exceed the CNP interval; insensitive (110\,$\mu$s barely matters) \\
-$F$, $R_{AI}$ & 5, 40\,Mb/s & Trade convergence speed against oscillation; no buffer starvation at 16:1 incast (halving $R_{AI}$ handles 32:1 but converges slower) \\
+rate-increase timer & 55\,$\mu$s & increase independent of rate; just above the CNP interval\\
+byte counter & 10\,MB & keep it from dominating the increase or triggering hyper increase early\\
+$K_{min}$ / $K_{max}$ / $P_{max}$ & 5\,KB / 200\,KB / 1\% & long gentle slope, so bigger flows get more CNPs\\
+$g$ & 1/256 & low, steady queues\\
+$\alpha$ decay interval & 55\,$\mu$s & longer than the CNP interval\\
+$F$, $R_{AI}$ & 5, 40\,Mb/s & convergence speed vs oscillation\\
 \bottomrule
 \end{tabularx}
 \end{center}
-\textbf{Note:} the timer and $\tau'$ are set 5\,$\mu$s above the CNP interval so that a flow does not increase its rate in the gap between two CNPs it is still receiving. If the feedback delay differs a lot (e.g.\ larger RTTs), the values must change.
 
-\textbf{Why DCQCN can keep a shallower queue than DCTCP:} DCTCP needs a large ECN threshold (160\,KB at 40\,G) to absorb the bursts created by the OS/NIC interaction (segmentation offload). DCQCN paces with \key{hardware rate limiters}, so its bursts are small and $K_{min}$ can be shallow. In a 20:1 incast the 95th-percentile queue was 76.6\,KB (DCQCN) vs 162.9\,KB (DCTCP).
+With these settings, 1 to 19 senders into one receiver always kept total throughput above 39\,Gb/s with the switch queue under 100\,KB. Back in the
+two experiments: the four senders split the bottleneck equally, and the victim flow kept its throughput as senders were added. In a storage
+benchmark with incast, the spine switches received about 3000 PAUSE messages instead of over 6 million.
 
-\section{Practical issues}
+% ------------------------------------------------------------------
+\section{Practical issues}\label{sec:dqpractical}
 \begin{itemize}
-\item \key{Multiple bottlenecks (parking lot)}: a flow crossing two congested links gets congestion signals from both, so it gets less than its max-min fair share. Cut-off marking has this problem; RED-like marking with small $P_{max}$ \key{mitigates but does not solve} it (same reason as above: faster flows collect more CNPs).
-\item \key{Packet loss}: PFC prevents \emph{overflow} drops, but corruption, flaky ports and misconfiguration still drop packets. RoCEv2 assumes loss is rare: with RDMA READ the data sender learns nothing about delivery; the \key{receiver} detects a gap in sequence numbers and starts recovery. ConnectX-3 Pro uses simple \key{go-back-N}, adequate while loss stays low; throughput falls fast above about \key{0.1\%} loss, and larger messages suffer more (most messages here are under 4\,MB).
-\item \key{Deadlock}: PAUSE can deadlock if flows form a \key{cyclic dependency on each other's buffers}. In a Clos network servers attach only to ToRs, and traffic never passes through another server or more than two ToRs, so no cycle can form unless equipment malfunctions or is misconfigured (e.g.\ a NIC spewing PAUSEs).
-\item \key{TCP friendliness} was not a goal: TCP and DCQCN traffic are separated with \key{802.3 priority tags}, each with its own priority, buffer limits and rate limits.
-\item \key{Incremental deployment} is not a concern inside one operator's datacenter.
+  \item \textbf{Multiple bottlenecks.} A flow crossing two congested links gets CNPs caused by both, so it ends up below its fair share. Probabilistic
+        marking reduces this effect but does not remove it.
+  \item \textbf{Packet loss still happens}, from corruption, bad cables and misconfiguration; PFC only prevents overflow drops. RoCEv2 recovers with
+        go-back-N: the receiver spots a gap in sequence numbers, and everything from the lost packet onward is resent. That works only while loss stays
+        rare, and throughput falls sharply above about 0.1\% loss.
+  \item \textbf{Deadlock.} PAUSEs can deadlock if buffers wait on each other in a cycle. In a Clos datacenter, traffic never goes through a server or
+        more than two ToRs, so no cycle can form unless something is broken or misconfigured.
+  \item \textbf{Coexisting with TCP} is handled by giving RDMA and TCP different priority classes, each with its own buffers and limits. TCP-friendliness
+        was not a goal.
 \end{itemize}
 
-\begin{keybox}[The big idea: responsiveness vs.\ stability]
-Congestion control has always traded \emph{responsiveness} against \emph{stability}. DCQCN combines a \key{blunt but fast} mechanism (PFC, which stops loss \emph{just in time}) with a \key{fine-grained but slower} one (end-to-end rate control, which keeps PFC from firing persistently). The pair is responsive in the short term and stable in the long term.
+\begin{keybox}[The big idea]
+Congestion control always trades responsiveness against stability. DCQCN pairs a \textbf{fast but blunt} mechanism (PFC, which stops loss
+instantly) with a \textbf{precise but slower} one (per-flow rate control on the NIC, which keeps queues short so PFC rarely fires). Together they are
+lossless in the short term and fair and stable in the long term.
 \end{keybox}
 
 \section{DCTCP vs.\ QCN vs.\ DCQCN}
@@ -289,34 +357,33 @@ Congestion control has always traded \emph{responsiveness} against \emph{stabili
 \small
 \begin{tabularx}{\linewidth}{@{}lXXX@{}}
 \toprule
- & \textbf{DCTCP} & \textbf{QCN} & \textbf{DCQCN} \\
+ & \textbf{DCTCP} & \textbf{QCN} & \textbf{DCQCN}\\
 \midrule
-Network & L3, lossy & \key{L2 only} & \key{L3 (RoCEv2), lossless with PFC} \\
-Where & Host kernel (window) & Switch + NIC & Switch (RED/ECN only) + \key{NIC} \\
-Control & Window & Rate & \key{Rate} (hardware limiters) \\
-Feedback & ECN echoed \key{per ACK} & \key{Quantized} metric, probabilistic, from switch to source & ECN $\to$ \key{CNP from receiver}, at most one per 50\,$\mu$s \\
-Decrease & $W(1-\alpha/2)$ & by quantized feedback & $R_C(1-\alpha/2)$, $\alpha$ updated on CNP / decays on timer \\
-Increase & Slow start + additive & Fast recovery / AI / hyper (timer + byte counter) & \key{Same as QCN}; \key{no slow start} \\
-Switch change & None (ECN) & QCN in ASIC & \key{None} (standard RED/ECN) \\
+Network & IP, lossy & Ethernet L2 only & IP (RoCEv2), lossless via PFC\\
+Runs in & host kernel & switch + NIC & NIC; switch only does standard RED/ECN\\
+Controls & window & rate & rate (hardware pacing)\\
+Feedback & ECN echoed in every ACK & quantized value, switch $\to$ source & CNP from receiver, $\le$ 1 per 50\,$\mu$s\\
+Cut & $W(1-\alpha/2)$ & by feedback value & $R_C(1-\alpha/2)$\\
+Growth & slow start + additive & fast recovery / additive / hyper & same as QCN, no slow start\\
 \bottomrule
 \end{tabularx}
 \end{center}
 
 \begin{keybox}[Exam one-liner]
-DCQCN makes RoCEv2 RDMA usable at datacenter scale by adding per-flow, NIC-based, rate-based congestion control on top of PFC: switches RED/ECN-mark, the receiver NIC sends at most one CNP per 50\,$\mu$s per flow, and the sender NIC cuts $R_C$ by $\alpha/2$ and recovers QCN-style (fast recovery, additive, hyper) with no slow start; buffer thresholds (dynamic $t_{PFC}$ with $\beta$) ensure ECN fires before PFC, so PFC's unfairness and victim-flow problems rarely appear.
+DCQCN makes RoCEv2 RDMA work at datacenter scale by adding per-flow, NIC-based rate control on top of PFC. Switches RED/ECN-mark,
+the receiver NIC sends at most one CNP per 50\,$\mu$s per flow, and the sender NIC cuts $R_C$ by $\alpha/2$ (remembering $R_T$), then recovers
+with timer-driven fast recovery, additive and hyper increase, with no slow start. A dynamic PFC threshold ($\beta = 8$) guarantees that ECN fires
+before PFC. A fluid model shows that a fast timer (55\,$\mu$s) and gentle probabilistic marking ($P_{max}$ = 1\%) are needed for flows to converge.
 \end{keybox}
 
 \section{Revision checklist}
 \begin{itemize}
-\item \textbf{Why RDMA:} TCP $>$20\% CPU at 40\,G, 25.4\,$\mu$s vs 1.7\,$\mu$s; RDMA runs on the NIC, needs a lossless fabric.
-\item \textbf{RoCEv2:} IB transport + IP/UDP (routing/ECMP) + Ethernet; lossless via PFC.
-\item \textbf{PFC:} ingress threshold $\to$ PAUSE upstream, RESUME later; 8 classes; per port+priority, not per flow $\Rightarrow$ \key{unfairness} (parking lot) and \key{victim flows} (cascading PAUSEs, HoL blocking).
-\item \textbf{Why not QCN:} L2 flow ID (MACs) lost across IP hops; switch ASIC changes needed.
-\item \textbf{Roles:} CP (switch, RED/ECN), NP (receiver, CNP $\le$ 1 per 50\,$\mu$s), RP (sender, rate control).
-\item \textbf{RP cut:} $R_T{=}R_C$, $R_C{=}R_C(1-\alpha/2)$, $\alpha{=}(1-g)\alpha+g$; $\alpha$ starts at 1; no CNP for 55\,$\mu$s $\Rightarrow \alpha{=}(1-g)\alpha$.
-\item \textbf{RP increase:} timer + byte counter; fast recovery ($\max(T,BC)<5$): $R_C{=}(R_T+R_C)/2$; additive: $R_T{+}{=}R_{AI}$; hyper when $\min(T,BC)>5$; \key{no slow start}.
-\item \textbf{Buffers:} $t_{flight}=22.4$\,KB; static $t_{PFC}\le24.47$\,KB forces $t_{ECN}<0.85$\,KB (infeasible); dynamic $t_{PFC}=\beta(B-8nt_{flight}-s)/8$ with $\beta=8$ $\Rightarrow t_{ECN}<21.75$\,KB. ECN is egress, PFC is ingress.
-\item \textbf{Fluid model:} fixed point $R_C=C/N$, $p<1\%$, queue near $K_{min}$.
-\item \textbf{Parameters:} timer 55\,$\mu$s, byte counter 10\,MB, $K_{min}$ 5\,KB, $K_{max}$ 200\,KB, $P_{max}$ 1\%, $g$ 1/256. Byte-counter dominance prevents convergence; timer + probabilistic marking fix it.
-\item \textbf{Practical:} parking lot mitigated not solved; go-back-N, bad above 0.1\% loss; no deadlock in Clos; TCP isolated by priority tags; PFC still needed.
+  \item Why RDMA (CPU and latency); RoCEv2 = IB transport over UDP/IP/Ethernet; needs lossless, hence PFC.
+  \item PFC pauses a link, not a flow: unfairness (H4 got a whole port) and victim flows (pauses climb hop by hop).
+  \item QCN fails on IP networks (Ethernet header rewritten per hop); real fix = per-flow congestion control.
+  \item Loop: CP marks (RED) $\to$ NP sends CNP ($\le$ 1 per 50\,$\mu$s) $\to$ RP cuts $R_C(1-\alpha/2)$, $R_T = $ old rate, $\alpha$ up; $\alpha$ decays every 55\,$\mu$s without CNP.
+  \item Increase: timer + byte counter; fast recovery halves the gap, additive adds 40\,Mb/s to target, hyper after long quiet; no slow start.
+  \item Buffers: headroom 22.4\,KB; static PFC limit forces $t_{ECN} < 1$ packet (impossible); dynamic $t_{PFC}$ with $\beta = 8$ gives $t_{ECN} < 21.75$\,KB.
+  \item Convergence: byte-counter-driven increase favours fast flows (25 vs 8 steps/ms); fix with 55\,$\mu$s timer and RED slope with small $P_{max}$ (big flows get more CNPs).
+  \item Practical: parking lot mitigated, go-back-N needs loss $<$ 0.1\%, no deadlock in Clos, TCP in a separate class.
 \end{itemize}
