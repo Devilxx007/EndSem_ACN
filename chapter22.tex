@@ -1,255 +1,452 @@
 \chapter{FTMB: Rollback-Recovery for Middleboxes}
 \paperinfo{J. Sherry, P. X. Gao, S. Basu, A. Panda, A. Krishnamurthy, C. Maciocco, M. Manesh, J. Martins, S. Ratnasamy, L. Rizzo, S. Shenker (UC Berkeley, U. Washington, Intel, NEC Labs, U. Pisa, ICSI)}{ACM SIGCOMM 2015}
 
-\begin{keybox}[FTMB in one paragraph]
-Stateful middleboxes (NATs, firewalls, IDSes, WAN optimisers) must survive failures \key{without losing their state}, must recover \key{fast} (before TCP times out), and must add only \key{tens of microseconds} of latency when nothing fails. Checkpointing alone holds every output packet until the next checkpoint (milliseconds of delay). FTMB (Fault-Tolerant MiddleBox) instead uses \key{rollback recovery}: log every \key{input packet} plus the \key{nondeterministic events} (the order in which threads touched \key{shared state}, and values read from clocks/RNGs), take periodic \key{snapshots}, and after a crash \key{replay} the logged input from the last snapshot on a backup. Two new mechanisms make this fast on a multicore middlebox: \key{ordered logging} (each shared-variable access emits a small \key{Packet Access Log, PAL}, queued before the lock is released) and \key{parallel release} (an output packet carries a \key{vector clock} of per-thread PAL sequence numbers and is released once the output logger has received all PALs up to it). Result: about \key{30\,$\mu$s} extra median latency and recovery in \key{40--275\,ms}.
+\begin{keybox}[The paper in three sentences]
+When a stateful middlebox (NAT, firewall, IDS) crashes, a backup must take over \emph{with the same state}, or existing
+connections break. FTMB gets the state back by \key{logging every input packet} and \key{the order in which threads touched
+shared variables}, and after a crash it \key{re-runs (replays) those packets on a backup} in exactly that order, which rebuilds the
+state. The hard part is doing this while adding only tens of microseconds per packet; two tricks make it possible:
+\key{ordered logging} and \key{parallel release}.
 \end{keybox}
 
-\section{Motivation}
-\begin{itemize}
-\item Middleboxes are as numerous as routers and are moving to software (\key{NFV}). Performance and management of NFV got attention; \key{fault tolerance} did not.
-\item Today's practice: (1) \key{engineer the box not to fail} (one vendor uses a single NIC line and a whole team testing driver releases), and (2) keep a \key{dedicated 1:1 backup}. NFV breaks (1): code runs on diverse commodity hardware the vendor does not control. (2) is expensive (one high-end appliance costs about \$250K; one enterprise had 166 firewalls and over 600 middleboxes) and gives only weak recovery, because the backup \key{does not have the state}.
-\item Losing state breaks traffic: a backup NAT without port mappings, or a firewall without connection state, drops or resets existing flows.
-\item What vendors told the authors:
-\begin{itemize}
-\item \key{Shared state is common}: an IDS touches tens of shared variables per packet; even the simplest devices touch at least one.
-\item \key{Resetting connections after failure is unacceptable} (user-visible disruption).
-\item Their current stateful recovery is ad hoc (e.g.\ checkpoint some data structures; ``fail open'' so flows bypass inspection) with \key{no correctness guarantee}.
-\item \key{1\,ms} is the hard upper bound on added latency; a trial product adding 1--2\,ms triggered about 100 alarms within an hour.
-\item \key{No 1:1 redundancy} (cost).
-\end{itemize}
-\end{itemize}
+% ------------------------------------------------------------------
+\section{The problem, told as a story}
 
-\section{System and failure model}
-\paperfig[0.45]{fm_fig1_model}{Middlebox model: the NIC hashes each packet's 5-tuple (RSS) to a queue; each thread handles its own queues end to end; threads share some state.}
-\begin{itemize}
-\item \key{Multi-threaded on a multicore CPU}, fixed number of threads, \key{multi-queue NICs}. The NIC hashes the flow 5-tuple (\key{RSS}) so all packets of a flow go to the same thread, and each packet is processed entirely by one thread.
-\item So \key{per-flow state is thread-local}. \key{Shared state} is state touched by several threads: aggregate counters, IDS state machines, rate limiters, WAN-optimiser packet caches, address pools.
-\item The middlebox runs \key{virtualised} (VM, container, or anything that isolates and supports cheap \key{snapshots}).
-\item \key{Fail-stop} failures (a component stops and others can tell), not Byzantine. Covered: hardware, drivers, host OS, i.e.\ the virtualisation layer and below. Hardware matters: in one study 80\% of firewall, 66\% of IDS and 74\% of load-balancer failures needed hardware replacement. Bugs in the middlebox application itself are not covered.
-\end{itemize}
+Picture a NAT running in software on a 4-core server. Each core runs one thread. The NIC spreads incoming packets over the
+threads by hashing the flow's 5-tuple (RSS), so every packet of a given flow always lands on the same thread
+(Figure~\ref{fig:ftmbmodel}). That is convenient: the state that belongs to one flow, such as its translation entry, is only
+ever touched by one thread, so it needs no locking.
 
-\section{Why this is hard}
-Three properties together:
+\paperfig[0.45]{fm_fig1_model}{The middlebox model: the NIC hashes each packet's 5-tuple to a queue, each thread processes its own
+queue start to finish, and some state is shared between threads.\label{fig:ftmbmodel}}
+
+But some state is \key{shared} between threads. In our NAT, the pool of free external ports is one shared counter
+\texttt{next\_port}: whichever thread sees a new flow takes the next number and increments the counter. Real middleboxes are full of
+such shared state: global counters, rate limiters, an IDS's cross-flow state machines, a WAN optimiser's packet cache. One vendor
+told the authors that their IDS touches \emph{tens} of shared variables per packet, and even their simplest box touches at least one.
+
+Now the server dies (a disk, a NIC, a driver, the host OS). A standby server takes over. If it starts empty, it has no
+translation table. A returning packet for an existing connection arrives, the backup has never heard of it, and it drops it or
+resets the connection. Vendors told the authors this is not acceptable. So the goal is:
+
+\begin{keybox}[What FTMB must achieve]
 \begin{enumerate}
-\item \key{Statefulness}: the state must be restored so future packets are processed as if it were never lost.
-\item \key{Frequent nondeterminism}: threads \key{race} for shared state, so the order of accesses depends on scheduling; \key{clocks and random number generators} return unpredictable values. A shared variable may be accessed 100K--1M times per second.
-\item \key{Low latency}: packets cross a middlebox in 10--100s of $\mu$s, so any fault-tolerance step on the packet path must cost about that much or less.
+  \item \textbf{Correct recovery}: after failover, packets are processed as if nothing was lost.
+  \item \textbf{Low cost when nothing fails}: at most tens to hundreds of $\mu$s extra per packet (vendors gave 1\,ms as the absolute limit;
+        a trial product that added 1--2\,ms caused about 100 complaints within an hour).
+  \item \textbf{Fast recovery}: before TCP times out or resets.
+  \item \textbf{General}: one mechanism for any middlebox, not a custom design per product.
+  \item \textbf{Passive}: no expensive dedicated hot replica per box; one backup can serve many.
 \end{enumerate}
-\textbf{Why not ``active:active'' (run a replica on the same inputs)?} With nondeterminism, master and replica \key{diverge}, so the replica's state may not match what the master already sent. The same applies to replicated state machines. Recording every nondeterministic outcome is the usual fix, but naive interception is too slow at these rates.
+\end{keybox}
 
-\section{Goals and the correctness condition}
-\begin{enumerate}
-\item \key{Correctness} (Strom and Yemini): \emph{``a system recovers correctly if its internal state after a failure is consistent with the observable behaviour of the system before the failure.''} The restored state need not be \emph{identical}; it must be a state that \emph{could have produced} every packet already sent.
-\item \key{Low overhead without failures}: 10--100s of $\mu$s extra latency.
-\item \key{Fast recovery}: before TCP enters timeout or reset.
-\item \key{Generality}: one mechanism for all middleboxes (small annotations and automated code changes are acceptable; no new programming model).
-\item \key{Passive}: one backup can be shared by many masters; no dedicated hot replica.
-\end{enumerate}
+% ------------------------------------------------------------------
+\section{Why the obvious solutions do not work}
+
+\subsection{Idea 1: just take snapshots}
+Every 100\,ms, copy the middlebox VM's memory to safe storage. On a crash, start the backup from the latest snapshot.
+
+\textbf{Why it is wrong on its own.} Suppose the snapshot was taken at $t=0$, and at $t=40$\,ms the NAT gives flow X port 5001
+and sends X's packet out to the Internet. The box crashes at $t=70$\,ms. The backup loads the $t=0$ snapshot, in which port 5001 is
+still free. The next new flow, Y, now gets port 5001, while the server on the other side is already talking to X on port 5001.
+Replies get delivered to the wrong flow. The backup's state \emph{contradicts what the outside world has already seen}.
+
+\textbf{The only fix for snapshot-only designs} is to hold back every outgoing packet until a snapshot that includes its effects has
+been saved. Then nothing the world saw can be missing from the snapshot. But this means every packet waits up to a whole snapshot
+interval. Systems built this way (Remus, Colo, and Pico, which is designed for middleboxes) add \key{milliseconds} per packet
+(Pico: 8--9\,ms, Remus: over 50\,ms). That is far too slow.
+
+\subsection{Idea 2: run two copies in lock-step (active:active)}
+Feed every packet to both the master and a replica; only the master's output goes out. If the master dies, the replica already
+has the state.
+
+\textbf{Why it is wrong.} The two copies do not stay identical. Suppose flow X's first packet (thread 1) and flow Y's first
+packet (thread 2) arrive at the same moment. Both threads race for \texttt{next\_port}. On the master, thread 2 happens to win:
+Y gets 5000 and X gets 5001. On the replica, thread 1 happens to win: X gets 5000 and Y gets 5001. Which thread wins depends on
+scheduling and caches, which nobody controls. After failover, the replica's state again contradicts what the world saw.
+Clocks and random numbers cause the same problem: two copies reading \texttt{gettimeofday()} get different values.
+
+\subsection{Idea 3: log the inputs and replay them (rollback recovery)}
+The middlebox code is deterministic \emph{except} for a few events: which thread won each race on a shared variable, and what the
+clock and random-number generator returned. If we record
+\begin{itemize}
+  \item every \textbf{input packet}, and
+  \item the \textbf{outcome of every nondeterministic event} (in the literature these records are called \key{determinants}),
+\end{itemize}
+then after a crash we can load an old snapshot and \emph{re-run} all the logged packets, forcing every race to come out the same way.
+The code then rebuilds exactly the state the master had. Snapshots are still taken, but only so that replay starts from a recent
+point instead of from the beginning of time.
+
+The big advantage: a packet does not have to wait for the next snapshot. It only has to wait until \emph{the information needed to
+replay it} is safely logged. That can take microseconds instead of milliseconds. FTMB follows this approach, but the classic
+rollback-recovery algorithms from the 1980s and 1990s cannot keep up with a middlebox that emits a packet every few microseconds
+(details in Section~\ref{sec:ftmbclassic}).
+
+% ------------------------------------------------------------------
+\section{The rule that defines ``correct'': output commit}
 
 \begin{keybox}[Output commit]
-\textbf{No output may be released until all information needed to recreate an internal state consistent with that output is on stable storage.} For a middlebox: before packet $p$ leaves, everything needed to replay an execution that would produce $p$ must be logged.
+A packet may leave the middlebox only after \textbf{everything needed to recreate a state consistent with that packet} is on
+stable storage.
 \end{keybox}
 
-\section{Design space}
-\begin{center}
-\begin{tabularx}{\linewidth}{@{}lXX@{}}
-\toprule
-\textbf{Approach} & \textbf{How it meets output commit} & \textbf{Problem for middleboxes} \\
-\midrule
-\key{No-replay} (checkpoint only: Pico, Remus, Colo) & Snapshot state periodically; \key{buffer all output} until a snapshot covering it is stored & Every packet waits up to a snapshot interval: \key{milliseconds} (Pico adds 8--9\,ms per packet) \\
-\key{Replay-based} (rollback recovery) & Log \key{inputs} and \key{determinants} (records of nondeterministic events); release output as soon as \emph{its} dependencies are logged; snapshots only bound replay time & Classic algorithms do not scale to outputs every few $\mu$s \\
-\quad Optimistic logging & Output commit check needs \key{coordination among all threads} per output & A prototype managed only \key{600\,Mb/s} \\
-\quad Causal logging & Coordination-free, but logs determinants \key{redundantly} & Estimated 500\,Gb/s--300\,Tb/s of logs for 10\,Gb/s of traffic \\
-Replay debuggers & Record and replay multicore execution & No output commit at all (they never resume service) \\
-\bottomrule
-\end{tabularx}
-\end{center}
-FTMB follows the replay blueprint but adds \key{ordered logging} and \key{parallel release} so logging is cheap and the output-commit check is parallel.
-
-\section{Architecture}
-\paperfig[0.45]{fm_fig2_arch}{FTMB: an Input Logger before and an Output Logger after the Master; stable storage holds logged packets, PALs and snapshots; a Backup starts from the latest snapshot.}
+Two points make this rule clear:
 \begin{itemize}
-\item \key{Master}: VM running the middlebox.
-\item \key{Input Logger (IL)}: upstream software switch; records every input packet.
-\item \key{Output Logger (OL)}: downstream software switch; receives PALs and output packets and enforces output commit.
-\item \key{Stable storage}: in the prototype, memory at the downstream switch: ``stable'' because it survives a failure of the Master.
-\item \key{Backup}: an identical server, started from the latest snapshot only when the Master fails (passive).
-\item FTMB survives failure of the Master \emph{or} of the logger node, not both at once. ``Bypass'' NICs that fail open can cover logger failure.
-\end{itemize}
-Enforcing output commit means answering four questions: \key{what} to log (determinants), \key{how} to log it, \key{what} each packet depends on, and \key{how to check} cheaply that those dependencies are logged.
-
-\section{What to log: Packet Access Logs (PALs)}
-Nondeterminism comes from (1) \key{races on shared variables} and (2) \key{hardware} whose values cannot be predicted.
-\begin{itemize}
-\item Each shared variable $v_j$ gets a \key{lock} and an \key{access counter}.
-\item When the thread processing packet $p_i$ accesses $v_j$, it creates a \key{PAL}:
-\[ (p_i,\ n_{ij},\ v_j,\ s_{ij}) \]
-$n_{ij}$ = how many shared variables $p_i$ has accessed so far (including this one); $s_{ij}$ = how many accesses $v_j$ has received so far (including this one).
-\item PALs are made by each thread independently, while holding the variable's lock, using only thread-private data or data protected by that lock: \key{no extra synchronisation}.
-\item A \key{shared pseudo-random generator} is treated like a shared variable (it is deterministic given its seed and access order).
-\item \key{Clocks and true randomness} (\texttt{gettimeofday()}, \texttt{/dev/random}): the PAL records the device and the \key{value returned} instead of an access order; on replay that value is returned again. No locking is needed.
+  \item \textbf{The recovered state does not have to be identical to the lost state.} It only has to be a state that \emph{could have
+        produced} every packet the world has already received. If a packet was still inside the middlebox when it crashed and had
+        never been sent, nobody saw its effect, so replay may process it differently. That is fine.
+  \item \textbf{The danger is a packet that left before its information was logged.} In the NAT example: if X's packet with port 5001
+        goes out, and the record ``thread 2 took \texttt{next\_port} before thread 1'' is lost in the crash, replay may give X port 5000
+        and the world sees a contradiction. Output commit forbids releasing X's packet until that record is safe.
 \end{itemize}
 
-\paperfig[0.48]{fm_fig3_pal}{Four threads process packets A--D (left to right in time) and access shared variables X, Y, Z, T (circles), producing the PALs shown. The red path is packet B's dependency tree.}
-\textbf{Worked example (Figure above):}
+So FTMB has to answer four questions:
+\begin{enumerate}
+  \item \textbf{What} must be logged to make replay deterministic? (Section~\ref{sec:ftmbpal})
+  \item \textbf{How} do we log it cheaply? (Section~\ref{sec:ftmbordered})
+  \item \textbf{Which} logged records does a given output packet depend on? (Section~\ref{sec:ftmbdeps})
+  \item \textbf{How} do we check, cheaply, that all of them are logged before releasing the packet? (Section~\ref{sec:ftmbrelease})
+\end{enumerate}
+
+% ------------------------------------------------------------------
+\section{Architecture: the path of a packet}
+
+\paperfig[0.45]{fm_fig2_arch}{FTMB architecture. Packets pass through the Input Logger, the Master and the Output Logger. Stable storage
+holds logged input and output packets, PALs and snapshots. The Backup is started only after a failure.}
+
+There are four parts. Follow one packet through them:
+\begin{enumerate}
+  \item \key{Input Logger (IL)}, a software switch in front of the middlebox. It gives the packet a sequence number, stores a copy in
+        stable storage, and forwards it reliably to the master. If the master crashes, this log is what gets replayed.
+  \item \key{Master}, the VM running the actual middlebox code. Its code has been modified slightly: every time a thread touches a
+        shared variable (or reads the clock), it writes a small record, a \key{PAL}, into a queue. PALs and output packets go to the
+        output logger.
+  \item \key{Output Logger (OL)}, a software switch behind the middlebox. It stores the PALs, which it holds in memory, and holds
+        each output packet back until all the PALs that packet depends on have arrived. Only then does the packet go out to the network.
+        This is where output commit is enforced.
+  \item \key{Backup}, an identical server that sits idle (passive). One backup can stand by for many masters.
+\end{enumerate}
+Periodically the master's VM is \key{snapshotted} to stable storage. After a snapshot, the logs from before it can be thrown away.
+
+\textbf{What ``stable storage'' means here.} In the prototype it is just memory on the output-logger machine. It counts as
+``stable'' because it survives a crash of the master. FTMB survives the failure of the master \emph{or} of the logger machine, but
+not both at once.
+
+% ------------------------------------------------------------------
+\section{What to log: Packet Access Logs (PALs)}\label{sec:ftmbpal}
+
+Nondeterminism comes from two sources, and each gets its own kind of record.
+
+\subsection{Races on shared variables}
+FTMB gives every shared variable $v_j$ a \key{lock} and an \key{access counter}. Whenever the thread processing packet $p_i$
+accesses $v_j$ (while holding its lock), it writes a \key{Packet Access Log}:
+\[
+  \text{PAL} = (p_i,\; n_{ij},\; v_j,\; s_{ij})
+\]
+\begin{itemize}
+  \item $p_i$: which packet was being processed;
+  \item $n_{ij}$: this is the $n$-th shared-variable access made while processing $p_i$ (1st, 2nd, \dots);
+  \item $v_j$: which shared variable;
+  \item $s_{ij}$: this is the $s$-th access that $v_j$ has ever received.
+\end{itemize}
+
+\textbf{Why these four fields are enough.} $s_{ij}$ records the \emph{order of accesses to each variable}: during replay, the thread
+whose PAL says $s=2$ must wait until the thread whose PAL says $s=1$ has gone. That forces every race to come out the same way.
+$n_{ij}$ records the \emph{order of accesses within one packet}, which links one packet's accesses into a chain. That chain is what
+the dependency rules (Section~\ref{sec:ftmbdeps}) are built from.
+
+\textbf{NAT example.} Thread 2 (packet $Y_1$) wins the race, then thread 1 (packet $X_1$):
 \begin{center}
 \begin{tabular}{@{}lll@{}}
 \toprule
-\textbf{Packet} & \textbf{PALs, in order} & \textbf{Reading} \\
+Event & PAL written & Meaning during replay\\
 \midrule
-A & (A,1,X,1), (A,2,T,6) & A's 1st access is X (X's 1st access); 2nd is T (T's 6th) \\
-B & (B,1,X,2), (B,2,Y,2) & B touches X after A, then Y after C \\
-C & (C,1,Z,2), (C,2,Y,1) & C touches Z after D, then is Y's first accessor \\
-D & (D,1,Z,1) & D is Z's first accessor \\
+thread 2 takes \texttt{next\_port}=5000 & $(Y_1, 1, \texttt{next\_port}, 1)$ & $Y_1$ must get the counter first\\
+thread 1 takes \texttt{next\_port}=5001 & $(X_1, 1, \texttt{next\_port}, 2)$ & $X_1$ must wait for access 1\\
+\bottomrule
+\end{tabular}
+\end{center}
+During replay, if thread 1 reaches the lock first, it sees that it is down for access 2 while access 1 has not happened yet, so
+it waits. Thread 2 goes first, gets 5000, and X again gets 5001. The state is rebuilt exactly.
+
+\textbf{Why making PALs is cheap.} The thread writes the PAL while it already holds the variable's lock, using only its own counter
+($n$) and the variable's counter ($s$, protected by that same lock). No extra synchronisation is needed. A shared pseudo-random
+generator is handled like any shared variable, because given the same seed and the same order of calls it returns the same numbers.
+
+\subsection{Clocks and true randomness}
+\texttt{gettimeofday()} or \texttt{/dev/random} cannot be ``re-run'' to get the same answer. For these, the PAL simply records the
+\emph{value that was returned}. During replay, the call is not executed; the logged value is handed back instead. These PALs need no
+lock, since they use only thread-local information.
+
+% ------------------------------------------------------------------
+\section{Which records does a packet depend on?}\label{sec:ftmbdeps}
+
+It is \emph{not} enough for a packet to wait only for its own PALs. Its result also depends on what other packets did to the
+shared variables before it touched them. Figure~\ref{fig:ftmbpal} shows four threads processing packets A, B, C, D over time.
+
+\paperfig[0.48]{fm_fig3_pal}{Four threads (horizontal lines) process packets A, B, C, D, left to right in time. Circles are accesses
+to shared variables X, Y, Z, T, labelled with the PAL each one generates. The red tree is everything packet B depends on.\label{fig:ftmbpal}}
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Packet & PALs in order & What happened\\
+\midrule
+D & (D,1,Z,1) & D is the first ever to touch Z\\
+C & (C,1,Z,2), (C,2,Y,1) & C touches Z after D, then is the first to touch Y\\
+A & (A,1,X,1), (A,2,T,6) & A is first to touch X, later is the 6th to touch T\\
+B & (B,1,X,2), (B,2,Y,2) & B touches X after A, then Y after C\\
 \bottomrule
 \end{tabular}
 \end{center}
 
-\section{How to log: ordered logging}
+\textbf{The rule.} For replay to reproduce one access exactly, two things must be true: the variable must have gone through the
+same earlier accesses, and the thread must be in the same state it was in. So every PAL $(p_i, n, v_j, s)$ depends on up to two
+earlier PALs:
+\begin{itemize}
+  \item its \key{per-packet predecessor}: the same packet's previous access, $(p_i, n-1, \cdot, \cdot)$, because the thread's state
+        came from there;
+  \item its \key{per-variable predecessor}: the variable's previous access, $(\cdot, \cdot, v_j, s-1)$, because the variable's value
+        came from there.
+\end{itemize}
+A packet depends on its \emph{last} PAL, and through these two links, recursively, on everything behind it.
+
+\textbf{Walking packet B's tree:}
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+PAL & per-packet predecessor & per-variable predecessor\\
+\midrule
+(B,2,Y,2) \emph{B's last} & (B,1,X,2) & (C,2,Y,1)\\
+(B,1,X,2) & none & (A,1,X,1)\\
+(C,2,Y,1) & (C,1,Z,2) & none\\
+(C,1,Z,2) & none & (D,1,Z,1)\\
+\bottomrule
+\end{tabular}
+\end{center}
+So B may leave only after six PALs are logged: (B,2,Y,2), (B,1,X,2), (A,1,X,1), (C,2,Y,1), (C,1,Z,2) and (D,1,Z,1).
+
+\textbf{Why even D matters to B.} The value of Y that B read was written by C. What C wrote may depend on what C read from Z, and
+that value depended on D's earlier update of Z. If B goes out and then D's thread crashes before (D,1,Z,1) is logged, replay
+cannot reproduce Z, so it cannot reproduce C's write to Y, so it cannot reproduce what B saw. B would have revealed a state that
+replay cannot rebuild, which is exactly what output commit forbids.
+
+\textbf{Note what B does \emph{not} depend on}: packet A itself. B needs A's PAL on X, but A goes on to do more work and finishes
+much later. B should not have to wait for A to finish. This shapes the logging design below.
+
+% ------------------------------------------------------------------
+\section{How to log: ordered logging}\label{sec:ftmbordered}
+
 Two design decisions:
-\begin{enumerate}
-\item \key{PALs travel separately from data packets} to the Output Logger. Otherwise packets would inherit needless dependencies: B depends on the PAL (A,1,X,1) but \emph{not} on packet A, which finishes much later. B should wait only until that PAL is logged.
-\item \key{A PAL is put in the thread's output queue before the variable's lock is released.} This gives two guarantees:
-\begin{enumerate}
-\item when packet $p_i$ is queued, \key{all of $p_i$'s own PALs are already queued};
-\item when a PAL for $v_j$ is queued, \key{all earlier PALs for $v_j$} (from any thread) are already queued.
+
+\paragraph{1. PALs travel separately from data packets.} If PALs were attached to their packet, B's dependency (A,1,X,1) would
+only reach the logger when A's packet did, so B would wait for A to finish for no reason. Instead, each thread pushes PALs into
+its own outgoing queue as soon as they are created, and they stream to the output logger on their own.
+
+\paragraph{2. A PAL is put into the queue \emph{before} the lock on its variable is released.} This simple ordering rule gives
+two guarantees:
+\begin{enumerate}[label=(\roman*)]
+  \item \textbf{When a packet is queued for output, all of its own PALs are already queued}, since the thread wrote them while
+        processing the packet, before the packet was finished.
+  \item \textbf{When a PAL for $v_j$ is queued, every earlier PAL for $v_j$ is already queued} on some thread. The earlier accessor
+        queued its PAL before releasing the lock, and our thread could not get the lock until it was released.
 \end{enumerate}
-\end{enumerate}
+Putting the two together, by induction over the dependency tree: \textbf{by the time a packet enters its output queue, every PAL it
+depends on is already sitting in some thread's PAL queue.} For packet B: (D,1,Z,1) was queued before D released Z's lock, which
+happened before C could take it, and so on along the red tree.
 
-\section{What a packet depends on}
-For replay to reproduce the access to $v_j$ by $p_i$, the variable must have seen the same earlier accesses, and the thread must be in the same state. So each PAL $(p_i, n, v_j, m)$ has up to two dependencies:
-\begin{itemize}
-\item \key{per-packet}: the previous PAL of the same packet, $(p_i, n-1, \cdot, \cdot)$;
-\item \key{per-variable}: the previous PAL of the same variable, $(p', \cdot, v_j, m-1)$.
-\end{itemize}
-A packet depends on its \key{last PAL}, and recursively on everything reachable.
+\textbf{What goes wrong without rule 2.} Suppose D released Z's lock first and queued its PAL a moment later. C could grab Z,
+queue (C,1,Z,2), and the logger could receive C's PAL and even B's PALs before D's PAL exists anywhere. The ordering facts the
+release check relies on would no longer hold.
 
-\textbf{Packet B's dependency tree:}
-\begin{center}
-\begin{tabular}{@{}lll@{}}
-\toprule
-\textbf{PAL} & \textbf{Per-packet predecessor} & \textbf{Per-variable predecessor} \\
-\midrule
-(B,2,Y,2) \emph{(B's last)} & (B,1,X,2) & (C,2,Y,1) \\
-(B,1,X,2) & --- & (A,1,X,1) \\
-(C,2,Y,1) & (C,1,Z,2) & --- \\
-(C,1,Z,2) & --- & (D,1,Z,1) \\
-\bottomrule
-\end{tabular}
-\end{center}
-So B can leave only after (B,2,Y,2), (B,1,X,2), (A,1,X,1), (C,2,Y,1), (C,1,Z,2) and \key{(D,1,Z,1)} are all logged. The recursion is essential: if B were released without (D,1,Z,1) and D's thread then crashed, replay could not rebuild Z, hence C's view of Y, hence the Y that B saw.
+% ------------------------------------------------------------------
+\section{Checking output commit: parallel release}\label{sec:ftmbrelease}
 
-\section{Checking output commit: parallel release}
-\subsection{Rejected: fine-grained tracking}
-A ``scoreboard'' at the Output Logger tracked every PAL arrival in two matrices (sequence number of each packet at each variable; which packet accessed each variable at each sequence number) and released each packet the moment its exact dependencies arrived. It was lock-free and provably prompt, but cost about $O(nc)$ cache misses per release ($n$ shared variables, $c$ cores), so the scoreboard became the bottleneck.
+The output logger now has to decide, for each output packet, ``have all its dependencies arrived?''. It is itself
+multi-threaded, with one input queue per master thread, so one packet's dependencies may be spread across several queues.
 
-\subsection{Parallel release}
-\paperfig[0.48]{fm_fig4_release}{Parallel release. Each Master thread streams PALs with per-queue sequence numbers; a packet carries the vector of the largest sequence numbers queued on every thread (VOR) and is released when the Output Logger has received, contiguously, at least that much on every queue.}
-\textbf{Key observation:} because of the queueing rule, by the time packet $p$ reaches its output queue, \key{every PAL it depends on is already queued} on \emph{some} thread. So it is enough to release $p$ after \key{all PALs queued before it on every thread} have arrived: slightly coarser than exact tracking, but cheap.
+\subsection{First attempt (rejected): track every dependency exactly}
+The authors first built a ``scoreboard'' at the output logger: two tables recording, for every packet and every variable, which
+PALs had arrived. A packet was released the instant its exact dependency tree was complete. It was correct and released packets as
+early as possible, but every release had to read and update entries that other cores were also touching. That cost about $O(nc)$
+cache misses per packet ($n$ shared variables, $c$ cores), and the scoreboard became the bottleneck.
+
+\subsection{Parallel release: wait for ``everything queued before me''}
+The ordered-logging guarantee says that all of B's dependencies were queued, on some thread, \emph{before} B was queued. So instead of
+working out exactly which PALs B needs, FTMB waits a little longer and releases B once \key{every PAL queued on every thread before B}
+has reached the logger. This is a superset of B's real dependencies, so it is safe, and it can be checked with a few integer
+comparisons.
+
+\paperfig[0.48]{fm_fig4_release}{Parallel release. Each master thread streams its PALs to its own output-logger queue with sequence
+numbers. Each data packet carries a vector clock (VOR) of how many PALs every thread had queued when the packet was sent. The
+output logger releases the packet once it has received, without gaps, at least that many on every queue.\label{fig:ftmbrelease}}
+
+\textbf{The mechanism, step by step:}
 \begin{enumerate}
-\item Each Master thread maps \key{one-to-one} to an ingress queue at the OL. PALs on each queue form a reliable, \key{sequenced stream} (like TCP); the per-queue sequence number replaces a field of the PAL.
-\item Each Master thread keeps \key{MAX}: the largest sequence number it has assigned so far.
-\item \key{Master}: before sending a data packet, the thread reads MAX of \emph{every} thread to form a \key{vector clock $VOR$}, sends its pending PALs, then the packet with $VOR$ attached.
-\item \key{Output Logger}: each thread tracks $MAX_i$ = the highest sequence number such that \key{all} PALs up to it have been received on queue $i$ (requesting retransmission of lost PALs).
-\item On a data packet, release it once \key{$MAX_i \ge VOR_i$ for every $i$}.
+  \item \textbf{Numbered streams.} Master thread $i$ talks to output-logger queue $i$ (one-to-one). Its PALs are numbered 1, 2, 3, \dots
+        and sent as a reliable sequenced stream, like TCP. Each master thread keeps \texttt{MAX}: the highest sequence number it has
+        assigned so far.
+  \item \textbf{Stamping a packet (at the master).} When thread $k$ is about to send a data packet, it reads the current \texttt{MAX}
+        of \emph{every} thread and puts them in a vector, $VOR = [\texttt{MAX}_1, \dots, \texttt{MAX}_c]$. It sends its own pending
+        PALs first, then the packet with $VOR$ attached.
+  \item \textbf{Tracking progress (at the output logger).} For each queue $i$, the logger keeps $MAX_i$: the highest number $m$ such that
+        \emph{all} PALs $1..m$ on that queue have arrived. If one PAL is missing, $MAX_i$ stops just before it, and the logger asks
+        for a retransmission.
+  \item \textbf{Release.} A held packet is released when $MAX_i \ge VOR_i$ for every $i$.
 \end{enumerate}
 
-\textbf{Worked example (Figure above):} the OL has received, contiguously, up to $[53, 76, 57, 75]$ on queues 1--4. On queue 3 it already has 59 and 60, but \key{58 is missing}, so $MAX_3 = 57$.
+\textbf{Why this is correct.} Every PAL that B depends on was already queued when B's thread read the \texttt{MAX} values, so on its
+thread $i$ its number is $\le VOR_i$. Once the logger has everything up to $VOR_i$ on every queue, B's dependencies are guaranteed to
+be in stable storage.
+
+\textbf{Worked example (Figure~\ref{fig:ftmbrelease}).} Four master threads. On queue 3 the logger has received 57, 59 and 60, but
+\key{58 is missing}, so $MAX_3 = 57$ (``everything up to 57''). Overall the logger has $[53, 76, 57, 75]$.
 \begin{center}
 \begin{tabular}{@{}llll@{}}
 \toprule
-\textbf{Packet} & \textbf{VOR} & \textbf{Check vs.\ $[53, 76, 57, 75]$} & \textbf{Result} \\
+Packet & VOR it carries & Check against $[53, 76, 57, 75]$ & Result\\
 \midrule
-B & $[45, 76, 60, 70]$ & $53\ge45$, $76\ge76$, \key{$57 < 60$}, $75\ge70$ & wait for PAL 58 \\
-A & $[56, 77, 63, 77]$ & all four smaller than needed & wait \\
+B & $[45, 76, 60, 70]$ & $53\ge45$ \checkmark, $76\ge76$ \checkmark, $57\ge60$ \textbf{fails}, $75\ge70$ \checkmark & held\\
+A & $[56, 77, 63, 77]$ & fails on every queue & held\\
 \bottomrule
 \end{tabular}
 \end{center}
-When PAL 58 arrives, $MAX_3$ jumps to 60 and B is released.
+When PAL 58 arrives, $MAX_3$ jumps straight to 60 (59 and 60 were already there), every check for B passes, and B is released. A
+keeps waiting until the logger reaches $[56, 77, 63, 77]$.
 
-\textbf{Why it is fast:}
+\textbf{Why it is fast.}
 \begin{itemize}
-\item Master and OL threads run in parallel.
-\item No write-write conflicts on other threads' queues (others' MAX values are only read).
-\item The release check is a small constant-time comparison.
-\item With batching, all packets in a batch share one vector clock, which saves link bandwidth and amortises the check.
+  \item Master threads and logger threads all work in parallel; nobody waits for a global coordinator.
+  \item Threads only \emph{read} each other's \texttt{MAX}; there are no write-write conflicts on shared cache lines.
+  \item The release test is $c$ integer comparisons, constant time.
+  \item With batching, all packets in one batch share a single VOR, which saves link bandwidth and amortises the check.
 \end{itemize}
+The price is a little extra waiting: B may wait for some PAL it does not really need. Because PAL queues are kept short (128 entries)
+and a full queue of 16-byte PALs drains in under 2\,$\mu$s, this costs very little.
 
-\section{Implementation}
+\subsection{Why the classic algorithms were not good enough}\label{sec:ftmbclassic}
+\begin{itemize}
+  \item \textbf{Optimistic logging} does the output-commit check by coordinating \emph{all} threads every time a packet is released. The authors
+        built one and it topped out at about 600\,Mb/s, because the cores spend their time talking to each other.
+  \item \textbf{Causal logging} avoids coordination by piggybacking dependency information redundantly on many messages. For a middlebox the
+        authors estimated 500\,Gb/s to 300\,Tb/s of log data for just 10\,Gb/s of traffic.
+  \item \textbf{Record-and-replay debuggers} (e.g.\ Scribe) record races by trapping memory accesses with page faults (about 400\,$\mu$s per
+        lock access) and do not enforce output commit at all, since they never need to resume service.
+\end{itemize}
+Ordered logging plus parallel release avoids both problems: no per-packet global coordination, and each PAL is logged once.
+
+% ------------------------------------------------------------------
+\section{Implementation: what each component does}
+
 \subsection{Input Logger}
-For each input queue (5-tuple hashing as usual): receive packets, assign \key{sequence numbers}, save them to stable storage, and pass them \key{reliably} to the Master. Not CPU-heavy; costs one extra hop, about \key{5--10\,$\mu$s}.
+For each NIC queue, the input logger receives packets, numbers them, saves them in stable storage and passes them reliably to the master.
+It does little computation; small packets are bundled into MTU-sized segments for the transfer. Its main cost is one extra hop,
+about \key{5--10\,$\mu$s} of latency.
 
-\subsection{Master: code changes}
+\subsection{Master: how the middlebox code is changed}
 \begin{itemize}
-\item Input comes from the IL's reliable stream, and output goes to the output queue, not straight to a NIC. In Click this means just replacing \texttt{FromDevice} and \texttt{ToDevice}.
-\item Accesses to shared variables are protected by locks and \key{generate and queue PALs}; hardware calls (timers, etc.) generate PALs too.
-\item The developer only \key{annotates shared variables} where they are declared. A tool built on \key{LLVM} computes the call graph and the locks held at each access:
-\begin{itemize}
-\item if all accesses to a variable already share a common lock, it just inserts PAL code;
-\item otherwise it adds a new \key{protecting lock} around every access, plus PAL code.
-\end{itemize}
-New locks never wrap another lock, so the instrumentation \key{cannot introduce deadlock}. Static analysis is conservative (it may add an unnecessary lock).
-\item Works with some lock-free schemes: with \key{seqlocks} (single writer, many readers), the seqlock's version number replaces the access count $s_{ij}$.
+  \item \textbf{I/O shim.} The middlebox reads from the IL's reliable stream instead of the NIC and writes to the output queue instead of the
+        NIC. In Click this is just swapping the \texttt{FromDevice} and \texttt{ToDevice} elements.
+  \item \textbf{The developer's only manual job}: mark which variables are shared, where they are declared.
+  \item \textbf{An LLVM-based tool does the rest.} It builds the program's call graph and works out which locks are held at every access to each
+        shared variable.
+        \begin{itemize}
+          \item If every access to a variable is already protected by one common lock, the tool only inserts the PAL-writing code.
+          \item If not, the tool creates a new ``protecting'' lock, wraps every access in it, and inserts the PAL code.
+        \end{itemize}
+        The new locks never wrap another lock, so they cannot cause deadlock. Static analysis is conservative, so it may sometimes add a lock that
+        was not strictly needed.
+  \item \textbf{Lock-free structures} can sometimes be kept. With seqlocks (one writer, many readers, readers check a version number) the
+        version number plays the role of the access counter $s_{ij}$.
+  \item \textbf{Cost:} writing a PAL takes tens of nanoseconds. The real cost appears only when the tool must add locks that were not there
+        before. In a test pipeline, each lock plus PAL added about 4\,$\mu$s to a packet's latency.
 \end{itemize}
 
 \subsection{Output Logger}
 \begin{itemize}
-\item Master threads tag packets so that NIC hashing at the OL keeps the one-to-one queue mapping.
-\item Bandwidth overhead: e.g.\ 5M PALs plus vector clocks per second at 16 bytes each is about \key{10\%} of a 10\,Gb/s link.
-\item Latency: one-way time to the OL, plus waiting for all queued PALs. PAL queues are kept short (\key{128 slots}; they exist only for batching); draining a full queue of 16-byte PALs takes under 2\,$\mu$s, so the OL and the check add about \key{10--30\,$\mu$s}.
-\item Sizing example for storage: snapshot every 50--200\,ms, 10--40\,Gb/s links, about 5M PALs/s (1.25M packets/s $\times$ 5 shared accesses per packet).
+  \item Master threads tag their packets so that the logger's NIC hashing keeps the one-to-one mapping between master threads and logger queues.
+  \item Extra bandwidth: about 5 million PALs plus vector clocks per second at 16 bytes each is roughly \key{10\%} of a 10\,Gb/s link.
+  \item Extra latency: the one-way trip to the logger plus the wait for queued PALs, about \key{10--30\,$\mu$s} in total.
 \end{itemize}
 
 \subsection{Snapshots}
-Periodic snapshots bound replay time and log size. A snapshot freezes the VM; cost is about \key{5\,$\mu$s per dirty 4\,KB page} on a 10\,Gb/s link plus a fixed 1--2\,ms, so the pause depends on how many pages changed since the last snapshot.
+Snapshots bound how much must be replayed and how much log must be kept. Taking one briefly freezes the VM: a fixed 1--2\,ms plus about
+5\,$\mu$s for every 4\,KB memory page modified since the last snapshot. These freezes cause the occasional latency spikes at the tail
+(in the tests, 95th percentile 810\,$\mu$s and 99th percentile 18\,ms, with a snapshot every 200\,ms). Snapshots are taken every
+50--200\,ms.
 
-\subsection{Replay after a failure}
+% ------------------------------------------------------------------
+\section{Recovery: what happens after a crash}
+
+Continue the NAT example. The master crashes at $t = 70$\,ms; the last snapshot is from $t = 0$.
 \begin{enumerate}
-\item Start a \key{replica} from the last snapshot in \key{replay mode}; the IL feeds it the logged input (duplicates at the start are discarded).
-\item When a thread wants a shared variable's lock, it checks the \key{PALs}: if another thread accessed the variable earlier in the original run, it \key{blocks until that access has been replayed}. So accesses happen in the original order.
-\item Hardware calls return the \key{logged values}.
-\item No PALs are generated during replay.
-\item Outputs go to the OL, which \key{drops duplicates} of packets already released (e.g.\ packets that were inside the Master when it crashed but whose dependencies had all been logged).
-\item When a thread finds \key{no more PALs} for a shared variable, it leaves replay mode and behaves as a normal Master (generating PALs, computing dependencies).
+  \item \textbf{Start the backup from the snapshot}, in \key{replay mode}. Its memory is the master's memory at $t = 0$.
+  \item \textbf{Feed it the logged input.} The input logger replays every packet it logged since $t = 0$, in the original per-queue order. In
+        fact it starts sending them while the VM is still loading. Duplicates at the start of the stream are discarded.
+  \item \textbf{Enforce the original race outcomes.} When a backup thread wants a shared variable's lock, it looks up the PALs. If the PAL for its
+        access says ``access number 2'' and access 1 has not been replayed yet, it waits. In the example, the thread replaying $X_1$
+        waits until the thread replaying $Y_1$ has taken \texttt{next\_port}, so Y gets 5000 and X gets 5001 again.
+  \item \textbf{Replay clocks and random numbers} by returning the logged values instead of calling the hardware.
+  \item \textbf{No new PALs} are written during replay; the old ones are being consumed.
+  \item \textbf{Remove duplicate outputs.} Replayed output packets go to the output logger. Any packet that was already released before the
+        crash is dropped, so the world does not see it twice. Packets that were held back, waiting for their dependencies, are released normally.
+  \item \textbf{Switch back to normal mode.} When a thread finds that there are no more PALs for a shared variable, it has caught up with the
+        point of the crash. It starts behaving like a master again, writing PALs and so on.
 \end{enumerate}
-Total outage also includes the failure detector's latency, which the paper does not address.
 
+The output logger's guarantee is what makes this safe. Every packet that reached the world had all its PALs logged, so replay reproduces
+exactly those packets. Anything never logged was never seen by anyone, so it does not matter if replay does it differently.
+
+\textbf{Cost of recovery.} Replay runs at about normal speed, often faster, because the logged packets arrive at full link rate.
+Reconstructing state took \key{40--275\,ms} in the experiments. If the middlebox touches shared variables very often, waiting for its
+turn at each lock slows replay down. Packets that arrive during replay are buffered, so for a short while afterwards latency is high.
+At 30\% load it was back to normal within about 60\,ms. (The time to \emph{detect} the failure comes on top of this and is outside the paper's scope.)
+
+% ------------------------------------------------------------------
 \section{Results in brief}
-Added to 7 Click middleboxes (including an industrial NAT): about \key{30\,$\mu$s} extra median latency (2--3 orders of magnitude less than checkpointing systems), \key{5--30\%} throughput overhead, and state reconstructed in \key{40--275\,ms}.
+FTMB was added to seven Click middleboxes, including a commercial NAT/firewall (MazuNAT). In failure-free operation it added
+about \key{30\,$\mu$s} to median latency (2--3 orders of magnitude less than Remus, Colo or Pico) and cost \key{5--30\%} throughput. Boxes
+with little lock contention pay relatively more, because the PAL cost is a bigger fraction of their tiny per-packet work. In an
+application test where a NAT lost all state (stateless recovery), HTTP stalled until browsers reset connections, and one BitTorrent
+download failed outright. With stateful recovery, performance stayed close to the no-failure baseline.
 
-\section{FTMB vs.\ alternatives}
+% ------------------------------------------------------------------
+\section{Summary comparison}
 \begin{center}
 \small
 \begin{tabularx}{\linewidth}{@{}lXXX@{}}
 \toprule
- & \textbf{Checkpoint + buffer (Pico, Remus)} & \textbf{Active:active replica} & \textbf{FTMB} \\
+ & \textbf{Snapshot + hold output (Remus, Pico)} & \textbf{Two copies in lock-step} & \textbf{FTMB}\\
 \midrule
-Correct with nondeterminism & Yes & \key{No} (replica diverges) & \key{Yes} (PALs) \\
-Added latency, no failure & \key{Milliseconds} & Small & \key{Tens of $\mu$s} \\
-Recovery & Load last snapshot & Instant & Snapshot + \key{replay} (40--275\,ms) \\
-Backup & Passive & Dedicated, always running & \key{Passive}, shareable \\
-Code changes & None & None & Annotate shared variables (LLVM adds the rest) \\
+Correct with races and clocks? & yes & \key{no}, the copies diverge & \key{yes}, PALs fix the order\\
+Extra latency with no failure & \key{milliseconds} (wait for snapshot) & small & \key{tens of $\mu$s} (wait for PALs)\\
+How state is recovered & load last snapshot & replica already has it & snapshot + \key{replay} of logged input\\
+Backup & passive & dedicated, always running & \key{passive}, shareable\\
+Code changes & none & none & annotate shared variables; LLVM adds the rest\\
 \bottomrule
 \end{tabularx}
 \end{center}
 
 \begin{keybox}[Exam one-liner]
-FTMB makes stateful, multithreaded middleboxes fault tolerant by rollback recovery: input is logged at an Input Logger, every shared-variable access (and clock/RNG read) emits a PAL $(p, n, v, s)$ queued before the lock is released, and an Output Logger releases each packet only when it has received all PALs up to the packet's vector clock (parallel release), which enforces output commit with about 30\,$\mu$s of latency; after a crash a passive backup loads the last snapshot and replays the logged input, using PALs to reproduce the original access order.
+FTMB makes multithreaded stateful middleboxes fault tolerant by rollback recovery. An Input Logger records every input packet. Every
+shared-variable access (and clock/RNG read) produces a PAL $(p, n, v, s)$, queued \emph{before} the lock is released (ordered logging),
+so every dependency of a packet is queued before the packet itself. The Output Logger releases a packet only once it holds every PAL up to the
+packet's vector clock (parallel release), which enforces output commit at about 30\,$\mu$s. After a crash, a passive backup loads the last
+snapshot and replays the logged input, using the PALs to force the original order of every shared-variable access.
 \end{keybox}
 
 \section{Revision checklist}
 \begin{itemize}
-\item \textbf{Goals:} correct, low latency ($\ll$1\,ms; target 10--100s of $\mu$s), fast recovery, general, passive.
-\item \textbf{Model:} multicore, RSS flow-to-thread, per-flow state local, shared state across threads; virtualised; fail-stop below the application.
-\item \textbf{Why hard:} state + frequent nondeterminism (races, clocks, RNG) + $\mu$s latencies; active:active diverges.
-\item \textbf{Correctness:} restored state consistent with observed outputs; \key{output commit}.
-\item \textbf{Design space:} checkpoint-only buffers output (ms); replay logs inputs + determinants; optimistic logging needs coordination (600\,Mb/s); causal logging is too redundant.
-\item \textbf{Architecture:} IL $\to$ Master $\to$ OL; stable storage at OL switch; passive backup from snapshot.
-\item \textbf{PAL:} $(p_i, n_{ij}, v_j, s_{ij})$; per-variable lock + counter; hardware PALs store returned value.
-\item \textbf{Ordered logging:} PALs separate from packets; PAL queued before lock release.
-\item \textbf{Dependencies:} per-packet + per-variable predecessor, recursively from the packet's last PAL.
-\item \textbf{Parallel release:} per-thread sequenced PAL streams; packet carries VOR (MAX of all threads); release when $MAX_i \ge VOR_i$ for all $i$; scoreboard rejected ($O(nc)$ cache misses).
-\item \textbf{Implementation:} annotate shared vars; LLVM inserts locks/PALs (no deadlock); seqlocks; 128-slot PAL queues; OL adds 10--30\,$\mu$s; snapshot about 5\,$\mu$s/dirty page + 1--2\,ms.
-\item \textbf{Replay:} snapshot + logged input; PALs order lock acquisitions; OL drops duplicate outputs; exit replay when PALs run out.
+  \item Why a backup needs state (NAT port example), and why vendors reject resetting connections.
+  \item Snapshot-only must hold output until the next snapshot (ms). Lock-step copies diverge because of races and clocks.
+  \item Replay = log inputs + determinants; snapshots only shorten replay.
+  \item Output commit: no packet leaves before the information to recreate it is stable; recovered state must be \emph{consistent}, not identical.
+  \item Path: IL (number, store, forward) $\to$ Master (PALs) $\to$ OL (hold until PALs arrive) $\to$ network.
+  \item PAL $(p_i, n_{ij}, v_j, s_{ij})$: $s$ orders accesses to a variable, $n$ chains accesses of a packet; clocks log the returned value.
+  \item Dependencies: per-packet and per-variable predecessor, recursively; B depends on D's PAL but not on packet A.
+  \item Ordered logging: PALs separate from packets; PAL queued before lock release, so every dependency is queued before the packet.
+  \item Parallel release: per-thread numbered PAL streams; VOR = all threads' MAX when sent; release when logger's $MAX_i \ge VOR_i$ for all $i$
+        (worked example: missing PAL 58 holds B).
+  \item Rejected: exact scoreboard ($O(nc)$ cache misses), optimistic logging (600\,Mb/s), causal logging (huge logs).
+  \item Replay: snapshot + logged input, threads wait their PAL turn, logged clock values, OL removes duplicates, exit replay when PALs run out.
 \end{itemize}
