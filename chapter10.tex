@@ -1,115 +1,219 @@
 \chapter{Delay is Not an Option: Low Latency Routing in Space (Starlink)}
 \paperinfo{M. Handley (University College London)}{ACM HotNets 2018}
 
-\begin{keybox}[The paper in one paragraph]
-SpaceX's \key{Starlink} is a planned constellation of thousands of \key{low Earth orbit (LEO)} satellites using \key{phased-array antennas} for ground up/down links and \key{free-space lasers} between satellites. Lasers in vacuum travel at \key{$c$, about 47\% faster than light in glass}. Using a simulator built from SpaceX's public FCC filings, the paper works out how to \key{connect the satellites with lasers into a network}, how to \key{route} on this constantly moving but \key{predictable} topology, and what latency results. Conclusion: such a network can give \key{lower latency than any possible terrestrial fibre network for distances beyond about 3000\,km}, and offers \key{many disjoint low-latency paths}.
+\begin{keybox}[The paper in three sentences]
+SpaceX's Starlink plan puts thousands of satellites in low orbit (about 1,100--1,300\,km up), linked to each other by free-space lasers that carry light at
+$c$, about 47\% faster than light in glass. Using only the public FCC filings, the paper builds a simulator and works out how to wire the satellites together
+with their five lasers, how to route over a network whose topology changes every few seconds but is completely predictable, and what latencies result. Over
+distances beyond roughly 3000\,km, such a network can beat even an ideal fibre laid along the great circle, and it offers many near-equal paths, which raises new
+problems (packet reordering, load balancing) that the paper sets out as a research agenda.
 \end{keybox}
 
-\section{Motivation}
-\begin{itemize}
-\item Once traffic engineering has removed congestion and bufferbloat is fixed, the remaining wide-area latency problem is that \key{the speed of light in glass simply isn't fast enough} (see Chapter 9: fibre $\approx 2/3\,c$, and fibre routes are not great circles).
-\item Free-space lasers between satellites travel at $c$. So over long distances, \emph{going up to space, travelling at $c$ between satellites, and coming back down} can beat fibre, despite the extra trip up and down.
-\item Starlink is a \key{new kind of wide-area backbone}: thousands of nodes that \key{move constantly but predictably}; the network is far from a static mesh.
-\item Likely business: \key{low-latency premium service between already well-connected cities} (as private microwave links NY--Chicago, London--Frankfurt are for finance), not just connecting remote places.
-\end{itemize}
+% ------------------------------------------------------------------
+\section{Why go to space for low latency?}
 
-\section{The Starlink constellation}
+The previous chapter showed that wide-area latency is held back by the physical path: light in glass travels at only about $2/3\,c$, and fibre does not follow
+straight lines. Once congestion and bufferbloat are dealt with, that is what remains. \textbf{Lasers between satellites travel through vacuum at $c$}. So for a
+long trip, going up to a satellite, crossing the distance at $c$, and coming back down can beat fibre, despite the detour up and down. Over short distances the
+up-and-down detour costs more than the speed gain saves.
+
+\textbf{Example (New York--London, from the paper).} Fibre laid perfectly along the great circle would give an RTT of 55\,ms, which is impossible in practice because
+fibre cannot follow that route. The real Internet between well-connected sites gives 76\,ms. Through satellites directly overhead, the RTT varied between about 57 and
+66\,ms. With the smarter routing described below, it was clearly \emph{below} 55\,ms.
+
+\textbf{Who would pay?} The author expects the money to come less from connecting remote places than from selling \textbf{low-latency premium service between cities
+that already have fibre}, as with the private microwave links built for traders between New York and Chicago, London and Frankfurt, and London and Paris.
+
+% ------------------------------------------------------------------
+\section{The constellation}
+
 \begin{center}
 \small
 \begin{tabular}{@{}lccccc@{}}
 \toprule
- & \textbf{Phase 1} & \multicolumn{4}{c}{\textbf{Phase 2 (2,825 satellites)}} \\
+ & \textbf{Phase 1} & \multicolumn{4}{c}{\textbf{Phase 2 (2,825 more)}}\\
 \midrule
-Orbital planes & 32 & 32 & 8 & 5 & 6 \\
-Satellites per plane & 50 & 50 & 50 & 75 & 75 \\
-Altitude (km) & 1,150 & 1,110 & 1,130 & 1,275 & 1,325 \\
-Inclination & 53$^\circ$ & 53.8$^\circ$ & 74$^\circ$ & 81$^\circ$ & 70$^\circ$ \\
+Orbital planes & 32 & 32 & 8 & 5 & 6\\
+Satellites per plane & 50 & 50 & 50 & 75 & 75\\
+Altitude (km) & 1,150 & 1,110 & 1,130 & 1,275 & 1,325\\
+Inclination & 53$^\circ$ & 53.8$^\circ$ & 74$^\circ$ & 81$^\circ$ & 70$^\circ$\\
 \bottomrule
 \end{tabular}
 \end{center}
+
 \begin{itemize}
-\item \textbf{Phase 1}: 1,600 satellites at 1,150\,km covering all but the far north and south. \textbf{Phase 2}: 2,825 more (1,110--1,325\,km), denser at low latitudes and covering up to at least 70$^\circ$N. Total \key{4,425} LEO satellites. (A later 7,518-satellite VLEO layer at about 340\,km is not studied.)
-\item \textbf{RF reachability}: a satellite is usable from a ground station if it is within \key{40$^\circ$ of vertical}.
-\item \textbf{Five lasers per satellite}: the filings list five silicon-carbide ``communication components'' (laser mirrors) per satellite, so assume \key{five free-space laser links}. Five is also effectively the \emph{minimum} needed for a dense low-latency network.
-\item Laser capacity is likely high (100\,Gb/s+, since Starlink's links are short --- around 1000\,km --- compared with the 45,000\,km LEO-to-GEO EDRS link), but the paper studies only \key{latency}, which depends only on topology and $c$.
+  \item \textbf{Phase 1} is 1,600 satellites: 32 orbital planes of 50, at 1,150\,km, tilted 53$^\circ$ to the equator. It covers everything except the far north and south.
+        \textbf{Phase 2} adds 2,825 more, filling in the lower latitudes and reaching at least 70$^\circ$N, for 4,425 in total. (A later very-low-orbit layer is not studied.)
+  \item \textbf{Ground links}: phased-array antennas steer radio beams. A ground station can use any satellite within \textbf{40$^\circ$ of straight up}.
+  \item \textbf{Five lasers per satellite}: the filings list five silicon-carbide parts per satellite that might survive re-entry, a material used for laser mirrors.
+        So the paper assumes five laser links, and argues that five is also about the minimum for a good low-latency network.
+  \item Capacity is not modelled. Links are short (about 1000\,km, against 45,000\,km for Europe's 1.8\,Gb/s EDRS laser relay), so 100\,Gb/s+ seems plausible, but it is
+        speculative. \textbf{Latency depends only on the topology and on $c$}, so that is what the paper studies.
 \end{itemize}
 
-\subsection{Orbital phase offset}
-\begin{itemize}
-\item The 50 satellites in a plane are evenly spaced, and the 32 planes cross the equator at evenly spaced longitudes. The \key{phase offset} (0--1) says when satellites in consecutive planes cross the equator: 0 means satellite $n$ in plane $p$ crosses with satellite $n$ in plane $p+1$; 1 means with satellite $n+1$. For a uniform constellation it must be a multiple of 1/32.
-\item Constraint: satellites in different planes must not collide where planes cross. Even multiples of 1/32 collide; simulating the odd ones, the best (largest minimum passing distance) is \key{5/32} for the 53$^\circ$ shell, and \key{17/32} for the 53.8$^\circ$ shell (whose planes are staggered halfway between the 53$^\circ$ planes).
-\item Coverage is \key{not uniform}: densest near $\pm 53^\circ$ latitude (London at 51.5$^\circ$N sees about 30 satellites within the 40$^\circ$ cone).
-\end{itemize}
-\paperfig[0.62]{sl_fig2_3_orbits}{Satellite orbits: Phase 1 (left, 1,600 satellites at 53$^\circ$) and Phase 2 (right, full 4,425-satellite constellation).}
+\subsection{Where the satellites are relative to each other: phase offset}
+In each plane the 50 satellites are evenly spaced, and the 32 planes cross the equator at evenly spaced longitudes. One more number fixes the whole pattern:
+the \key{phase offset}, which says how satellites in neighbouring planes are staggered. Offset 0 means satellite $n$ of plane $p$ crosses the equator at the same moment
+as satellite $n$ of plane $p+1$; offset 1 means at the same moment as satellite $n+1$. For a regular pattern it must be a multiple of 1/32.
 
-\section{Building the network: which satellites to connect}
-Most laser links must stay up most of the time (a laser takes time --- up to a minute for EDRS --- to acquire a new partner). Key observation: in any region, \key{half the satellites travel north-east and half south-east} (all at about 7.3\,km/s). A NE-bound and a SE-bound satellite pass each other quickly, so a laser between them must track fast and keep switching partners.
+Neighbouring planes cross each other, so a bad offset makes satellites collide at the crossings. Simulating all options: every even multiple of 1/32 produces
+collisions. Among the odd ones, \textbf{5/32} keeps satellites farthest apart for the 53$^\circ$ shell. The 53.8$^\circ$ shell is placed halfway between the
+53$^\circ$ planes, and its best offset is \textbf{17/32}.
+
+\paperfig[0.62]{sl_fig2_3_orbits}{The orbits: Phase 1 (left, 1,600 satellites at 53$^\circ$) and the full Phase 2 constellation (right, 4,425 satellites).}
+
+Coverage is \textbf{not uniform}. A satellite on a 53$^\circ$ orbit spends a lot of time near the top and bottom of its swing, so satellites bunch up near
+53$^\circ$N and S. London (51.5$^\circ$N) has about 30 satellites within its 40$^\circ$ cone at any moment.
+
+% ------------------------------------------------------------------
+\section{Wiring the network: which satellites each laser points at}
+
+\subsection{The key geometric fact: two meshes moving in different directions}
+Each satellite is launched eastward, so it climbs north-east towards 53$^\circ$N, turns, and comes back down heading south-east. So over any region, roughly
+\textbf{half the satellites are heading north-east and half south-east}, all at about 7.3\,km/s. Two satellites in the same plane, or in neighbouring planes, keep
+roughly the same relative position. But a NE-bound satellite and a SE-bound satellite are on crossing paths: they come into range and leave again quickly.
+
+This matters because pointing a laser at a new partner is slow (Europe's EDRS takes up to a minute to acquire a link). A network where most links must
+constantly re-point would mostly be down. So the main links must go to partners that stay put relative to the satellite.
+
+\subsection{The five lasers}
+\paperfig[0.35]{sl_fig4_lasers}{The five lasers of one north-east-bound satellite: two fixed links along its own plane, two slowly tracking side links to the
+neighbouring planes (pointing roughly east--west), and one rapidly tracking link to a satellite of the other mesh.}
+
 \begin{enumerate}
-\item \key{Lasers 1--2: forward and backward along the same orbital plane.} These neighbours never move relative to the satellite; only fine-tuning is needed. They give SW$\leftrightarrow$NE and NW$\leftrightarrow$SE connectivity.
-\item \key{Lasers 3--4: side links to the neighbouring orbital planes.} Only satellites in adjacent planes stay in range consistently. With phase offset 5/32, linking satellite $n$ in plane $p$ to the \emph{nearest} satellites ($n+1$ in $p+1$) would nearly parallel the in-plane links. Instead link \key{satellite $n$ in plane $p$ to satellite $n$ in planes $p\pm1$}: this gives very good \key{east--west} connectivity (slightly off exact E--W, covering a range of directions). East--west is prioritized because the paying population is concentrated at 30--55$^\circ$N.
-\item \key{Laser 5: link between the two meshes.} Lasers 1--4 form \emph{two separate meshes} in each region --- one moving NE, one moving SE --- connected only the long way round the planet. The fifth laser connects to a \key{crossing satellite} of the other mesh. These links track very fast and are often down while re-aligning, but still improve routing a lot.
+  \item \textbf{Lasers 1 and 2: the satellites ahead and behind in the same plane.} These never move relative to this satellite, so the lasers need only fine
+        adjustment. Chains of such links give paths running SW$\leftrightarrow$NE and NW$\leftrightarrow$SE.
+  \item \textbf{Lasers 3 and 4: the neighbouring planes on either side.} Only satellites in adjacent planes stay in range all the time. The obvious choice, the
+        \emph{nearest} satellite there ($n+1$ in plane $p+1$ with offset 5/32), turns out to point almost the same way as the in-plane links, adding little new
+        direction. Instead, satellite $n$ links to satellite $n$ in planes $p-1$ and $p+1$. Because of the 5/32 stagger, these links point roughly
+        \textbf{east--west}, slightly tilted, so together they offer good paths over a range of near east--west directions. East--west was prioritised because the
+        people most likely to pay for latency live mostly in a band from 30$^\circ$ to 55$^\circ$N.
+  \item \textbf{Laser 5: bridging the two meshes.} Lasers 1--4 produce two separate meshes in every region, the NE-moving one and the SE-moving one, which locally connect
+        only by going all the way round the planet. The fifth laser links each satellite to a passing satellite of the other mesh. These links must track very fast and
+        are often down while they re-point to the next passing satellite, but they still improve routing noticeably.
 \end{enumerate}
-\paperfig[0.35]{sl_fig4_lasers}{The lasers of one NE-bound satellite: fixed forward/backward links along its plane, slowly tracking side links to neighbouring planes (near east--west), and one rapidly tracking link to a crossing satellite.}
-\paperfig[0.62]{sl_fig5_6_links}{Phase 1 network: side links only (left), giving good east--west connectivity; all laser links (right).}
 
-\section{Routing}
-\subsection{Basic approach: Dijkstra with source routing}
+\paperfig[0.62]{sl_fig5_6_links}{The Phase 1 network: only the side links (left), showing the near east--west paths; all laser links (right).}
+
+% ------------------------------------------------------------------
+\section{Routing on a moving network}
+
+\subsection{Basic scheme: Dijkstra on latency, computed for the future}
+Start simply. Each ground station connects to the satellite \textbf{most directly overhead} (strongest radio signal). Then run \textbf{Dijkstra's shortest-path
+algorithm} over the satellite graph, with each link weighted by its propagation delay, to find the lowest-latency path.
+
+The topology keeps changing: the overhead satellite changes, mesh-bridging lasers switch partners, and link lengths (hence delays) change continuously. But two
+facts make this easy:
 \begin{itemize}
-\item Simplest: each ground station connects to the satellite \key{most directly overhead} (strongest RF signal), then run \key{Dijkstra} over the satellite graph with \key{link latency as the metric}.
-\item The topology changes constantly (overhead satellite changes, NE--SE lasers switch, link latencies vary), but Dijkstra for all destinations runs easily every 10\,ms even on a laptop CPU.
-\item Crucially, \key{all topology changes are predictable}. So run Dijkstra (e.g., every 50\,ms) on the network \key{as it will be about 200\,ms in the future}, cache the results, and check whether a packet will cross a link that will have disappeared by the time it arrives. Each \key{sending ground station source-routes} its packets so they always find their links up.
-\item Purely local greedy forwarding at each satellite (like GPSR) gives a long latency tail, because packets discover mid-way that their onward path has vanished.
+  \item \textbf{It is cheap.} Dijkstra from one ground station to all destinations runs comfortably every 10\,ms on a laptop CPU.
+  \item \textbf{It is predictable.} Orbits are physics, so the topology at any future moment is known exactly.
 \end{itemize}
+So each sending ground station runs Dijkstra, say every 50\,ms, on the network \textbf{as it will be about 200\,ms in the future}, and caches the results. When it sends a
+packet, it can check that every link on the chosen path will still exist when the packet reaches it, and it \textbf{source-routes} the packet: the packet carries its
+full path, and satellites just follow it.
 
-\subsection{Problems with ``straight up, across, straight down''}
+\textbf{Why not let each satellite decide the next hop locally}, as in greedy geographic routing (GPSR)? Because a packet would then discover halfway that the onward
+link it was counting on has gone, and have to detour. That gives a long tail of bad latencies. Computing the whole path at the source, against the future
+topology, avoids this.
+
+\subsection{Problem: spikes when the two cities are on different meshes}
+With overhead satellites, the New York--London RTT averaged better than today's Internet, but had \textbf{spikes} (one lasting from about 70 to 95\,s in the
+simulation). They occurred when the satellite over one city was in the NE-moving mesh and the one over the other city was in the SE-moving mesh. The path then had
+to use the short-lived, indirect mesh-bridging links. In addition, going straight up, across and straight down is longer than necessary.
+
+\subsection{Fix: route the radio links too}
+Instead of fixing ``the satellite overhead'' in advance, put \textbf{every possible radio up- and down-link} into the graph: from each city, an edge to every satellite
+within its 40$^\circ$ cone, weighted by its delay. Dijkstra then chooses the up-link and down-link together with the laser path. The result:
 \begin{itemize}
-\item NYC--London latency via overhead satellites is on average lower than today's Internet, but has \key{spikes} when the satellites above the two cities are on \key{different meshes} (one NE-bound, one SE-bound): the fifth-laser links between meshes are indirect and short-lived.
-\item Also, going vertically up, horizontally, then vertically down is longer than necessary.
+  \item it picks satellites \textbf{in the direction of the destination}, usually near the edge of the cone (about 40$^\circ$ from vertical), so the slanted up and down
+        links themselves cover ground towards the destination;
+  \item it picks an up/down pair on the \textbf{same mesh}, avoiding the spikes;
+  \item the cost is about 3\,dB weaker radio signal from the slanted links, so probably a lower bitrate.
 \end{itemize}
-
-\subsection{Co-routing RF and lasers}
-Put \key{all possible RF up/down links} (every satellite within the 40$^\circ$ cone of each city) into the graph that Dijkstra runs over. Then routing automatically picks the best matched up/down satellite pair, in the \key{direction of the destination} --- usually satellites near 40$^\circ$ from vertical --- at the cost of about 3\,dB weaker RF signal (lower bitrate). With this, NY--London, SF--London and London--Singapore RTTs are \key{well below the RTT of fibre laid along the great circle} --- an unattainable bound for fibre.
+With this, the RTTs for New York--London, San Francisco--London and London--Singapore all stayed \textbf{well below the RTT of fibre along the great circle},
+a bound no real fibre can reach.
 
 \subsection{North--south routes and Phase 2}
+Phase 1's lasers favour east--west. London--Johannesburg is mostly north--south. Satellites still roughly halve today's 182\,ms Internet RTT, but the path zig-zags
+along SW and SE links. Phase 2 addresses this:
 \begin{itemize}
-\item Phase 1 lasers favour east--west paths. London--Johannesburg (mostly north--south) already roughly halves today's 182\,ms Internet RTT, but zig-zags along SW/SE links.
-\item \textbf{Phase 2, 53.8$^\circ$ shell}: these satellites are 40\,km lower, so they orbit slightly faster and drift relative to the 53$^\circ$ ones. Linking 53$^\circ$ to 53.8$^\circ$ satellites makes paths slowly become zig-zag, so \key{53.8$^\circ$ satellites link only to 53.8$^\circ$ satellites}. With phase offset 17/32, the side lasers are \key{offset by 2} (satellite $n$ in plane $p$ to $n-2$ in $p-1$ and $n+2$ in $p+1$) to give good \key{north--south} paths, especially at higher latitudes.
-\item High-inclination satellites (70--81$^\circ$) have planes too far apart to link neighbours except near the poles, so their spare lasers connect \key{opportunistically} to nearby satellites, giving polar coverage and extra N--S capacity.
-\item Phase 2 improves London--Johannesburg by about 20\%, and the \emph{second-best disjoint} path is almost as good, so latency does not depend critically on any one satellite or link.
+  \item The 53.8$^\circ$ satellites fly 40\,km lower, so each orbit takes 53\,s less than Phase 1's (about 107 minutes). Linking them to 53$^\circ$ satellites fails:
+        they drift apart, paths slowly turn into zig-zags, and the links eventually have to switch partners. So \textbf{53.8$^\circ$ satellites link only to 53.8$^\circ$
+        satellites}, even though those are farther away.
+  \item With their 17/32 offset, their side lasers are \textbf{offset by two}: satellite $n$ in plane $p$ links to $n-2$ in plane $p-1$ and to $n+2$ in plane $p+1$. These
+        links run roughly \textbf{north--south}, especially well at higher latitudes.
+  \item The high-inclination satellites (70--81$^\circ$) have planes too far apart for side links except near the poles, so their spare lasers connect
+        \textbf{opportunistically} to whatever satellite passes close. This gives polar coverage and extra north--south capacity.
 \end{itemize}
-\paperfig[0.4]{sl_fig10_phase2}{Phase 2 (53.8$^\circ$ shell) side links offset by two satellites, giving north--south oriented paths.}
+Phase 2 improved London--Johannesburg by about 20\%. The \emph{second-best} path, found after deleting every link of the best one, was nearly as good, so latency does not
+depend on any single satellite or link.
 
-\subsection{Multipath}
-\begin{itemize}
-\item One satellite path's bandwidth is small compared with long-haul fibre, but a dense LEO constellation offers \key{many paths} (about 60 satellites in range near 50$^\circ$N).
-\item Compute disjoint paths iteratively: run Dijkstra, remove all RF and laser links of that path, rerun. For NYC--London, \key{5 of the best 20 disjoint paths beat great-circle fibre} and \key{all 20 beat today's Internet}. The longer the distance, the more paths beat fibre.
-\item Worse paths have \key{more variable latency} (fewer options). Variations of about 10\% won't trigger TCP timeouts, but \key{sudden latency decreases cause reordering}, which TCP mistakes for loss (spurious fast retransmit).
-\end{itemize}
+\paperfig[0.4]{sl_fig10_phase2}{Phase 2 (53.8$^\circ$ shell): side links offset by two satellites give paths running roughly north--south.}
 
+\subsection{Many paths at once}
+A single satellite path carries much less than a long-haul fibre, but a dense constellation offers \textbf{many} paths: near 50$^\circ$N there may be 60 satellites in
+range. To count them, the author finds \textbf{disjoint} paths iteratively: run Dijkstra, delete every radio and laser link that path used, run Dijkstra again, and so on.
+For New York--London, of the best 20 disjoint paths, \textbf{5 beat great-circle fibre} and \textbf{all 20 beat today's Internet}. The longer the distance, the more
+paths beat fibre.
+
+Worse paths have fewer alternatives, so their latency jumps around more. A 10\% variation will not trigger TCP timeouts, but a sudden \emph{drop} in latency (a route change
+to a shorter path) makes later packets overtake earlier ones. TCP sees the resulting \textbf{reordering} as loss and needlessly retransmits.
+
+% ------------------------------------------------------------------
 \section{Research agenda}
-\paragraph{Reordering.} Unlike terrestrial networks, reordering here is \key{completely predictable} (all routes are known hundreds of ms ahead, if satellites don't queue). Solutions:
+
+\subsection{Reordering, which here is predictable}
+On a normal network reordering is random. Here, as long as satellites do not queue packets, every route and its delay is known hundreds of milliseconds ahead, so
+reordering can be undone exactly. Three options, from simplest to best:
+\begin{enumerate}
+  \item \textbf{Reorder buffer at the receiving ground station}: hold packets that came over a faster path until their delay matches the slower path. Even the 20th-best
+        New York--London path then has an RTT of about 74\,ms, still below today's Internet.
+  \item \textbf{Tag packets at the sender} with a sequence number, a path ID, and $t_{last}$, the time since the last packet was sent on the previous path. When the receiver
+        sees the path ID change and earlier packets are still missing, it holds the new path's packets until the missing ones arrive or until $t_{diff} - t_{last}$ has
+        passed, where $t_{diff}$ is the known difference between the two paths' delays. \textit{Example:} the old path takes 40\,ms one way and the new one 35\,ms, so
+        $t_{diff} = 5$\,ms. If the last old-path packet left 1\,ms before the first new-path packet, the receiver waits at most $5 - 1 = 4$\,ms. By then every old-path packet
+        must have arrived.
+  \item \textbf{Reorder at the sender}: if the sender has a queue longer than the delay difference, it can pick packets out of order and send them on paths of different
+        delay so that they \emph{arrive} in order.
+\end{enumerate}
+
+\subsection{Failures}
+The design is naturally resilient. If a satellite's radio fails, it can still relay traffic over its lasers, and many other satellites cover the ground. If one of its
+five lasers fails, it uses the remaining four for the in-plane and side links and drops the least important one, the mesh bridge. Spare satellites can be moved along a plane
+cheaply (changing plane costs too much fuel), and the 75-per-plane spacing of the high-inclination shells may let lasers skip a failed neighbour. The catch is that
+\textbf{every ground station must learn of every failure}, because each computes routes itself. Polar regions are sparse and less redundant.
+
+\subsection{Routing under load}
+The simulations assume no queueing in satellites. Two kinds of traffic would need different treatment:
 \begin{itemize}
-\item a \key{reorder buffer at the receiving ground station}: hold packets from a faster path until their one-way delay matches the slower path (even path 20 then stays below today's Internet RTT);
-\item better: the sender tags packets with a \key{sequence number, path ID}, and $t_{\text{last}}$ (time since the last packet on the previous path). On a path change, if earlier packets are missing, the receiver holds new-path packets until they arrive or until $t_{\text{diff}}-t_{\text{last}}$ elapses ($t_{\text{diff}}$ = known path-delay difference);
-\item or the \key{sender} pulls packets out of its queue out of order and sends them over paths of different delay so they \emph{arrive} in order.
+  \item \textbf{Premium low-latency traffic} gets strict priority, explicit lowest-latency routes, and \textbf{admission control} that keeps its volume small, as on the trading
+        microwave links.
+  \item \textbf{Ordinary traffic} needs traffic engineering, since shortest-path routing on a mesh creates hotspots. Centralised schemes like B4 recompute every few minutes,
+        which is far too slow for a topology that changes every few seconds, and the controller's distance from the ground stations adds delay.
 \end{itemize}
-\paragraph{Failures.} The network is \key{inherently resilient}: if an RF transceiver fails, the satellite still relays traffic and other satellites cover the ground; if one of five lasers fails, use the remaining four for in-plane and side links (the inter-mesh link is least critical). On-orbit spares can move \emph{along} a plane cheaply (changing planes costs too much fuel); 75 satellites per plane in high-inclination shells may let lasers skip a failed neighbour. But \key{every ground station must learn of every failure} to route around it. Polar regions are sparser and less redundant.
-\paragraph{Load-dependent routing.} The simulations assume no queuing in satellites.
-\begin{itemize}
-\item \key{High-priority} (paid) low-latency traffic: \key{admission control} keeps its volume small, and it gets explicit minimum-latency routes (like HFT microwave links).
-\item Ordinary traffic needs \key{traffic engineering} to avoid hotspots (shortest-path routing on meshes creates hotspots). Centralized schemes like \key{B4} or LDR decide minute-by-minute --- \key{too slow} for LEO, and controller latency may be too high.
-\item Proposed \key{hybrid}: satellites measure link load and \key{broadcast it to all ground stations}; hotspots tend to be \emph{geographic}; ground stations \key{randomize path choice across slightly worse paths} to spread load. Because there are \emph{many similar-latency paths}, ground stations can move traffic back to the best path conservatively (slowly), avoiding the flip-flop instability that this would cause in traditional topologies.
-\end{itemize}
+Proposed \textbf{hybrid}: satellites measure their link loads and \textbf{broadcast them to all ground stations}. Hotspots in such a network are mostly geographic. Ground
+stations then \textbf{spread traffic randomly over slightly worse paths} near a hotspot. In an ordinary network this would make traffic flip back and forth between the
+best path and the alternative. Here there are so many similar-latency paths that ground stations can afford to move traffic back to the best path \emph{slowly}, which
+avoids that instability.
+
+\begin{keybox}[Exam one-liner]
+Starlink-style LEO constellations (Phase 1: 32 planes $\times$ 50 satellites at 1,150\,km, 53$^\circ$, phase offset 5/32) connect satellites with five lasers at
+$c$: two along the plane, two side links to the same-index satellite in neighbouring planes (east--west), and one bridge between the NE- and SE-moving meshes.
+Each ground station runs Dijkstra on latency over the \emph{predicted} topology about 200\,ms ahead, including all radio up/down links within 40$^\circ$, and
+source-routes packets. The result beats great-circle fibre beyond about 3000\,km, with many disjoint paths. Open problems: predictable reordering, failure
+dissemination, and load-aware routing.
+\end{keybox}
 
 \section{Revision checklist}
 \begin{itemize}
-\item \textbf{Core idea:} LEO satellites + free-space lasers at $c$ (47\% faster than fibre) beat any fibre beyond $\sim$3000\,km.
-\item \textbf{Constellation:} Phase 1 = 1,600 sats, 32 planes $\times$ 50, 1,150\,km, 53$^\circ$; total 4,425; RF usable within 40$^\circ$ of vertical; 5 lasers per satellite.
-\item \textbf{Phase offset:} avoid collisions; 5/32 (53$^\circ$), 17/32 (53.8$^\circ$); coverage densest near $\pm53^\circ$.
-\item \textbf{Laser plan:} 2 in-plane (fixed), 2 side links to same-index satellite in neighbouring planes (east--west), 1 to crossing satellite of the other (NE vs.\ SE) mesh.
-\item \textbf{Routing:} Dijkstra on latency, recomputed frequently on the \emph{future} topology; ground station source-routes; greedy per-satellite routing has a long tail.
-\item \textbf{RF + laser co-routing:} include all up/down links in the graph; picks satellites toward the destination ($\sim$40$^\circ$ off vertical); RTT below great-circle fibre.
-\item \textbf{Phase 2:} 53.8$^\circ$ links only to 53.8$^\circ$ (drift), offset-by-2 side links for north--south; high-inclination satellites link opportunistically.
-\item \textbf{Multipath:} many disjoint paths, several better than fibre; latency changes cause TCP reordering.
-\item \textbf{Agenda:} predictable reordering (receiver buffer, path-ID tags, sender reordering); resilience but global failure knowledge; admission control for premium traffic + load broadcast and randomized path choice for the rest.
+  \item Why space: vacuum laser at $c$ (47\% faster than glass) beats fibre over long distances despite the climb; NYC--LON: fibre ideal 55\,ms, Internet 76\,ms, overhead satellites 57--66\,ms, co-routed below 55.
+  \item Constellation: Phase 1 1,600 (32 $\times$ 50, 1,150\,km, 53$^\circ$); total 4,425; radio within 40$^\circ$ of vertical; five lasers; coverage densest near $\pm 53^\circ$.
+  \item Phase offset: even multiples collide; 5/32 (53$^\circ$), 17/32 (53.8$^\circ$).
+  \item Two meshes (NE-bound, SE-bound); laser re-pointing is slow, so main links go to partners that stay put.
+  \item Lasers: 2 in-plane (fixed), 2 side to satellite $n$ in planes $p \pm 1$ (east--west), 1 rapid bridge to the other mesh.
+  \item Routing: Dijkstra on delay every 50\,ms for the topology 200\,ms ahead; source routing; greedy per-hop routing has a long tail.
+  \item Spikes when endpoints are on different meshes; fix by putting all radio links in the graph (picks slanted satellites towards the destination, about 3\,dB weaker).
+  \item Phase 2: 53.8$^\circ$ links only to 53.8$^\circ$ (drift), side links offset by 2 for north--south; high-inclination opportunistic; London--Johannesburg 20\% better.
+  \item Multipath: iterative disjoint Dijkstra; 5 of 20 beat fibre, all 20 beat the Internet; latency drops cause reordering.
+  \item Agenda: reorder buffer / path-ID tagging ($t_{diff} - t_{last}$) / sender-side reordering; failures known everywhere; admission control for premium traffic, load broadcast and randomised path spreading for the rest.
 \end{itemize}
