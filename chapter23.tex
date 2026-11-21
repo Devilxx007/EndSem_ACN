@@ -1,0 +1,239 @@
+\chapter{Stateless Network Functions: Decoupling State from Processing}
+\paperinfo{M. Kablan, A. Alsudais, E. Keller (University of Colorado Boulder), F. Le (IBM Research)}{USENIX NSDI 2017}
+
+\begin{keybox}[StatelessNF in one paragraph]
+Network functions (NFs: firewalls, NATs, load balancers, IPSes) keep per-flow state \emph{inside} each instance. That \key{tight coupling of state and processing} makes failover lose state, makes scaling out/in break existing flows, and breaks under \key{asymmetric or multipath routing}. \key{StatelessNF} moves all \key{dynamic network state} into a \key{low-latency, resilient data store} (RAMCloud over Infiniband/RDMA), so NF instances become \key{stateless processors}: \key{any packet can be handled by any instance}. A network-wide \key{orchestrator} watches load and failures, starts or kills instances (Docker), and steers traffic with \key{OpenFlow}. Each instance is a set of DPDK \key{pipes} (a pull thread + a processing thread + a lockless queue) with an optimised data-store client (\key{batching}, \key{pre-allocated buffers}, \key{no copy}). It reaches 10\,Gb/s with 100--500\,$\mu$s added latency, and fails over and scales \key{without disrupting} flows.
+\end{keybox}
+
+\section{What ``state'' means here}
+\begin{center}
+\begin{tabularx}{\linewidth}{@{}llX@{}}
+\toprule
+\textbf{Kind} & \textbf{Examples} & \textbf{Where it lives in StatelessNF} \\
+\midrule
+\key{Static state} & firewall rules, IPS signature database & Copied to every instance at boot; read locally \\
+Dynamic: \key{internal, instance-specific} & file descriptors, temporary variables & Stays local (not needed by others) \\
+Dynamic: \key{network state} & connection tracking, NAT port mappings, LB server assignments, IPS automaton position & \key{Remote data store}: must survive failures and be visible to every instance \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\section{The problem: state locked inside an instance}
+\paperfig[0.95]{sl_fig2_problems}{Four failure modes of coupled state (flows F, their packets P): (a) after failure the new instance's lookups fail; (b) scale-out: moved flows fail lookups; (c) scale-in must wait for the instance to drain; (d) asymmetric routing: the SYN-ACK reaches an instance that never saw the SYN.}
+\begin{enumerate}
+\item \key{Failure}: virtualisation can launch a new instance quickly and SDN can redirect traffic, but the new NAT has no mappings for existing flows, so their lookups fail, new (wrong) mappings are made, and connections time out. Hot standby doubles cost. Also, because failover is expensive, detectors are \key{conservative} (is a missed hello a crash, a lost packet, or just overload?): aggressive thresholds cause needless failovers, conservative ones keep sending traffic to a dead box.
+\item \key{Scale out}: a new instance cannot take \emph{existing} flows, since their state is elsewhere; only new flows can be moved.
+\item \key{Scale in}: an instance can only be shut down after \key{all its flows finish} (drain), which limits agility and assumes short flows.
+\item \key{Asymmetric / multipath routing}: a firewall instance sees an internal client's SYN; the SYN-ACK returns via \emph{another} instance, whose lookup fails, so it drops the packet.
+\end{enumerate}
+
+\subsection{Why existing fixes fall short}
+\begin{center}
+\begin{tabularx}{\linewidth}{@{}lXX@{}}
+\toprule
+\textbf{Approach} & \textbf{Idea} & \textbf{Limitation} \\
+\midrule
+\key{Checkpointing} (Pico replication) & Checkpoint state often; release a packet only after the state it affects is checkpointed & About \key{10\,ms} per-packet latency (at 1000 checkpoints/s); no elasticity \\
+\key{Log + replay} (FTMB) & Log inputs and replay after failure & Low latency, but \key{recovery takes as long as replaying since the last checkpoint}; no elasticity, no help for asymmetric routing \\
+\key{State migration} (Split/Merge, OpenNF, Router Grafting) & Export state from one instance and import it into another via an API & Takes time; \key{useless for unplanned failures}; still relies on \key{flow-to-instance affinity} \\
+Cross-instance sync (distributed IDS, HSRP) & Exchange state or wait on other instances & Synchronises processing; does not scale \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\section{The idea}
+\paperfig[0.55]{sl_fig1_overview}{(a) Traditional NFs bundle state with processing. (b) StatelessNF puts the state in a data store; the NF instances only process.}
+\begin{itemize}
+\item \key{Resilience}: a replacement instance has all the state immediately, so failover does not disrupt traffic. Failover is so cheap that it can be \key{speculative}: fail over on suspicion, and correct later if wrong.
+\item \key{Elasticity}: scale out by starting an instance and sending traffic to it at once (an established connection's lookup succeeds via the store); scale in by just redirecting traffic away.
+\item \key{Asymmetric / multipath routing}: correctness no longer depends on flow affinity; \key{any instance can handle any packet}. Logically there is one scalable, resilient NF.
+\end{itemize}
+\textbf{Why this is feasible at packet rates} (unlike a web server with a database, an NF may touch state per packet):
+\begin{enumerate}
+\item New \key{low-latency, resilient data stores} from disaggregation research, e.g.\ \key{RAMCloud}.
+\item Only \key{dynamic network state} must be remote; static state is replicated locally.
+\item NFs share a pattern: a \key{lookup} when the packet arrives and sometimes a \key{write} after processing, so there are fewer store interactions than one might fear, and they can be optimised.
+\end{enumerate}
+
+\section{How network functions use the store}
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}llllX@{}}
+\toprule
+\textbf{NF} & \textbf{State} & \textbf{Key} & \textbf{Value} & \textbf{Access pattern} \\
+\midrule
+Load balancer & backend pool & cluster ID & IP list & 1 read/write at connection start/end \\
+ & assigned server & 5-tuple & server IP & 1 read/write at start/end; \key{1 read per other packet} \\
+Firewall & flow & 5-tuple & TCP flag & 5 read/write at start/end; 1 read per other packet \\
+NAT & pool of IPs/ports & cluster ID & IP+port list & 1 read/write at start/end \\
+ & mapping & 5-tuple & (IP, port) & 1 read/write at start/end; 1 read per other packet \\
+TCP re-assembly & expected seq. record & 5-tuple & next seq., buffered-packet keys & 1 read/write \key{every packet} \\
+ & buffered packets & buffer pointer & packet & 1 read/write per out-of-order packet \\
+IPS & automaton state & 5-tuple & integer & 1 write on first packet; \key{1 read + 1 write per packet} \\
+\bottomrule
+\end{tabularx}
+\end{center}
+(Reads and writes are written \texttt{readRC}/\texttt{writeRC}, RC for RAMCloud.)
+
+\subsection{Load balancer}
+\begin{lstlisting}
+process(P):
+  extract 5-tuple
+  if P is TCP SYN:                       # new connection
+      backends = readRC(ClusterID)
+      server   = nextServer(backends, 5-tuple)
+      updateLoad(backends, server)
+      writeRC(ClusterID, backends)
+      writeRC(5-tuple, server)
+      send(P, server)
+  else:                                  # existing connection
+      server = readRC(5-tuple)
+      if server is NULL: drop(P) else send(P, server)
+\end{lstlisting}
+
+\subsection{IPS (signature matching)}
+\begin{itemize}
+\item Offline, all signatures are compiled into \key{one deterministic automaton} (e.g.\ Aho-Corasick, as in Snort); this is \key{static} state on every instance.
+\item Per flow, the only dynamic state is the \key{automaton's current node} (an integer), keyed by 5-tuple.
+\item SYN: initialise the node and \texttt{writeRC}. Data packet: \texttt{readRC} the node, feed each payload byte through the automaton (alert on a match), \texttt{writeRC} the new node, forward.
+\item Out-of-order bytes are handled by a \key{TCP re-assembly} module in front (like Snort's preprocessor), which keeps its expected sequence number and buffered packets in the store.
+\end{itemize}
+
+\subsection{Firewall and NAT}
+\begin{itemize}
+\item \key{Firewall}: key = \emph{directional} 5-tuple; read the session state, compute the new state from the TCP flags, write it back only if it changed, then allow or drop by checking rules against the state.
+\item \key{NAT}: read the (IP, port) mapping for the 5-tuple; if none, read the pool for the cluster, take a free (IP, port), write the updated pool and the new mapping; then rewrite and forward.
+\end{itemize}
+
+\textbf{Worked example: store operations for one load-balanced TCP connection of 10 packets.}
+\begin{center}
+\begin{tabular}{@{}lccl@{}}
+\toprule
+\textbf{Packet} & \textbf{Reads} & \textbf{Writes} & \textbf{What} \\
+\midrule
+SYN & 1 & 2 & read pool; write updated pool and 5-tuple$\to$server \\
+9 data packets & 9 & 0 & read 5-tuple$\to$server each time \\
+\midrule
+Total & 10 & 2 & about one store access per packet \\
+\bottomrule
+\end{tabular}
+\end{center}
+If the 6th packet goes to a \emph{different} instance (scale-out, failover or asymmetric path), its \texttt{readRC} still finds the server, so the connection survives. In a traditional LB that lookup fails and the packet is dropped.
+
+\section{System architecture}
+\paperfig[0.6]{sl_fig3_arch}{StatelessNF: NF instances on commodity hosts read and write state in a shared data store (with a timeout manager); a controller monitors and manages hosts and installs OpenFlow rules on an SDN switch that steers traffic to instances.}
+Three components: the \key{data store}, the \key{NF hosts} (commodity servers running instances), and the \key{orchestration} (controller + SDN).
+
+\subsection{The data store}
+\begin{itemize}
+\item \key{Separation of concerns}: the NF only processes packets; the store provides resilience (replication) and global access. Since the store is on the packet's critical path, it must be \key{low latency}. Transactions are not assumed.
+\item \key{RAMCloud}: a distributed in-memory key-value store.
+\begin{itemize}
+\item \key{Resilient}: keeps \key{one copy in DRAM}; writes are appended to a \key{log} that is sent to replicas, which buffer it in memory and write it to \key{disk}. A crashed server's memory is rebuilt by replaying its log. (Full in-memory replication would cost too much RAM.)
+\item \key{Fast}: about \key{6\,$\mu$s reads} and \key{15\,$\mu$s durable writes} (100 bytes) at up to 10,000 servers, using Infiniband/RDMA, all data in memory, and optimised request handling. The design does not depend on Infiniband (RoCE and DPDK-Ethernet versions were in development).
+\end{itemize}
+\item \key{Timers}: NFs need timeouts (e.g.\ expire idle connections), which do not fit a key-value interface (polling would be wasteful). The store interface is extended so an NF can \key{create and update timers}; on expiry, a \key{timeout manager} notifies \key{exactly one} NF instance, whose handler processes it.
+\end{itemize}
+
+\subsection{Orchestration}
+\begin{itemize}
+\item Goal: present \key{one reliable NF that can take any load}, while using as few resources as possible.
+\item \key{Monitoring and failure detection}: reuse existing tools (Docker monitoring, plus \texttt{ssh} checks of cores, memory and SR-IOV NICs on each host); launch or destroy container instances through the Docker engines.
+\item Failure detection can be \key{fast and speculative}: failing over costs nothing (traffic can go to \emph{any} instance), unlike traditional systems that wait out timeouts to be sure.
+\item \key{Programmable network}: the controller (Java, with an admin API for elasticity policies) uses the \key{Floodlight} SDN controller's REST API to install \key{OpenFlow} rules that direct traffic to new instances and away from failed or retiring ones. It also exposes the store's contents, giving operators a global view.
+\end{itemize}
+
+\section{Inside an NF instance}
+\paperfig[0.62]{sl_fig4_instance}{An instance: several pipes, each a pull thread and a processing thread joined by a queue, sharing a data store client interface (buffer pool, request batching) that talks to the remote store over its own NIC.}
+\subsection{Packet-processing pipes}
+\begin{itemize}
+\item An instance has a number of \key{pipes}; the count can \key{adapt to load}.
+\item Each pipe = \key{two threads + one lockless queue}:
+\begin{enumerate}
+\item the \key{pull thread} polls its NIC and puts packets in the queue;
+\item the \key{processing thread} dequeues a packet, \key{reads} state through the store interface, applies the NF logic, \key{writes} updated state, and outputs the packet(s).
+\end{enumerate}
+\item Developers write only the application logic; pipes are C/C++ pipeline functions linked with the store client at compile time.
+\end{itemize}
+
+\subsection{Deployment and I/O}
+\begin{itemize}
+\item Each instance is a single-process \key{Docker container} with its own cores and memory (fast to deploy, low overhead, isolated).
+\item \key{SR-IOV} splits the physical NIC into virtual NICs, one per instance (Intel x520: up to 126 virtual functions, each able to run at full rate).
+\item Each host has one \key{Infiniband} card; Mellanox's RDMA library lets several user-space NFs use it directly, \key{bypassing the kernel}.
+\item Packet I/O uses \key{DPDK}. With several DPDK pipes in containers on one host, each needs its own \key{huge-page} file and socket-memory amount (2\,GB worked best); DPDK's EAL handles memory and core affinity.
+\end{itemize}
+
+\subsection{The optimised data-store client (the critical path)}
+\begin{center}
+\begin{tabularx}{\linewidth}{@{}lX@{}}
+\toprule
+\textbf{Technique} & \textbf{What it does} \\
+\midrule
+\key{Request batching} & Combine many requests into one RPC. A single RAMCloud read takes 6\,$\mu$s; a multi-read of 100 objects takes 51\,$\mu$s, i.e.\ \key{0.51\,$\mu$s per object}. Too small a batch wastes the gain; too large adds waiting latency. The prototype uses a fixed batch of 100 (adaptive batching is future work). \\
+\key{Pre-allocated buffer pool} & Reuse request buffers instead of allocating a new RPC object for every lookup. \\
+\key{Eliminate a copy} & Hand the processing pipe a \key{pointer} to the returned data instead of copying it. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+\textbf{Worked example (batching):} 100 packets each need one lookup.
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+ & \textbf{Store time} & \textbf{Per packet} \\
+\midrule
+100 single reads & $100 \times 6 = 600\,\mu$s & 6\,$\mu$s \\
+1 multi-read of 100 & 51\,$\mu$s & \key{0.51\,$\mu$s} (but the first packet waits for the batch to fill) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Implementation and results in brief}
+\begin{itemize}
+\item Firewall, NAT and load balancer built as DPDK applications in Docker, each in a traditional and a stateless version that differ \key{only} in whether state is accessed locally or in RAMCloud.
+\item About \key{10\,Gb/s} (4.6M packets/s at minimum size), with \key{100--500\,$\mu$s} extra latency at the 95th percentile, depending on NF and traffic.
+\item Failover and scale-out/in \key{without disrupting} traffic, matching the ideal, while traditional instances broke connections (e.g.\ after scale-in, the firewall lacked state for the merged traffic).
+\end{itemize}
+
+\section{Discussion: making it faster}
+\begin{itemize}
+\item \key{Fewer remote interactions}: a \key{Bloom filter} (set-membership structure) in the store to skip reads that would miss; \key{caching} read-mostly state; \key{co-locating} store instances with NF instances so more requests are served locally, without the consistency problems of caches (data not local is still read remotely).
+\item \key{Store scalability} is the ultimate limit, but data stores are an active research area; faster stores (e.g.\ FaRM) would help directly.
+\item Not every NF suits this design; the paper shows it works for the functions studied.
+\end{itemize}
+
+\section{StatelessNF vs.\ FTMB and state migration}
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}lXXX@{}}
+\toprule
+ & \textbf{FTMB (log + replay)} & \textbf{State migration (OpenNF etc.)} & \textbf{StatelessNF} \\
+\midrule
+Where state lives & Inside the instance (logged outside) & Inside the instance & \key{Remote data store} \\
+Failure recovery & Replay since last snapshot (40--275\,ms) & Not for unplanned failures & \key{Immediate}; even speculative failover \\
+Scale out / in & Not addressed & Migrate state (takes time) & \key{Just redirect traffic} \\
+Asymmetric / multipath routing & Not addressed & Needs flow affinity & \key{Any packet, any instance} \\
+Per-packet cost & About 30\,$\mu$s & None in steady state & 100--500\,$\mu$s (remote lookups) \\
+Code changes & Annotate shared variables & Add export/import API & Rewrite state accesses as store reads/writes \\
+\bottomrule
+\end{tabularx}
+\end{center}
+Both FTMB and StatelessNF target stateful NFV; FTMB keeps the processing model and makes state \emph{recoverable}, while StatelessNF changes the model so that state is \emph{never lost} with an instance.
+
+\begin{keybox}[Exam one-liner]
+StatelessNF breaks the coupling of state and processing: dynamic network state (connections, NAT mappings, LB assignments, IPS automaton state) lives in a low-latency resilient store (RAMCloud over RDMA, with timer support), so stateless DPDK/Docker instances can each handle any packet; an orchestrator with OpenFlow steering gives instant (even speculative) failover, scale-out/in without draining, and correctness under asymmetric routing, at a cost of about one remote lookup per packet, hidden by batching, buffer pools and zero copy.
+\end{keybox}
+
+\section{Revision checklist}
+\begin{itemize}
+\item \textbf{State:} static (replicate locally) vs dynamic internal (local) vs dynamic \key{network} state (remote store).
+\item \textbf{Problems of coupling:} failover loses state, conservative failure detection, scale-out can't move flows, scale-in must drain, asymmetric routing fails lookups.
+\item \textbf{Prior work:} Pico (about 10\,ms per packet), FTMB (slow recovery), state migration (slow, no unplanned failures, needs affinity).
+\item \textbf{Feasible because:} fast resilient stores, only network state remote, lookup-then-write access pattern.
+\item \textbf{Access patterns:} LB/NAT/firewall: work at connection start/end + 1 read per packet; IPS and TCP re-assembly: read + write per packet.
+\item \textbf{RAMCloud:} one DRAM copy + logged replicas on disk; 6\,$\mu$s read, 15\,$\mu$s write; timer extension notifies exactly one instance.
+\item \textbf{Orchestration:} Docker monitoring, speculative failover, Floodlight/OpenFlow steering.
+\item \textbf{Instance:} pipes = pull thread + processing thread + lockless queue; Docker, SR-IOV, DPDK hugepages, Infiniband RDMA.
+\item \textbf{Client optimisations:} batching (6\,$\mu$s vs 0.51\,$\mu$s per object at 100), buffer pool, zero copy.
+\item \textbf{Results:} 10\,Gb/s, 4.6\,Mpps, +100--500\,$\mu$s; seamless failover and scaling.
+\end{itemize}
