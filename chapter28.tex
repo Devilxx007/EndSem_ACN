@@ -1,0 +1,288 @@
+\chapter{Chord: A Scalable Peer-to-peer Lookup Service}
+\paperinfo{I. Stoica, R. Morris, D. Karger, M. F. Kaashoek, H. Balakrishnan (MIT)}{ACM SIGCOMM 2001}
+
+\begin{keybox}[The paper in three sentences]
+Chord solves one problem: \key{given a key, find the node responsible for it}, in a peer-to-peer system with no central server where
+nodes keep joining and leaving. Nodes and keys are hashed onto the same \key{identifier circle}, and each key belongs to its
+\key{successor}: the first node at or after it on the circle. Each node keeps only $O(\log N)$ pointers (a \key{finger table} pointing
+$1, 2, 4, 8, \dots$ positions ahead), so a lookup halves the remaining distance at each hop and finishes in \key{$O(\log N)$ hops}; a
+periodic \key{stabilisation} protocol keeps successor pointers correct as nodes come and go.
+\end{keybox}
+
+% ------------------------------------------------------------------
+\section{The problem}
+
+In a peer-to-peer system (file sharing, cooperative storage, a distributed cache) the data is spread over thousands of ordinary machines.
+To read or write item $k$ you must first answer: \emph{which machine holds $k$?}
+\begin{itemize}
+  \item A \textbf{central directory} (Napster) answers instantly but is a single point of failure and control.
+  \item \textbf{Flooding} the question to everyone (Gnutella) works without a centre but costs $O(N)$ messages per lookup and still may miss.
+\end{itemize}
+Chord provides a single operation, \texttt{lookup(key)} $\to$ node, with these goals:
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}lX@{}}
+\toprule
+Goal & Meaning\\
+\midrule
+\key{Load balance} & every node holds about the same number of keys\\
+\key{Decentralisation} & no node is special\\
+\key{Scalability} & lookup cost grows as $\log N$\\
+\key{Availability} & lookups keep working while nodes join, leave and fail\\
+\key{Flexible naming} & keys are just bit strings; the application decides what they mean\\
+\bottomrule
+\end{tabularx}
+\end{center}
+Chord itself does not store data. An application stores item $k$ at \texttt{lookup($k$)}. For example a file system on top: a file-system
+layer maps names to blocks, a block-storage layer stores and replicates blocks, and Chord tells it which node a block lives on.
+
+% ------------------------------------------------------------------
+\section{Consistent hashing: who is responsible for a key?}
+
+\begin{enumerate}
+  \item Every node and every key gets an \key{$m$-bit identifier} from SHA-1: node ID $=$ hash(IP address), key ID $=$ hash(key). $m$ is
+        large (160) so collisions do not happen.
+  \item Arrange the IDs $0 \dots 2^m - 1$ on a circle (the \key{identifier circle} or ring).
+  \item \key{Key $k$ is stored at successor($k$)}: the first node whose ID is equal to or follows $k$ clockwise.
+\end{enumerate}
+
+\textbf{Example ($m = 3$, IDs 0--7), nodes 0, 1 and 3, keys 1, 2 and 6} (the paper's running example):
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Key & Walk clockwise from the key & Stored at\\
+\midrule
+1 & 1 is a node & node 1\\
+2 & 2 (no node) $\to$ 3 & node 3\\
+6 & 6 $\to$ 7 $\to$ 0 (wraps round) & node 0\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Why consistent hashing (and not $\text{key} \bmod N$)?} With $\bmod N$, adding one server changes $N$, so almost every key moves. With
+consistent hashing:
+\begin{itemize}
+  \item \textbf{Node $n$ joins}: it takes over only the keys between its predecessor and itself, all from its successor. If node 7 joined above, it
+        would take key 6 from node 0. Nothing else moves.
+  \item \textbf{Node $n$ leaves}: its keys go to its successor. Nothing else moves.
+\end{itemize}
+\key{Theorem 1}: with $N$ nodes and $K$ keys, each node is responsible for at most $(1 + \epsilon)K/N$ keys (with $\epsilon = O(\log N)$, reducible to
+a small constant with $O(\log N)$ \key{virtual nodes} per physical node), and a join or leave moves only $O(K/N)$ keys, the minimum possible.
+
+% ------------------------------------------------------------------
+\section{Scalable lookup: from the successor ring to finger tables}
+
+\subsection{The simplest correct scheme}
+If each node only knows its \key{successor}, a lookup can walk around the ring, node to node, until it reaches the key's successor. This is
+always correct, but takes $O(N)$ hops. The successor pointer is all that is needed for \emph{correctness}; everything else is only for speed.
+
+\subsection{Finger tables}
+
+\begin{keybox}[The finger rule]
+Node $n$ keeps a table of up to $m$ entries. Entry $i$ (for $i = 1 \dots m$) is
+\[
+\text{finger}[i] \;=\; \text{successor}\big(n + 2^{i-1} \bmod 2^m\big).
+\]
+So it points to the first node at least 1, 2, 4, 8, \dots, $2^{m-1}$ positions ahead. finger[1] is the immediate successor.
+\end{keybox}
+
+\paperfig[0.9]{ch_fig3}{(a) The finger intervals of node 1. (b) Finger tables and stored keys for nodes 0, 1 and 3 ($m=3$).\label{fig:chfinger}}
+
+Each entry has a \texttt{start} ($n + 2^{i-1}$), an \texttt{interval} $[\text{start}_i, \text{start}_{i+1})$, and the \texttt{node} = successor(start).
+Building node 1's table (Figure~\ref{fig:chfinger}b):
+\begin{center}
+\begin{tabular}{@{}cccc@{}}
+\toprule
+$i$ & start $= 1 + 2^{i-1}$ & interval & successor(start)\\
+\midrule
+1 & 2 & [2, 3) & 3\\
+2 & 3 & [3, 5) & 3\\
+3 & 5 & [5, 1) & 0 (5, 6, 7 empty; wraps to 0)\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Two properties}:
+\begin{itemize}
+  \item A node knows a lot about the region just after it and less and less about far-away parts of the ring (like knowing your street well and the
+        rest of the city roughly).
+  \item There are $m$ entries, but only \key{$O(\log N)$ distinct} nodes in them (the small fingers all point to the same nearby successor).
+\end{itemize}
+
+\subsection{The lookup algorithm}
+
+\paperfig[0.42]{ch_fig4}{Lookup pseudocode. $(a, b]$ means the interval on the circle from $a$ (exclusive) to $b$ (inclusive).\label{fig:chcode}}
+
+In words:
+\begin{enumerate}
+  \item \texttt{find\_successor(id)}: find id's \emph{predecessor} $n'$ (the node just before id), then return $n'$.successor.
+  \item \texttt{find\_predecessor(id)}: start at $n' = n$. While id is \emph{not} in $(n', n'.\text{successor}]$, jump to
+        $n'.\texttt{closest\_preceding\_finger(id)}$.
+  \item \texttt{closest\_preceding\_finger(id)}: scan the fingers from the farthest ($i = m$) down; return the first finger that lies \emph{strictly
+        between} $n$ and id. Never jump past id.
+\end{enumerate}
+
+\textbf{Worked example (bigger ring).} $m = 6$ (IDs 0--63), nodes N1, N8, N14, N21, N32, N38, N42, N48, N51, N56. N8 looks up key \textbf{54}.
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}lXl@{}}
+\toprule
+At node & Fingers (start $\to$ node) & Step\\
+\midrule
+N8 & 9$\to$N14, 10$\to$N14, 12$\to$N14, 16$\to$N21, 24$\to$N32, 40$\to$N42 & 54 not in (8, 14]; farthest finger before 54 is \textbf{N42}\\
+N42 & 43$\to$N48, 44$\to$N48, 46$\to$N48, 50$\to$N51, 58$\to$N1, 10$\to$N14 & 54 not in (42, 48]; scanning down, 58 and 10 are past 54, \textbf{N51} is before it\\
+N51 & successor N56 & 54 $\in$ (51, 56] \checkmark: predecessor found\\
+\midrule
+\multicolumn{3}{@{}l}{Answer: successor(54) $=$ \textbf{N56}, reached in 3 hops (a plain successor walk would take 8).}\\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\textbf{Why $O(\log N)$ hops.} Say the target is distance $d$ ahead of $n$. Some finger $i$ has $2^{i-1} \le d < 2^i$; that finger points at or beyond
+the halfway point to the target and still before it. Jumping there leaves less than $d/2$ to go. Each hop at least \key{halves the remaining
+distance}, so after $\log N$ hops the remaining gap is so small (about $2^m/N$, roughly one node's spacing) that the target is next.
+\key{Theorem 2}: a lookup contacts $O(\log N)$ nodes with high probability. Simulations show about $\frac{1}{2}\log_2 N$ on average.
+
+% ------------------------------------------------------------------
+\section{Nodes joining (the simple version)}
+
+When node $n$ joins, three things must happen, with the help of any node $n'$ already in the ring:
+\begin{enumerate}
+  \item \textbf{Initialise $n$'s predecessor and fingers}: ask $n'$ to look up successor($n + 2^{i-1}$) for each $i$. (Optimisation: if finger $i$'s
+        node is also beyond start $i+1$, reuse it, avoiding most lookups.)
+  \item \textbf{Update other nodes' fingers}: $n$ becomes finger $i$ of node $p$ if $p$ precedes $n$ by at least $2^{i-1}$ and $p$'s current finger $i$
+        is beyond $n$. For each $i$, find the last such $p$ (the predecessor of $n - 2^{i-1}$) and walk backwards updating.
+  \item \textbf{Move keys}: take the keys in (predecessor, $n$] from the successor. (Done by the application layer.)
+\end{enumerate}
+Cost: $O(\log^2 N)$ messages (\key{Theorem 3}).
+
+\paperfig[0.9]{ch_fig5}{(a) After node 6 joins. (b) After a node leaves. Changed entries are black, unchanged grey. (The paper's caption says
+``node 3 leaves'', but the figure shows node 1 leaving: keys 1 and 2 end up at node 3.)\label{fig:chjoin}}
+
+\textbf{Node 6 joins (Figure~\ref{fig:chjoin}a):}
+\begin{center}
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+What changes & Why\\
+\midrule
+node 6's fingers: starts 7, 0, 2 $\to$ nodes 0, 0, 3 & successor of each start\\
+node 0's finger 3 (start 4): 0 $\to$ 6 & 6 is now the first node at or after 4\\
+node 1's finger 3 (start 5): 0 $\to$ 6 & first node at or after 5\\
+node 3's fingers 1, 2 (starts 4, 5): 0 $\to$ 6 & same\\
+key 6 moves from node 0 to node 6 & 6 is now successor(6)\\
+\bottomrule
+\end{tabular}
+\end{center}
+\textbf{Node 1 leaves (Figure~\ref{fig:chjoin}b):} its key 1 goes to its successor, node 3 (which now holds 1 and 2), and node 0's finger 1 (start 1)
+must change from 1 to 3 (successor(1) is now 3; the figure prints 0 there, which looks like a second slip in the figure, so trust the rule).
+
+% ------------------------------------------------------------------
+\section{Concurrent joins: stabilisation}
+
+The join above updates everyone's fingers immediately. With many nodes joining at once (and failures), that is hard to keep correct. Chord
+therefore \key{separates correctness from performance}:
+\begin{itemize}
+  \item \textbf{Correctness} needs only correct \emph{successor} pointers. A background protocol, \key{stabilize}, keeps them right.
+  \item \textbf{Speed} needs fingers; these are refreshed lazily by \key{fix\_fingers}. Stale fingers only make lookups slower, not wrong.
+\end{itemize}
+
+\paperfig[0.42]{ch_fig7}{Join and stabilisation pseudocode.\label{fig:chstab}}
+
+\begin{itemize}
+  \item \texttt{join($n'$)}: set predecessor $=$ nil; successor $= n'$.find\_successor($n$). That is all: nobody else knows about $n$ yet.
+  \item \texttt{stabilize()} (run periodically): ask my successor for \emph{its} predecessor $x$. If $x$ lies between me and my successor, a node has
+        joined in between, so make $x$ my successor. Then \texttt{notify} my successor that I exist.
+  \item \texttt{notify($n'$)}: ``$n'$ thinks it might be your predecessor''. Accept it if I have no predecessor or $n'$ is closer than my current one.
+  \item \texttt{fix\_fingers()} (periodically): pick a random finger $i$ and recompute it with find\_successor(finger[$i$].start).
+\end{itemize}
+
+\textbf{Walk-through: N26 joins between N21 and N32.}
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}lXl@{}}
+\toprule
+Step & Action & Pointers afterwards\\
+\midrule
+0 & before & N21.succ $=$ N32, N32.pred $=$ N21\\
+1 & N26.join(): looks up successor(26) $=$ N32 & N26.succ $=$ N32, N26.pred $=$ nil\\
+2 & N26.stabilize(): asks N32 for its pred (N21, not between 26 and 32), then notify(N32) & N32.pred $=$ N26 (26 is closer than 21)\\
+3 & N21.stabilize(): asks N32 for its pred, gets N26; 26 $\in$ (21, 32) & N21.succ $=$ N26\\
+4 & N21 notifies N26 & N26.pred $=$ N21\\
+5 & keys in (21, 26] move from N32 to N26; fix\_fingers gradually makes other nodes point at N26 & all correct\\
+\bottomrule
+\end{tabularx}
+\end{center}
+Between steps 1 and 3, lookups still work: they may reach N21, follow its successor pointer to N32, and be slightly slower or briefly miss keys not yet moved.
+The application can just retry.
+
+\textbf{Guarantees}: once a node can reach a key it always can (\key{Theorem 4}); some time after the last join, all successor pointers are correct
+(\key{Theorem 5}); and if $N$ new nodes join a stable $N$-node ring with correct successors but no fingers, lookups still take $O(\log N)$ hops
+(\key{Theorem 6}), since a few new nodes between two old ones are just scanned linearly.
+
+% ------------------------------------------------------------------
+\section{Failures: successor lists}
+
+If a node fails, its predecessor's successor pointer is broken, and the ring could be cut. So:
+\begin{itemize}
+  \item Every node keeps a \key{successor list} of its $r$ nearest successors (kept up to date by stabilize).
+  \item If its successor stops responding, it switches to the first \emph{live} node in the list.
+  \item A lookup that hits a dead node times out and tries another route: the finger just before the dead one, or a successor-list entry.
+\end{itemize}
+
+\textbf{Why $r = O(\log N)$ is enough.} Suppose every node fails independently with probability $1/2$ (a massive failure). All $r$ successors of a node fail with
+probability $2^{-r}$. With $r = 2\log_2 N$, that is $1/N^2$, so with high probability every node still knows a live successor. \key{Theorems 7 and 8}: with
+$r = \Omega(\log N)$, after half the nodes fail, find\_successor still returns the closest \emph{live} successor, in $O(\log N)$ expected time.
+
+Note that Chord keeps the \emph{routing} working; keeping the \emph{data} is the application's job (for example, replicating each key on the $r$ nodes in the
+successor list, which become its owners in turn if one fails).
+
+% ------------------------------------------------------------------
+\section{Results in brief}
+\begin{itemize}
+  \item \textbf{Load balance}: with one ID per node, key counts per node vary a lot (some nodes get many times the mean, some none). With
+        $O(\log N)$ \key{virtual nodes} per physical node, the spread becomes much tighter.
+  \item \textbf{Path length}: grows as $\log N$, about $\frac{1}{2}\log_2 N$ on average (for example about 6 hops for $2^{12}$ nodes).
+  \item \textbf{Failures}: when 50\% of nodes fail at once, the fraction of failed lookups is about the fraction of keys whose node died: routing itself does
+        not break.
+  \item \textbf{Churn}: with nodes joining and failing continuously, only a small fraction of lookups fail because of temporarily wrong state.
+  \item \textbf{Internet prototype} (10 sites): lookup latency grows slowly with the number of nodes.
+\end{itemize}
+
+% ------------------------------------------------------------------
+\section{Summary}
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}lX@{}}
+\toprule
+Mechanism & What it gives\\
+\midrule
+SHA-1 IDs on a ring; key at successor($k$) & balanced load, minimal key movement (consistent hashing)\\
+Successor pointer & correctness\\
+Finger $i$ $=$ successor($n + 2^{i-1}$) & $O(\log N)$ state, $O(\log N)$ hops (each hop halves distance)\\
+stabilize / notify / fix\_fingers & correctness with concurrent joins; lazy finger repair\\
+Successor list of $r = O(\log N)$ & survives massive failures\\
+Virtual nodes & tighter load balance\\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{keybox}[Exam one-liner]
+Chord maps keys to nodes with consistent hashing: SHA-1 IDs on a $2^m$ ring, key $k$ stored at successor($k$), so joins and leaves move only $O(K/N)$ keys. Each node
+keeps fingers finger[$i$] $=$ successor($n + 2^{i-1}$); a lookup repeatedly jumps to the closest preceding finger, halving the distance each hop, so it takes
+$O(\log N)$ hops with $O(\log N)$ state. Correctness depends only on successor pointers, maintained by periodic stabilize/notify; fingers are fixed lazily;
+successor lists of length $O(\log N)$ handle failures.
+\end{keybox}
+
+\section{Revision checklist}
+\begin{itemize}
+  \item One operation: lookup(key) $\to$ node. Goals: load balance, decentralisation, scalability, availability, flexible naming.
+  \item Consistent hashing: key at successor($k$); join takes keys from successor; leave gives keys to successor; Theorem 1 ($(1 + \epsilon)K/N$, $O(K/N)$ moved).
+  \item Successor-only lookup: correct but $O(N)$.
+  \item Finger table: start $n + 2^{i-1}$, interval, node; build node 1's table for $m=3$, nodes 0, 1, 3.
+  \item find\_successor $\to$ find\_predecessor $\to$ closest\_preceding\_finger (scan from $i = m$ down, stay strictly before id).
+  \item Example: N8 looks up 54 $\to$ N42 $\to$ N51 $\to$ N56. Halving argument $\Rightarrow$ $O(\log N)$, about $\frac{1}{2}\log_2 N$ average.
+  \item Simple join: init fingers, update others, move keys; $O(\log^2 N)$ messages; node-6 example.
+  \item Stabilisation: join sets only successor; stabilize checks successor.predecessor; notify; fix\_fingers random entry; N26 walk-through.
+  \item Failures: successor list $r = O(\log N)$; $2^{-r}$ argument; alternate routes on timeout; data replication is the application's job.
+\end{itemize}
