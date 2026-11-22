@@ -1,0 +1,366 @@
+\chapter{C-Saw: Incentivizing Censorship Measurements via Circumvention}
+\paperinfo{A. Nisar, A. Kashaf, I. A. Qazi, Z. A. Uzmi (LUMS, Pakistan)}{ACM SIGCOMM 2018}
+
+\begin{keybox}[The paper in three sentences]
+Censorship \emph{measurement} systems (what is blocked, where, how) struggle to find volunteers, while censorship \emph{circumvention}
+tools (Tor, Lantern, VPNs) use one slow method for everything because they do not know \emph{how} each site is blocked. C-Saw
+\key{combines the two}: a local proxy on the user's machine detects how each visited URL is blocked, picks the \key{cheapest
+circumvention that defeats that specific blocking}, and shares what it learned through a \key{crowdsourced global database}. Users
+join because pages load faster (incentive), and every user who joins makes the measurements richer.
+\end{keybox}
+
+% ------------------------------------------------------------------
+\section{The problem: two kinds of systems that need each other}
+
+\subsection{Measurement systems lack users}
+Systems like OONI and Centinel want to know \emph{what is blocked, where, how and when}. They need probes inside many censored networks,
+so they ask volunteers to install software or host a device. Apart from altruism there is no reason to do this, so deployment stays small.
+They also test a fixed \key{target list} of URLs, which misses anything not on the list, and the lists are often outdated. And testing
+URLs on someone's behalf raises an ethical question: did the user consent to their machine fetching, say, a banned political site?
+
+\subsection{Circumvention tools are one-size-fits-all}
+Tor, Lantern and VPNs send every blocked request through relays, whatever the blocking method. That always works but is slow: Tor can
+increase latency by more than 5$\times$ compared with the direct path. Yet many kinds of blocking can be beaten with a cheap
+\key{local fix} that needs no relay at all, if only the tool knew which kind of blocking was being used.
+
+\subsection{How censors block, and the cheap fix for each}
+A censor can interfere at each step of loading a page. Each method has a matching fix:
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}lXX@{}}
+\toprule
+Blocking method & What the censor does & Cheapest circumvention (local fix)\\
+\midrule
+\key{DNS blocking} & The ISP's resolver returns no answer, an error, or a wrong IP (e.g.\ a local host that serves a block page). &
+Ask a \key{public DNS} server (e.g.\ Google DNS) instead.\\
+\key{IP blocking} & Packets to the site's IP are dropped or the connection is reset. & No local fix: needs a \key{relay} (Tor, Lantern, VPN).\\
+\key{HTTP blocking} & The censor reads the \texttt{Host} header and URL path of a plain HTTP GET and resets the connection, drops it, or returns a
+\key{block page}. & Use \key{HTTPS}: the URL and Host header are encrypted.\\
+\key{HTTPS (SNI) blocking} & The TLS handshake carries the server name in plaintext (SNI); the censor blocks on it. & \key{Domain fronting}.\\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\textbf{Domain fronting, explained.} A normal HTTPS connection to \texttt{youtube.com} shows the name \texttt{youtube.com} in the DNS
+query (plaintext), the TLS SNI (plaintext) and the HTTP Host header (encrypted). With domain fronting, the DNS query and SNI say
+\texttt{google.com} (allowed), while the encrypted Host header says \texttt{youtube.com}. The censor only sees a connection to Google. The
+front-end server (Google) decrypts the request and forwards it internally to the YouTube backend. This works only when the blocked site and
+the front domain are served by the same provider.
+
+\subsection{The case study that motivated C-Saw (Pakistan)}
+The authors measured from a university and homes in Pakistan, where censorship is \key{distributed}: each ISP blocks in its own way (in
+centralised censorship, as in Iran, everyone sees the same blocking).
+\begin{itemize}
+  \item \textbf{ISP-A} blocked YouTube only at the \textbf{HTTP} level (redirect to a block page). So plain \textbf{HTTPS} gets through.
+  \item \textbf{ISP-B} used \key{multi-stage blocking}: DNS blocking (resolving to a local host) \emph{and} dropping HTTP/HTTPS requests. So
+        public DNS plus domain fronting gets through.
+  \item Even within one ISP, different URLs were blocked by different methods.
+\end{itemize}
+Then they compared page load times (PLTs) for YouTube's homepage:
+\begin{itemize}
+  \item HTTPS/domain fronting (direct path) was much faster than going through static proxies in the US, Europe or Japan.
+  \item HTTPS was much faster than \key{Tor}, whose three relays (entry, middle, exit) make the path long.
+  \item For a page blocked by keyword filtering, simply putting the site's \emph{IP address} in the URL instead of its hostname was about
+        1.5$\times$ faster than \key{Lantern}, which picks relays by trust, not by distance.
+\end{itemize}
+\textbf{Lesson}: if you know \emph{how} a URL is blocked in \emph{your} ISP, you can pick a much faster circumvention. Knowing that
+requires measurement. That is the link C-Saw exploits.
+
+% ------------------------------------------------------------------
+\section{Goals and design principles}
+
+\begin{keybox}[Goals]
+\begin{itemize}
+  \item \textbf{G1, scalable measurements with consent}: many users, fine-grained, and only with the user's agreement.
+  \item \textbf{G2, adaptive circumvention}: pick the method with the lowest PLT for the blocking actually used.
+  \item \textbf{Constraint 1}: no target list of URLs.
+  \item \textbf{Constraint 2}: protect the privacy of users who report measurements.
+\end{itemize}
+\end{keybox}
+
+How these are met:
+\begin{itemize}
+  \item \textbf{Built-in incentive}: users get faster access to blocked content, so they have a reason to install C-Saw.
+  \item \textbf{Measure only what the user visits}: this removes the need for a target list \emph{and} gives consent for free, because the
+        user chose to visit those URLs while browsing normally.
+  \item \textbf{Detect the blocking type quickly and choose the least-overhead fix.}
+\end{itemize}
+
+\textbf{Threat model.} The censor can block, modify or reject any web connection, but will not block \emph{all} web traffic (too much
+collateral damage). It may try to block access to C-Saw's database, inject false reports, or identify users who report. It cannot break
+into the databases, and users trust the C-Saw proxy itself.
+
+% ------------------------------------------------------------------
+\section{Architecture}
+
+\paperfig[0.75]{cs_fig3}{C-Saw's components: a proxy with a local database on each client; a cloud-hosted global database and server. The
+client measures the direct path, circumvents when needed, sends reports of blocked URLs, and downloads the list of URLs blocked in its AS.\label{fig:csarch}}
+
+\begin{enumerate}
+  \item \key{Client-side proxy} on the user's machine. All the browser's requests go through it. It has two parts: a \key{measurement
+        module} (is this URL blocked, and how?) and a \key{circumvention module} (fetch it via the direct path, a local fix, a static proxy,
+        Tor, Lantern, \dots).
+  \item \key{local\_DB}: an in-memory hash table on the client, one record per URL the user has visited.
+  \item \key{global\_DB} plus a server (\key{server\_DB}) in the cloud: the crowdsourced list of blocked URLs from all users.
+\end{enumerate}
+
+\subsection{What is stored}
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}lX@{}}
+\toprule
+Field (local\_DB) & Meaning\\
+\midrule
+URL & the requested URL (the index)\\
+AS number & the user's AS at measurement time (blocking differs per ISP)\\
+$T_m$ & when it was measured\\
+Status & \texttt{blocked}, \texttt{not-blocked}, or \texttt{not-measured} (never measured, or the record expired)\\
+Stage-1 \dots\ Stage-$k$ blocking & the blocking seen at each stage (multi-stage, e.g.\ DNS then IP)\\
+Global posted & whether this has been reported to global\_DB yet\\
+\bottomrule
+\end{tabularx}
+\end{center}
+The global\_DB has the same fields plus $T_p$ (when it was posted) and a \key{UUID} for the reporting client. It stores \emph{no IP
+addresses}, so reports cannot be traced back to users. Clients report \emph{only blocked} URLs.
+
+\subsection{Life of a client}
+\begin{enumerate}
+  \item \textbf{Install and register.} The user solves a ``No CAPTCHA reCAPTCHA'' (to stop bots creating thousands of fake clients). The
+        server gives the client a UUID.
+  \item \textbf{Download} the list of URLs that other users have reported blocked \emph{in this client's AS}.
+  \item \textbf{Browse.} Every request goes through the proxy, which follows Algorithm 1 (Figure~\ref{fig:csalg}) below.
+  \item \textbf{Report}, periodically, newly found blocked URLs to global\_DB, always \key{over Tor} so the censor cannot see who is reporting.
+\end{enumerate}
+
+% ------------------------------------------------------------------
+\section{The measurement module}
+
+\paperfig[0.48]{cs_alg1}{Algorithm 1: what the proxy does with each requested URL.\label{fig:csalg}}
+
+The algorithm has three cases, depending on what the databases say about the URL:
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}lXX@{}}
+\toprule
+Status of URL & What the proxy does & Why\\
+\midrule
+\texttt{not-measured} & Send \key{redundant requests}: one on the direct path and one on a circumvention path (e.g.\ Tor) at the same
+time. Measure the direct path and record the result. & We do not know if it is blocked. Detecting blocking on the direct path can be slow,
+so the circumvention copy makes sure the user still gets the page fast.\\
+\texttt{blocked} & Use the circumvention approach recorded for it. \key{With probability $p$}, also send a request on the direct path and
+re-measure. & Get the page fast; occasionally re-check, so false reports and unblocking are caught.\\
+\texttt{not-blocked} & Use only the direct path. & Fastest; no extra traffic (\key{selective redundancy}).\\
+\bottomrule
+\end{tabularx}
+\end{center}
+The result is written to local\_DB. Every record \key{expires} after $t$ seconds and becomes \texttt{not-measured} again. The proxy checks
+local\_DB first, and consults its copy of the global list only if the URL is not blocked locally.
+
+\subsection{Detecting the type of blocking}
+
+\paperfig[0.42]{cs_fig4}{Flowchart for detecting the blocking type on the direct path. ``GDNS?'' asks whether retrying with a global (public)
+DNS server succeeds.\label{fig:csdetect}}
+
+Follow a request down the flowchart (Figure~\ref{fig:csdetect}):
+\begin{enumerate}
+  \item \textbf{DNS query} to the local (ISP) resolver. If there is no response or NXDOMAIN, retry with a \key{global DNS} server.
+  \item \textbf{TCP connection} to the IP. If the connection gets no response or is reset: if the IP came from global DNS too, and it still
+        fails, declare \key{IP blocking}; otherwise retry using global DNS.
+  \item \textbf{Send HTTP/HTTPS.} No response or reset $\to$ HTTP/S blocking is suspected.
+  \item \textbf{Block page detection} on the response. If it is a block page and the global-DNS address gives the same result: \key{HTTP/S
+        blocking} (possibly plus DNS).
+  \item If the page is correct: if it was only correct after switching to global DNS, it was \key{DNS blocking}; if it was correct straight away,
+        \key{no blocking}.
+\end{enumerate}
+A URL is declared blocked when the circumvention path returns a response but the direct path returns nothing, or something abnormal, or a block page.
+
+\textbf{Why detection can be slow} (average detection time per blocking type, measured in Pakistan):
+\begin{center}
+\begin{tabular}{@{}lr@{}}
+\toprule
+Blocking type & Avg.\ time to detect\\
+\midrule
+DNS (``server refused'') & 0.025\,s\\
+HTTP (block page) & 1.8\,s\\
+DNS (``server failure'') & 10.6\,s\\
+TCP/IP (wait for TCP timeout) & 21\,s\\
+DNS + TCP/IP (multi-stage) & 32.7\,s\\
+\bottomrule
+\end{tabular}
+\end{center}
+If the user had to wait 32.7\,s before C-Saw even tried to circumvent, nobody would use it. This is why redundant requests matter.
+
+\subsection{Redundant requests}
+For a \texttt{not-measured} URL, the proxy sends the request on the direct path \emph{and} on a circumvention path at the same time, and shows the user
+whichever useful response arrives first. Two benefits:
+\begin{enumerate}
+  \item \textbf{Speed}: the user does not wait for detection. Sending in parallel (instead of ``try direct, detect blocking, then try Tor'') cut PLTs of
+        blocked pages by \key{46--64\%}.
+  \item \textbf{Telling censorship from network problems}: both paths share the user's access link. If the circumvention path works but the direct path
+        does not, the problem is not the user's own connection: it is probably censorship.
+\end{enumerate}
+\textbf{Cost and how it is limited}: duplicates add load, which hurts pages with many embedded objects. So redundancy is \emph{selective}
+(only \texttt{not-measured} URLs, and blocked URLs with probability $p$). The second copy can also be \emph{delayed} (e.g.\ by 2\,s, and not sent at
+all if the direct response arrives first). HTTP POSTs are never duplicated, to avoid doing a write twice. Two copies improved median PLT by 30\%; a third
+copy did not help and made the tail 17\% worse.
+
+\subsection{Detecting block pages quickly: a two-phase algorithm}
+Censors often return a normal-looking HTTP 200 page that says ``this site is blocked''. Comparing it with the real page is the reliable test, but that means
+waiting for the slower circumvention copy. So:
+\begin{enumerate}
+  \item \textbf{Phase 1 (fast)}: look only at the direct-path response and apply an \key{HTML-tag heuristic} for block pages. If it does not look like a
+        block page, show it to the user immediately.
+  \item \textbf{Phase 2 (accurate)}: if it does look like one, wait for the circumvention response and \key{compare page sizes}; a block page is much smaller
+        than the real page.
+\end{enumerate}
+On a dataset of block pages from 47 ISPs, phase 1 alone correctly classified 80\% of block pages with no false positives. If phase 1 misses a block page (false
+negative), the user briefly sees it, and C-Saw refreshes the browser as soon as the real page arrives via the circumvention path.
+
+\subsection{Choosing $p$: trust the crowd or re-check?}
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+$p$ & Behaviour & Problem\\
+\midrule
+0 & always trust global\_DB's ``blocked'' & a false report forces slow circumvention forever\\
+1 & always re-measure the direct path & extra traffic; global\_DB is pointless\\
+$0 < p < 0.25$ & re-check occasionally & recommended balance\\
+\bottomrule
+\end{tabular}
+\end{center}
+For URLs fixed with a local fix, re-checking is free, since the local fix uses the direct path anyway.
+
+% ------------------------------------------------------------------
+\section{The circumvention module: picking a method}
+
+\begin{keybox}[Selection rule]
+\begin{enumerate}
+  \item \textbf{Prefer a local fix} (public DNS for DNS blocking, HTTPS for HTTP blocking, domain fronting for HTTPS blocking): no relay, so the path is
+        short.
+  \item If a relay is needed (IP blocking), choose the relay method (Tor, Lantern, static proxy) with the \key{lowest moving-average PLT} for that URL.
+  \item Every \key{5th} access, try a \emph{random} eligible method, in case it has become faster (exploration).
+\end{enumerate}
+\end{keybox}
+
+\textbf{Example walk-through.} A user on ISP-B (DNS + HTTP/HTTPS blocking) visits a never-seen URL:
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Request & What happens & Result\\
+\midrule
+1st & \texttt{not-measured}: direct + Tor in parallel; Tor's copy is shown & detect DNS + HTTPS blocking; record it\\
+2nd & \texttt{blocked}: local fix = public DNS + domain fronting & fast, no relay\\
+\dots, 5th & random method tried (e.g.\ Lantern) & PLT average updated\\
+next & with probability $p$ also re-test direct path & detects if the site was unblocked\\
+\bottomrule
+\end{tabular}
+\end{center}
+\textbf{User preference}: a user who wants \key{anonymity} can tell C-Saw to always use an anonymous method (Tor), even when a faster local fix exists.
+
+% ------------------------------------------------------------------
+\section{Extra features}
+
+\subsection{Tracking changes in blocking (churn)}
+\begin{itemize}
+  \item \textbf{Blocked $\to$ unblocked}: the record expires, the status becomes \texttt{not-measured}, redundant requests are sent, and the direct path is seen
+        to work.
+  \item \textbf{Unblocked $\to$ blocked}: the direct path is always used for unblocked URLs, so the blocking is noticed on the next visit.
+\end{itemize}
+
+\subsection{Keeping local\_DB small: URL aggregation}
+Many devices in developing countries have little memory, so C-Saw aggregates URLs under their base URL, depending on the blocking type:
+\begin{itemize}
+  \item \textbf{HTTP blocking}: (a) if the base URL \texttt{foo.com/} is blocked, keep only that record; every page under it counts as blocked. (b) If only
+        a derived URL \texttt{foo.com/a.html} is blocked (censors sometimes block single pages), keep a separate record for it. (c) If any URL is unblocked,
+        keep one record for the base. A lookup then uses \key{longest-prefix match}.
+  \item \textbf{DNS, IP, HTTPS blocking}: these block a whole hostname or IP (SNI carries only the hostname), so mark the base URL blocked, even if it was a
+        derived URL that was detected.
+\end{itemize}
+This reduced local\_DB records by \key{55\%} for Pakistan's top-15 websites.
+
+\subsection{Multi-homed networks}
+Suppose a network sends each request at random over ISP A or ISP B, and only A blocks URL Y. The first request goes via B: ``not blocked''. The next goes via A:
+``blocked''. The status keeps flipping, and C-Saw keeps re-detecting. Fix: periodically look up the ASN of the upstream provider; if more than one ASN shows up
+over a short time, the network is multi-homed, and C-Saw uses the circumvention suited to the \emph{stricter} ISP for all requests to Y.
+
+% ------------------------------------------------------------------
+\section{Security and privacy}
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}lX@{}}
+\toprule
+Threat & Defence\\
+\midrule
+Censor identifies users who report & Reports go \key{over Tor}; global\_DB stores no IP addresses.\\
+Censor blocks access to global\_DB & Use collectors exposed as \key{Tor hidden services} (as OONI does), so there is no well-known name to block.\\
+Fake clients flood false reports & \key{reCAPTCHA} at registration limits fake identities; \key{voting} limits each client's influence (below).\\
+DDoS on server/database & Host on cloud platforms with auto-scaling and DDoS protection, replicated across providers.\\
+Users endangered by circumventing & Users may choose anonymous methods only; measurement is only of URLs they chose to visit (Menlo Report ethics).\\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\textbf{The voting scheme.} Each client $c_i$ has \emph{one} vote in total, split evenly over the $d$ URLs it reports as blocked: each gets $1/d$.
+For each (URL $j$, AS $k$), the server keeps the sum of votes $s_{j,k}$ and the number of reporters $n_{j,k}$.
+
+\textbf{Example}: an honest user reports 2 blocked URLs, giving 0.5 to each. A malicious client reports 1000 fake URLs, giving each only 0.001. A fake URL
+reported only by that client has $n = 1$, $s = 0.001$: it should be trusted little. A genuinely blocked URL reported by 40 users has large $n$ \emph{and} large
+$s$. A URL with large $n$ but tiny $s$ means many reporters who each report huge lists, which is suspicious too. (Inspired by PageRank.)
+
+% ------------------------------------------------------------------
+\section{Implementation and results in brief}
+\begin{itemize}
+  \item Built with Electron (cross-platform, works with any browser); global\_DB on MongoLab, server\_DB on Heroku; Tor and Lantern as relay options.
+  \item C-Saw cut average PLT by up to \key{48\%} versus Lantern and \key{63\%} versus Tor: for a DNS-blocked page it uses a local fix instead of a relay, and for
+        unblocked pages it uses the direct path, while Tor and Lantern always relay.
+  \item \textbf{Pilot study}: 123 users in Pakistan over three months, 420 blocked domains, 16 ASes. Block pages were the most common method, DNS blocking second.
+        It found \key{blocking of CDN servers}, which earlier studies had not seen.
+  \item \textbf{Live event}: during protests on 25--28 Nov 2017, C-Saw users recorded Twitter blocked by HTTP timeout in one AS and by a block page in another,
+        and Instagram blocked via DNS in several ASes: different ISPs, different methods, within minutes.
+\end{itemize}
+
+\textbf{Limitations}: coverage depends on what users visit (unpopular sites may never be measured); Tor exits can be blacklisted (but Tor is only one of the
+options); users flocking to one method after another is shut down might be fingerprintable; redundant requests use more data.
+
+% ------------------------------------------------------------------
+\section{Summary comparison}
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}lXXX@{}}
+\toprule
+ & Measurement tools (OONI, \dots) & Circumvention tools (Tor, Lantern) & \textbf{C-Saw}\\
+\midrule
+Why users join & altruism & access to blocked content & \key{faster} access to blocked content\\
+Which URLs & a fixed target list & n/a & \key{only what the user visits} (consent)\\
+Adapts to blocking type & n/a & no, always relays & \key{yes}, local fix first\\
+Shares knowledge & yes & no & yes, per-AS crowdsourced list\\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{keybox}[Exam one-liner]
+C-Saw merges censorship measurement with circumvention. A local proxy measures only URLs the user visits (consent, no target list), detects the blocking type
+(DNS, IP, HTTP, HTTPS/SNI, multi-stage) with a flowchart using a global DNS retry, sends redundant requests (direct + circumvention) for unmeasured URLs to hide
+slow detection (up to 32.7\,s), and uses a two-phase block-page check (HTML heuristic, then size comparison). It prefers local fixes (public DNS, HTTPS, domain
+fronting) over relays, picks relays by moving-average PLT with random exploration every 5th access, and shares blocked URLs per AS via a global DB (reports over
+Tor, reCAPTCHA + $1/d$ voting against fake reports). Faster pages are the incentive that makes measurement scale.
+\end{keybox}
+
+\section{Revision checklist}
+\begin{itemize}
+  \item Problem: measurement lacks incentive/consent and uses target lists; circumvention is one-size-fits-all and slow.
+  \item Blocking types and their local fixes; domain fronting (DNS/SNI = front, encrypted Host = real site).
+  \item Pakistan case study: ISPs block differently (ISP-A HTTP only; ISP-B DNS + HTTP/HTTPS); local fixes beat Tor, Lantern and static proxies.
+  \item Components: proxy (measurement + circumvention modules), local\_DB, global\_DB + server\_DB; download per-AS blocked list; report over Tor.
+  \item Algorithm 1: not-measured $\to$ redundant requests + measure; blocked $\to$ circumvent, re-measure with prob.\ $p$; not-blocked $\to$ direct only; records expire.
+  \item Detection flowchart with GDNS retry; detection times (0.025--32.7\,s).
+  \item Redundant requests: hide detection time, separate censorship from network faults; selective, optionally delayed, no POST duplication.
+  \item Two-phase block-page detection; $p < 0.25$.
+  \item Selection: local fix first, else min moving-average PLT, random every 5th access; anonymity preference.
+  \item URL aggregation (rules per blocking type, longest-prefix match); multi-homing detection via ASN.
+  \item Security: Tor reports, no IPs, hidden-service collectors, reCAPTCHA, $1/d$ voting with $s_{j,k}$ and $n_{j,k}$.
+\end{itemize}
