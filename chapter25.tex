@@ -1,0 +1,256 @@
+\chapter{Understanding the Network-Level Behavior of Spammers}
+\paperinfo{A. Ramachandran, N. Feamster (Georgia Tech)}{ACM SIGCOMM 2006}
+
+\begin{keybox}[The paper in three sentences]
+Spam filters mostly look at the \emph{content} of an email, which spammers change freely. This paper looks instead at
+\key{network-level properties} of the sender (its IP address, IP range, AS, operating system, BGP route), which are much harder to
+fake, by joining 17 months of spam caught at a \key{sinkhole} domain with BGP data and a botnet trace. It finds that spam comes from a
+few concentrated IP ranges and ASes, mostly from \key{short-lived Windows bots} that send very little each, and that a small group of
+spammers \key{hijacks large IP blocks with short-lived BGP announcements} (``\key{BGP spectrum agility}'') to stay untraceable.
+\end{keybox}
+
+% ------------------------------------------------------------------
+\section{The problem: filters look at the wrong thing}
+
+There are two common ways to stop spam:
+\begin{itemize}
+  \item \key{Content filtering} (e.g.\ SpamAssassin): look at words, headers and patterns in the email. Spammers simply change the text,
+        add random characters, use images, and so on. Changing content costs the spammer nothing, so this is an endless arms race.
+  \item \key{IP blacklists (DNSBLs)}: lists of IP addresses known to send spam. The mail server looks up the connecting IP and rejects it if
+        it is listed. This only works if a spammer keeps using the same IP for a while.
+\end{itemize}
+
+The paper's argument: a spammer can rewrite an email in a second, but it is much harder to change \emph{where the email is sent from}: the
+ISP, the IP address block, the AS, the botnet. So if spam differs from normal mail in these \key{network-level} properties, filters built on
+them would be more robust. Before building such filters, we need to know how spammers actually behave at the network level. That is what
+this paper measures.
+
+\textbf{Which properties can be trusted?} Most email headers can be forged. But the \key{IP address of the machine that opens the TCP
+connection} to our mail server cannot be forged (the TCP handshake needs replies to reach it), and from it we can derive its AS, its
+route, and a TCP fingerprint. The whole study uses only such unforgeable properties.
+
+% ------------------------------------------------------------------
+\section{How spammers send spam (the methods being measured)}
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}lX@{}}
+\toprule
+Method & How it works\\
+\midrule
+\key{Direct spamming} & Buy connectivity from a ``spam-friendly'' ISP and send directly. If the ISP kicks them out, they must move and renumber.\\
+\key{Open relays / proxies} & Mail servers or proxies that forward mail for anyone. They hide the spammer behind one extra hop. Blacklists have
+nearly killed this method.\\
+\key{Botnets} & Thousands of infected home PCs (\emph{drones}) controlled by one master. Each drone sends spam from its own IP. The paper studies
+\key{Bobax}, a Windows worm (spread through DCOM/LSASS holes) that turns a PC into a mail relay.\\
+\key{BGP spectrum agility} (new) & Announce a route for an IP block you do not own (often a huge /8), send spam from addresses in it, then
+withdraw the route. Described below.\\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+% ------------------------------------------------------------------
+\section{The measurement setup: four datasets joined together}
+
+\subsection{1. The spam sinkhole}
+The authors registered a domain that has \emph{no real users}, and published an MX record for it. Any mail sent there must be spam, because
+no-one legitimate has an address there. Spammers find the domain through address harvesting and dictionary attacks. The sinkhole collected
+everything from August 2004 to January 2006: over \key{10 million spam messages}.
+
+The mail server runs \key{Mail Avenger}, a programmable SMTP server. It accepts every message (whatever the username), and \emph{at the moment
+the sender connects} it records:
+\begin{itemize}
+  \item the \textbf{IP address} of the relay that made the SMTP connection;
+  \item a \textbf{traceroute} to that IP (where it is in the network);
+  \item a passive \key{p0f TCP fingerprint}: small details of the TCP SYN (initial window, TTL, options) that reveal the sender's operating
+        system, without sending any probes;
+  \item \textbf{DNSBL lookups} in 8 blacklists, \emph{at that moment} (not later, when the IP might have been added).
+\end{itemize}
+
+\subsection{2. Legitimate mail logs}
+To see whether spam looks different from normal mail, they used one day of logs (about 700,000 accepted messages) from a large email provider
+with about 40 million mailboxes. The provider rejects likely spam, so the accepted mail is a sample of legitimate senders.
+
+\subsection{3. A botnet's membership list (Bobax trace)}
+Bobax drones contacted their controller by a \emph{domain name}. Researchers got the domain's DNS operators to point that name at a machine they
+controlled (a \key{C\&C sinkhole}). For 1.5 days every drone that phoned home connected to the researchers instead, so they captured the IP
+addresses of \key{117,268 infected hosts}. Joining this list with the sinkhole tells us which spam came from \emph{known} bots.
+
+\subsection{4. BGP routing data}
+A \key{BGP monitor} in the same network as the sinkhole had an iBGP session with the border router. It saw every change in the border router's
+best route to each prefix. So for every spam message, the authors could ask: \emph{at the time this spam arrived, was there a route to the
+sender's IP, and how long did that route exist?}
+
+\textbf{Limitation (the authors stress it)}: this is one domain's view, so the numbers are not Internet-wide. But it is exactly the view a
+single network operator would have, which is what a real filter would see.
+
+% ------------------------------------------------------------------
+\section{Finding 1: where spam comes from in IP space and ASes}
+
+\paperfig[0.48]{sp2_fig2}{CDF over IP space (binned by /24) of legitimate email, spam, and spamming IP addresses. Flat parts are ranges that send
+nothing; steep parts are ranges that send a lot.\label{fig:sp2ip}}
+
+\textbf{How to read Figure~\ref{fig:sp2ip}.} The x-axis is the whole IPv4 space from 0.0.0.0 to 255.255.255.255. The curve rises wherever mail
+comes from. If spam were spread evenly over the address space, the curve would be a straight diagonal line. Instead it has steep jumps and long flat
+sections.
+
+\begin{itemize}
+  \item \textbf{Finding 4.1:} most spam comes from a \key{small part of IP space} (for example 60.*--90.* and 200.*--220.*); large ranges send
+        none at all.
+  \item But \textbf{legitimate mail comes from mostly the same ranges}. A few ranges differ: 80.*--90.* sends mostly spam, while 60.*--70.* sends
+        relatively more legitimate mail. So IP range alone separates spam from good mail only for some ranges.
+  \item \textbf{Ranges are persistent; individual IPs are not.} The per-range distribution looks the same month after month. But about
+        \key{85\% of spamming IPs sent fewer than 10 emails} to the sinkhole in 17 months. Blocking one IP does little; noticing that a whole
+        range or AS keeps spamming is more useful.
+  \item \textbf{Finding 4.2 (ASes):} two ASes (Korean Internet Exchange and China Telecom) sent about 12\% of all spam; the top 20 ASes sent about
+        37\%. These ASes are mostly \emph{different} from the top ASes for legitimate mail (Google, Yahoo, AT\&T, \dots). So ``which AS sent
+        this'' is a useful hint.
+  \item \textbf{Finding 4.3 (countries):} the top two ASes are in Asia, but 11 of the top 20 are in the US, and overall about three times as much
+        spam comes from US ISPs as from Korea or China.
+\end{itemize}
+
+\subsection{How well do blacklists work?}
+Because Mail Avenger queried 8 DNSBLs at the time each spam arrived, the authors can measure this directly.
+\begin{itemize}
+  \item About \key{80\%} of spam came from an IP listed in \emph{at least one} of the 8 lists. That sounds good, but:
+  \item the most aggressive single list (Spamcop) listed only about \key{half} of the spam, and aggressive lists also have many false positives;
+  \item spam from \key{short-lived BGP routes} was listed much less: \key{half} of those IPs were in \emph{no} list at all.
+\end{itemize}
+Bobax drones were listed \emph{more} often than average, which seems odd for IPs that each sent so little to this domain. The reason: the same drone
+spams many other domains too, and those reports reach the blacklists. This is evidence that \emph{collaborative} filtering across domains works.
+
+% ------------------------------------------------------------------
+\section{Finding 2: spam from botnets}
+
+\subsection{Bots and spam live in the same IP ranges}
+The IP distribution of Bobax drones looks almost the same as the distribution of all spamming hosts in Figure~\ref{fig:sp2ip}. This is correlation,
+not proof, but it suggests that much of the spam comes from botnets. One exception: the range 60.*--67.* has many spamming IPs but few Bobax drones,
+which hinted at a different method there (spectrum agility, below).
+
+\subsection{Operating systems (from p0f fingerprints)}
+\begin{itemize}
+  \item About \key{70\%} of spamming hosts (95\% of those that could be identified) run \key{Windows}, consistent with infected home PCs.
+  \item \textbf{Finding 5.2:} only about 4\% of hosts run something else (mostly Linux/FreeBSD), but they send about \key{8\%} of the spam: each
+        non-Windows host sends more. These are likely dedicated spam servers.
+\end{itemize}
+
+\subsection{How long does a bot spam, and how much?}
+Only 4,693 of the 117,268 known Bobax drones ever spammed this one domain, but that sample tells us how bots behave.
+
+\paperfig[0.48]{sp2_fig7}{Lifetime of each Bobax drone at the sinkhole (time between its first and last spam). About 65\% have lifetime 0: they
+appeared once.\label{fig:sp2life}}
+
+\begin{itemize}
+  \item \textbf{Finding 5.3 (single-shot bots):} more than \key{65\%} of Bobax IPs spammed the domain \emph{only once}, and about \key{75\%} were active
+        for \key{less than two minutes} in total. The rest are bimodal: they last a day or longer, some for months.
+  \item \textbf{Finding 5.4 (low volume):} \key{99\%} of bots sent \key{fewer than 100} spams to this domain over 17 months, whether short- or long-lived.
+        That is less than one spam per bot per day.
+\end{itemize}
+
+\textbf{Why this matters for filters.} A spammer with 100,000 bots can send a few messages from each and never reuse an address on the same
+domain. Then:
+\begin{itemize}
+  \item \textbf{per-IP blacklisting} at one domain fails (the IP is never seen again);
+  \item \textbf{volume-based detection} fails (each bot is quiet).
+\end{itemize}
+Only aggregate views (many domains sharing data, or looking at ranges/ASes/botnet membership) can catch this.
+
+% ------------------------------------------------------------------
+\section{Finding 3: BGP spectrum agility}
+
+\subsection{What the attack is}
+BGP has no check that an AS is allowed to announce a prefix. A spammer who controls a BGP-speaking router (for example at a small, careless ISP)
+can do the following:
+\begin{enumerate}
+  \item \textbf{Announce} a route for an IP block it does not own, usually a large one such as 61.0.0.0/8, often \emph{unused} (``dark'') space.
+        Now the Internet sends traffic for those addresses to the spammer.
+  \item \textbf{Send spam} from many different IP addresses scattered across that block. The TCP handshake works, because replies to those
+        addresses now reach the spammer.
+  \item \textbf{Withdraw} the route a few minutes later. The addresses become unreachable again.
+\end{enumerate}
+
+\paperfig[0.5]{sp2_fig9}{One real episode for 61.0.0.0/8 on 30 Sep 2005: the route is announced at about 13:23, spam arrives from addresses
+in the block over the next minutes, and the route is withdrawn at about 13:35.\label{fig:sp2agile}}
+
+\textbf{Walking through Figure~\ref{fig:sp2agile}}:
+\begin{center}
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+Time (30 Sep 2005) & Event\\
+\midrule
+13:23 & AS 4678 announces 61.0.0.0/8 (a /8 is 16.7 million addresses)\\
+13:24--13:32 & spam arrives at the sinkhole from relays with addresses inside 61.0.0.0/8\\
+13:35 & the route is withdrawn; those addresses are unreachable again\\
+later & a user complains; the source address cannot be reached or traced\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Why it is so effective (for the spammer)}
+\begin{itemize}
+  \item \textbf{Untraceable}: by the time someone investigates, the route is gone, so the sender's network does not exist any more. Only someone who
+        logged BGP updates at that exact time could connect the two.
+  \item \textbf{Defeats blacklists}: a /8 gives millions of fresh addresses, so the spammer can ``hop'' to a new address for every message.
+        Half of these IPs were in no blacklist.
+  \item \textbf{Large prefixes get through}: ISPs commonly filter announcements of very small, specific prefixes, but rarely filter a /8.
+  \item \textbf{Hides the origin}: many AS paths in these announcements contained reserved (unallocated) AS numbers, suggesting forged paths.
+\end{itemize}
+
+\textbf{The most persistent cases}: AS 21562 (an ISP in Indianapolis) announcing 66.0.0.0/8; AS 8717 (Sofia, Bulgaria) announcing 82.0.0.0/8; and
+AS 4678 (Canon Network Communications, Japan) announcing 61.0.0.0/8. In February 2006, 60--80\% of the relays seen using this technique did not
+respond to traceroute.
+
+\subsection{How common is it?}
+\begin{itemize}
+  \item About 99\% of spam came from routes that had existed for at least a day, so spectrum agility is \emph{not} the main method.
+  \item \textbf{Finding 6.2:} only about \key{1\%} of spam came from routes that lived less than a day; but in periods when the technique was in use,
+        it was up to \key{10\%}.
+  \item \textbf{Finding 6.3:} the ASes that use it \emph{most persistently} are not the ones that send the \emph{most} spam through it. Persistent users
+        seem to do it deliberately; for high-volume ones the short route may just coincide with spam sent another way.
+  \item It can be combined with other methods (for example, to give a botnet fresh addresses), which makes it more worrying than its volume suggests.
+\end{itemize}
+
+% ------------------------------------------------------------------
+\section{Lessons for building better spam defences}
+
+Network-level features have two advantages over content: they are \key{harder to change}, and they can be seen \key{inside the network}, close to the
+source, before the mail reaches the destination server.
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}lX@{}}
+\toprule
+Lesson & Why (from which finding)\\
+\midrule
+1. Filtering needs a \key{better notion of host identity} than an IP address. & Single-shot bots, hijacked /8s and dynamic addressing all break
+``IP = sender''.\\
+2. \key{Aggregate behaviour} (ranges, ASes, botnet membership, across many domains) exposes spammers better than single IPs. & Individual IPs are
+transient, but ranges and ASes are persistent; blacklists work for bots because many domains report them.\\
+3. \key{Securing BGP} is needed for traceability. & Spectrum agility works only because anyone can announce any prefix.\\
+4. Some network features are \key{easy to add} to filters. & E.g.\ ``was this sender's prefix announced only minutes ago?'' would stop spectrum
+agility, which blacklists miss.\\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{keybox}[Exam one-liner]
+Using a 17-month spam sinkhole (a domain with no users, so all mail is spam) joined with p0f fingerprints, real-time DNSBL lookups, a Bobax botnet
+membership trace and BGP updates, the paper shows: spam comes from a few persistent IP ranges and ASes, but individual IPs are transient; most spam comes
+from Windows bots that appear once, for under 2 minutes, and send under 100 messages; and some spammers use \emph{BGP spectrum agility}: briefly announce
+a hijacked /8, spam from scattered addresses in it, withdraw it, which defeats blacklists and tracing. So filters should use network-level, aggregate
+features, and BGP must be secured.
+\end{keybox}
+
+\section{Revision checklist}
+\begin{itemize}
+  \item Why network-level: content is cheap to change; sender IP (TCP handshake), AS, route and OS fingerprint are hard to fake.
+  \item Spamming methods: direct, open relays/proxies, botnets (Bobax), BGP spectrum agility.
+  \item Data: sinkhole + Mail Avenger (IP, traceroute, p0f, 8 DNSBLs at receive time); legitimate mail logs; Bobax C\&C sinkhole (117K drones via DNS redirection); co-located BGP monitor.
+  \item IP space: concentrated, similar to legitimate mail except some ranges (80--90.* mostly spam); ranges persistent, 85\% of IPs send $<$10 mails.
+  \item ASes: top 2 ASes about 12\%, top 20 about 37\%; different from legitimate-mail ASes.
+  \item Blacklists: 80\% listed in at least one of 8, best single list about 50\%, spectrum-agility IPs half unlisted.
+  \item Bots: 70\% Windows; non-Windows 4\% of hosts send 8\% of spam; 65\% single-shot, 75\% active $<$2 min, 99\% send $<$100 spams.
+  \item Spectrum agility: announce /8 $\to$ spam from scattered addresses $\to$ withdraw; untraceable, beats blacklists, /8s pass route filters; about 1\% of spam (up to 10\%).
+  \item Lessons: better host identity, aggregate behaviour, secure BGP, add features like ``recently announced prefix''.
+\end{itemize}
