@@ -1,0 +1,310 @@
+\chapter{Huygens: Scalable, Fine-grained Clock Synchronization}
+\paperinfo{Y. Geng, S. Liu, Z. Yin, A. Naik, B. Prabhakar, M. Rosenblum, A. Vahdat (Stanford University, Google)}{USENIX NSDI 2018 --- ``Exploiting a Natural Network Effect for Scalable, Fine-grained Clock Synchronization''}
+
+\begin{keybox}[The paper in three sentences]
+Huygens synchronises the NIC clocks of all servers in a data center to within \key{about 10--20\,ns}, in software, with no special
+switches or cables. Servers send each other probe packets; \key{coded probes} (pairs of packets) throw away every probe that was
+delayed by queues or noise, and a \key{Support Vector Machine (SVM)} fits straight lines through the clean probes to get each pair's
+clock offset and drift. Finally, the \key{network effect} uses loops in the probing graph (A$\to$B$\to$C$\to$A must add up to zero)
+to find and spread out the remaining errors, which cuts them by another 3--4$\times$.
+\end{keybox}
+
+% ------------------------------------------------------------------
+\section{Why synchronised clocks matter, and why it is hard}
+
+\subsection{What precise clocks buy you}
+If every server agreed on the time to within a few nanoseconds, many things become simple: a trading platform can order bids from different
+gateways correctly; SDN rule updates can be scheduled at exact times to avoid loops; Fastpass-style schedulers can give each host exact time
+slots; and databases can be consistent cheaply.
+
+\textbf{The database example (why it is worth nanoseconds).} Spanner gets external consistency by making every write \key{wait out the clock
+uncertainty $T$} before committing. With $T$ of a few ms, that is fine across continents, but it would cripple a single-data-center
+in-memory database. CockroachDB shows the same effect for reads: a read at timestamp $t$ must be retried if the record was updated at some
+time $s$ with $t < s \le t + T$ (it cannot tell which came first). In a 32-server test:
+\begin{center}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Clock uncertainty $T$ & 1\,ms & 10\,$\mu$s & 100\,ns\\
+\midrule
+Reads that had to be retried & 99.3\% & 4.74\% & 0.08\%\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Why it is hard}
+\begin{enumerate}
+  \item \textbf{Clocks drift a lot compared with network delays.} Server clocks are quartz oscillators. Their frequency depends on temperature,
+        so a clock drifts by about \key{6--10\,$\mu$s every second} (up to 30). But a one-way delay inside a data center is \key{under 10\,$\mu$s}.
+        If clocks are not re-synchronised often and finely, a packet's timestamps are meaningless: it might appear to arrive before it was sent.
+  \item \textbf{Measuring the one-way delay (OWD) is noisy.} To synchronise B to A, B must know how long A's message took to arrive. Big queueing
+        delays are easy to spot, but there is also small \key{path noise} of tens to hundreds of ns: switch jitter, cables of different lengths in
+        each direction, and noisy NIC timestamps.
+\end{enumerate}
+
+\subsection{Existing methods}
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}lXlX@{}}
+\toprule
+Method & How it works & Accuracy & Catch\\
+\midrule
+\key{NTP} & Exchange probe/echo pairs, take the 3 with the smallest RTT, OWD = half their average RTT. & 10s of $\mu$s -- ms & simple processing $\to$ coarse\\
+\key{PTP} & Hardware timestamps; ``transparent'' switches record how long each packet sat inside them. & 10s--100s of ns & every switch must support PTP; poor under high load\\
+\key{DTP} & Uses the clock signal already shared by the two PHYs at the ends of each Ethernet cable. & about 25\,ns per hop & special hardware in every PHY\\
+\key{PPS} & GPS receiver on the roof; atomic time sent over cables of precisely known length. & very high & very expensive; only a few servers\\
+\bottomrule
+\end{tabularx}
+\end{center}
+So the choice was: cheap but bad (NTP) or good but needing new hardware everywhere. Huygens aims for PTP/DTP accuracy with only what data
+centers already have: \key{NICs that can hardware-timestamp packets}.
+
+\subsection{What data centers give Huygens for free}
+\begin{itemize}
+  \item \textbf{Symmetric paths}: in a fat-tree/Clos fabric, the number of hops from A to B equals the number from B to A, so the OWD is about the
+        same in both directions (even if different switches are used).
+  \item \textbf{Small, bounded delays}: zero-queue propagation is at most 25--30\,$\mu$s.
+  \item \textbf{Lots of paths and spare capacity}: even at 40--90\% load, some probes get through \emph{without queueing}.
+  \item \textbf{Many clocks}: they can be synchronised \emph{together}, which is the basis of the network effect.
+\end{itemize}
+
+% ------------------------------------------------------------------
+\section{Background: what one probe tells you}
+
+\paperfig[0.55]{hy_fig3}{A probe from A to B is stamped $TX_A$ by A's clock and $RX_B$ by B's clock. A probe from B to A is stamped $tx_B$ and $rx_A$.\label{fig:hysig}}
+
+Let $\Delta_A$ be how far A's clock is off from true time (A's reading minus true time), and the same for $\Delta_B$. We want $\Delta_B - \Delta_A$:
+how far B's clock is ahead of A's.
+
+\textbf{Probe A $\to$ B.} It leaves at true time $T$ and arrives at true time $R$. The NICs record $TX_A = T + \Delta_A$ and $RX_B = R + \Delta_B$. Since the
+packet arrives after it leaves, $R > T$:
+\[
+RX_B - \Delta_B > TX_A - \Delta_A \quad\Longrightarrow\quad \Delta_B - \Delta_A < RX_B - TX_A \qquad\text{(an \key{upper bound})}.
+\]
+\textbf{Probe B $\to$ A} gives, by the same argument, $\;tx_B - rx_A < \Delta_B - \Delta_A\;$ (a \key{lower bound}).
+
+So each probe only gives a \emph{bound}, and the bound is too loose by exactly that probe's one-way delay. \textbf{The tightest bounds come from probes
+that had zero queueing and no noise.}
+
+\textbf{Worked example.} Suppose B's clock is really 93\,$\mu$s behind A's ($\Delta_B - \Delta_A = -93$) and the zero-queue OWD is 0.85\,$\mu$s
+each way. (Take $\Delta_A = 0$.)
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+Probe & Timestamps & Bound & Comment\\
+\midrule
+A$\to$B, no queue & $TX_A = 1000$, $RX_B = 1000.85 - 93 = 907.85$ & $< -92.15$ & tight upper bound\\
+B$\to$A, no queue & $tx_B = 950$ (true 1043), $rx_A = 1043.85$ & $> -93.85$ & tight lower bound\\
+A$\to$B, 5\,$\mu$s queue & $RX_B$ is 5\,$\mu$s later & $< -87.15$ & true but loose, useless\\
+\bottomrule
+\end{tabular}
+\end{center}
+The true value lies between $-93.85$ and $-92.15$; the midpoint, $-93.0$, is the answer, and the gap (1.7\,$\mu$s) is the round-trip time.
+This relies on \key{symmetric paths}: if one direction were longer, the midpoint would be off by half the difference.
+
+\subsection{Seeing it on real data}
+
+\paperfig[0.5]{hy_fig4}{Upper bounds (blue) and lower bounds (green) on $\Delta_B - \Delta_A$ for one pair of servers over 2 seconds. The edges of the
+two clouds are straight, parallel lines; the gap between them is the ``forbidden zone''.\label{fig:hybounds}}
+
+What Figure~\ref{fig:hybounds} shows:
+\begin{enumerate}
+  \item Over 2 seconds the \emph{least upper bound} and the \emph{greatest lower bound} lie on two \key{straight, parallel lines}. Points far
+        from the lines are probes that met queues.
+  \item The lines \textbf{slope}: here about $-1.6\,\mu$s per second. That slope is the \key{drift}: the two clocks run at slightly different
+        rates, so when A counts 1\,s, B counts $1 - 1.6\times10^{-6}$\,s.
+  \item The \textbf{midpoint between the lines} at A's time 0 is the \key{offset} (about $-93.3\,\mu$s here). The gap between them (about 1700\,ns) is the
+        minimum RTT, so the OWD is about 850\,ns.
+  \item A few points lie \emph{inside} the gap, the \key{forbidden zone}. Physically impossible: they would mean the probe arrived faster than light
+        through the wires. They come from \key{NIC timestamp noise}: on the 40G testbed the TX timestamp is taken when the NIC writes its ``transmit
+        done'' descriptor back to memory, which can be 10s--100s of ns \emph{after} the packet actually left. This is ``negative-delay'' noise, and it
+        must be filtered out, or it will pull the lines inward.
+\end{enumerate}
+
+\textbf{How clocks behave (measured on two testbeds).}
+\begin{itemize}
+  \item Pairwise drifts are typically 6--10\,$\mu$s/s, sometimes over 30\,$\mu$s/s.
+  \item Over \emph{minutes}, the lines curve, because NIC temperature changes (for example when the NIC is busy). Over \key{2--4\,s} they are straight. So
+        Huygens fits a straight line every 2\,s and joins them: a \key{piecewise-linear} model of the clock.
+  \item Paths really are symmetric: zero-queue RTTs between pairs at the same hop distance were tightly clustered (1-hop pairs: 1512--1650\,ns).
+\end{itemize}
+
+% ------------------------------------------------------------------
+\section{Idea 1: coded probes (filter out bad probes)}
+
+\paperfig[0.5]{hy_fig1}{A coded probe: two packets sent $s$ apart. If they arrive much more than $s$ apart, or much less, something disturbed them;
+only pairs arriving about $s$ apart are kept.\label{fig:hycoded}}
+
+\textbf{Idea}: send probes in \key{pairs}, P1 and P2, a small gap $s$ apart. If the network treated both the same way (no queueing, no noise),
+they arrive the same gap apart. If either one was delayed, the gap changes.
+
+\begin{keybox}[Rule for a pure coded probe]
+With transmit stamps $t_1, t_2$ and receive stamps $r_1, r_2$, the pair is \key{pure} if $r_2 > r_1$ and $\big|(r_2 - r_1) - (t_2 - t_1)\big| < \epsilon$
+(a small guard band). Keep \emph{both} packets' timestamps if pure; discard both if impure or if either packet was lost.
+\end{keybox}
+
+\textbf{Example} ($s = 10\,\mu$s, $\epsilon = 20$\,ns):
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Received gap & What happened & Verdict\\
+\midrule
+10.008\,$\mu$s & both crossed the network cleanly & pure, keep\\
+25\,$\mu$s & P2 queued behind other traffic & impure, discard\\
+3\,$\mu$s & P1 was delayed and P2 caught up with it & impure, discard\\
+\bottomrule
+\end{tabular}
+\end{center}
+\textbf{Why it works}: a queue or noise rarely hits both packets in exactly the same way, so a disturbed pair almost always shows a changed gap.
+(This borrows the packet-pair idea used for bandwidth estimation, but here we want \emph{no} change in spacing.) Coded probes improve accuracy
+by \key{4--5$\times$}, mainly by removing the forbidden-zone points that would otherwise ruin the line fit.
+
+% ------------------------------------------------------------------
+\section{Idea 2: SVMs (fit the two lines)}
+
+After filtering, we have, for a pair (A, B) over 2 seconds, a cloud of upper-bound points and a cloud of lower-bound points. We want the line
+\emph{halfway} between them.
+
+\textbf{Why simple methods fail}: NTP's ``take the minimum-RTT probes'' or a linear regression can reject big delays, but cannot handle small noise,
+and are pulled the wrong way by negative-delay points.
+
+\textbf{An SVM is exactly the right tool.} An SVM, given two labelled classes of points, finds the line that separates them with the \key{maximum
+margin}: as far as possible from the closest point of each class. Here the classes are ``upper-bound points'' and ``lower-bound points'', and the
+max-margin separating line runs exactly down the middle of the forbidden zone. Its \textbf{slope} $\alpha_{AB}$ is the drift and its
+\textbf{intercept} $\beta_{AB}$ is the offset. A soft-margin SVM tolerates a few remaining stray points, but works much better after coded-probe
+filtering.
+
+% ------------------------------------------------------------------
+\section{Idea 3: the network effect (loops must add up to zero)}
+
+Even after coded probes and SVMs, each pair's estimate has some error, for example from a slightly asymmetric path. A pair can never detect its own error.
+But a \emph{group} can.
+
+\paperfig[0.62]{hy_fig2}{The network effect. (a) A and B alone believe B is 20 ahead of A; the truth is 10. (b) Adding C reveals the loop A$\to$B$\to$C$\to$A
+sums to 10, not 0. (c) Adding D and a second loop pulls the A--B estimate to the true value.\label{fig:hynet}}
+
+\textbf{The principle}: synchronisation must be \key{transitive}. If B is $x$ ahead of A, C is $y$ ahead of B, and A is $z$ ahead of C, then $x + y + z = 0$
+(going round the loop brings you back to the same clock). Any non-zero sum, the \key{loop surplus}, proves there are errors.
+
+\textbf{Walking through Figure~\ref{fig:hynet}}:
+\begin{enumerate}
+  \item[(a)] A and B estimate offset 20 (truth 10). Alone, they cannot tell.
+  \item[(b)] C is added. Pairwise estimates: A$\to$B $= 20$, B$\to$C $= -15$, C$\to$A $= 5$. Sum $= 10 \neq 0$: there is an error of 10 somewhere in the loop.
+        Many corrections remove it. Subtracting all 10 from A$\to$B gives 10, $-15$, 5. The \key{minimum-norm} correction spreads it evenly: subtract
+        $10/3$ from each edge, giving 16.7, $-18.3$, 1.7. Huygens picks the minimum-norm one, because many small errors are far more likely than one big one.
+        A--B improves from 20 to 16.7.
+  \item[(c)] D is added, creating a second loop A$\to$B$\to$D$\to$A with surplus $20 + 25 - 15 = 30$. Solving both loops together with minimum norm, the
+        A--B edge (which lies on both loops) ends up at the true value \textbf{10}, with B$\to$D $= 15$ and D$\to$A $= -25$. Check: $10 - 15 + 5 = 0$ and
+        $10 + 15 - 25 = 0$.
+\end{enumerate}
+More clocks add noise (more hops), but they add \emph{more} information (more independent paths). That is the ``natural network effect''.
+
+\subsection{The math: one matrix multiplication}
+Collect all pairwise estimates into a vector $P$ (one entry per probing edge). Build a \key{loop matrix} $A$: one row per independent loop, one
+column per edge; a row has $+1$ for an edge traversed forwards in that loop, $-1$ backwards, 0 otherwise. Then $AP$ is the vector of loop surpluses.
+We look for an error vector $N$ that explains the surpluses ($AN = AP$) and has the smallest norm. That is the pseudo-inverse solution, so the
+corrected estimates are
+\[
+F \;=\; P - N \;=\; \big[\,I - A^{T}(AA^{T})^{-1}A\,\big]\,P .
+\]
+In words: project $P$ onto the set of loop-consistent vectors. If edge errors are independent Gaussians, this is the maximum-likelihood estimate.
+With each node probing $K$ others, the standard deviation of the error drops by about a factor of $1/\sqrt{K}$ (the paper estimates 68\% less for $K=10$,
+78\% for $K=20$). It also catches \key{path asymmetry}: an asymmetric path makes a large error on one edge, which shows up as surpluses in every loop
+through that edge.
+
+% ------------------------------------------------------------------
+\section{The full algorithm}
+
+\textbf{Setup}: $n$ clocks; $C_1$ is the reference. Each server probes $K$ \emph{random} others (10--20, whatever the data center size): this is the
+probing graph $G$. Build a \key{Reference Spanning Tree (RST)} of $G$ rooted at $C_1$, breadth-first.
+
+\textbf{Timing: ``progressive, batch, delayed''.} Probes collected during $[0, 2)$\,s are processed during $[2, 4)$\,s, which gives a correction for the
+\emph{midpoint} (1\,s). Then $[2, 4)$ gives the correction at 3\,s, and so on. Joining the midpoints with straight lines gives the correction at every
+instant, a few seconds behind real time.
+
+\textbf{Each 2-second interval $[L, R)$ with midpoint $M$:}
+\begin{enumerate}
+  \item \textbf{Filter and fit.} For every edge $(i, j)$ of $G$: apply the coded-probe filter, then an SVM, giving slope $\alpha_{ij}$ and intercept $\beta_{ij}$.
+  \item \textbf{Preliminary times via the tree.} When $C_1$ reads $M$, estimate what each clock reads, walking down the RST: for a child $i$ of $C_1$,
+        $M_i^P = M + \alpha_{1i}M + \beta_{1i}$; continue down the tree.
+  \item \textbf{Preliminary pairwise offsets on all edges.} For every edge of $G$ (not only tree edges), $\Delta^P_{ij} = \alpha_{ij}M_i^P + \beta_{ij}$; collect them in $P$.
+  \item \textbf{Network effect.} $F = [I - A^T(AA^T)^{-1}A]P$.
+  \item \textbf{Final times.} Walk down the RST again using $F$ to get each clock's corrected time $M_i^F$.
+\end{enumerate}
+
+\subsection{Huygens-R: real time}
+Huygens gives answers a few seconds late (fine for aligning logs or timestamps afterwards). Because clock frequency changes slowly, the last
+correction lines can be \key{extrapolated} a few seconds forward to give a real-time correction. Huygens-R is slightly worse (for example 14\,ns mean,
+44\,ns 99th percentile at 40\% load, versus 11 and 23\,ns for Huygens).
+
+% ------------------------------------------------------------------
+\section{Implementation: cheap and in place}
+\begin{itemize}
+  \item \textbf{Components}: on each server a \key{sensor} (sends probes, collects timestamps) and a \key{slave} (runs coded-probe filtering and the SVMs
+        locally); one global \key{master} (sets up the probe mesh, does steps 2--5). Slaves send only $(\alpha, \beta)$ per edge to the master, not raw
+        probe data, which is what makes it scale.
+  \item \textbf{Probes}: 64-byte UDP packet pairs. On the 40G testbed each server probes $K=20$ others every 500\,$\mu$s.
+  \item \textbf{Overhead}: about \key{0.05\%} of link bandwidth at 40\,Gb/s (it sends about the same number of probes whatever the line rate). One SVM on 2\,s of
+        data from one edge takes under 7\,ms, so under \key{0.44\%} of a 32-core server's CPU.
+  \item In deployment, probes can be given the highest 802.1 QoS priority so queueing hurts them even less.
+\end{itemize}
+
+% ------------------------------------------------------------------
+\section{Results in brief}
+Verified with NetFPGA boards. Two ports of the \emph{same} board share one clock, so the true offset is exactly 0; Huygens synchronised them through
+the network (2--3 hops apart on the tree, never probing each other directly).
+\begin{center}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+Same NetFPGA, 40\% load & Mean error & 99th percentile\\
+\midrule
+Preliminary (coded probes + SVM) & 41.4\,ns & 91.0\,ns\\
+Final (+ network effect) & \key{11.2\,ns} & \key{22.0\,ns}\\
+\bottomrule
+\end{tabular}
+\end{center}
+\begin{itemize}
+  \item The network effect gives a \key{3--4$\times$} improvement. Across two different boards, Huygens matched a direct copper wire between them.
+  \item Even at \key{90\% load} the 99th-percentile error stayed under 60\,ns: in 2 seconds some probes always find empty queues, there are many alternative
+        pairs, and loop correction fixes pairs hurt by congestion.
+  \item NTP, even given the same hardware timestamps, was \key{about 4 orders of magnitude} worse under load (about 78\,$\mu$s mean at 40\% load versus 11\,ns).
+\end{itemize}
+
+% ------------------------------------------------------------------
+\section{Summary comparison}
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}lXXXX@{}}
+\toprule
+ & NTP & PTP & DTP & \textbf{Huygens}\\
+\midrule
+Extra hardware & none & PTP switches & every PHY & \key{none} (NIC timestamps)\\
+Probe processing & one probe pair at a time, min-RTT & per probe, switch dwell times & PHY clock signal & \key{bulk, 2\,s}: coded probes + SVM\\
+Uses many clocks together & no & no & no & \key{yes}, loop correction\\
+Accuracy & $\mu$s--ms & 10s--100s of ns, worse under load & about 25\,ns/hop & \key{about 10--20\,ns}, even at high load\\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{keybox}[Exam one-liner]
+Huygens synchronises NIC clocks in a data center to tens of ns in software. Each server probes 10--20 random others with \emph{coded probes} (packet
+pairs; keep only those whose spacing is preserved, which removes queueing and negative-delay noise). Each probe gives an upper or lower bound on the
+offset; over 2\,s the tightest bounds form two parallel lines, and an SVM finds the max-margin line between them (slope = drift, intercept = offset). The
+\emph{network effect} then enforces that offsets round every loop sum to zero, with the minimum-norm correction $F = [I - A^T(AA^T)^{-1}A]P$, giving a
+further 3--4$\times$ improvement. Piecewise-linear over 2\,s intervals (temperature changes drift over minutes); Huygens-R extrapolates for real time.
+\end{keybox}
+
+\section{Revision checklist}
+\begin{itemize}
+  \item Why: drift 6--10 (up to 30)\,$\mu$s/s vs OWD $<10\,\mu$s; uses (Spanner wait-out, CockroachDB retries 99.3\% $\to$ 0.08\%).
+  \item NTP/PTP/DTP/PPS and their limits; Huygens needs only NIC hardware timestamps.
+  \item DC properties used: symmetric paths, bounded delay, many paths, many clocks.
+  \item Bounds: A$\to$B gives $\Delta_B - \Delta_A < RX_B - TX_A$; B$\to$A gives $tx_B - rx_A < \Delta_B - \Delta_A$; tightest from zero-queue probes.
+  \item Forbidden zone: points inside it come from negative-delay NIC timestamp noise (late TX descriptor write-back).
+  \item Lines straight over 2--4\,s (temperature bends them over minutes) $\to$ piecewise linear.
+  \item Coded probes: pure if $|(r_2 - r_1) - (t_2 - t_1)| < \epsilon$; 4--5$\times$ better.
+  \item SVM: max-margin separator between upper and lower points; slope = drift, intercept = offset.
+  \item Network effect: loops must sum to 0; minimum-norm spreads surplus; example 20 $\to$ 16.7 $\to$ 10; corrects asymmetry.
+  \item Algorithm: RST from reference, 2\,s batches processed with a delay, midpoints joined; steps filter/SVM $\to$ tree estimates $\to$ $P$ $\to$ $F$ $\to$ final.
+  \item Implementation: sensor + slave per server, master; 0.05\% bandwidth, 0.44\% CPU. Results: 11\,ns mean, 22\,ns p99; under 60\,ns at 90\% load.
+\end{itemize}
