@@ -1,0 +1,274 @@
+\chapter{The Impact of DHT Routing Geometry on Resilience and Proximity}
+\paperinfo{K. Gummadi, R. Gummadi, S. Gribble, S. Ratnasamy, S. Shenker, I. Stoica (U. Washington, USC, Intel Research, ICSI, UC Berkeley)}{ACM SIGCOMM 2003}
+
+\begin{keybox}[The paper in three sentences]
+Many DHTs (Chord, CAN, Pastry, Kademlia, Viceroy, \dots) all give $O(\log n)$ hops with $O(\log n)$ neighbours, so to compare them the paper looks
+at their underlying \key{routing geometry} (tree, hypercube, butterfly, ring, XOR, hybrid) and how much \key{flexibility} each geometry
+leaves in choosing \key{neighbours} and \key{next hops}. Flexibility decides how well a DHT routes when nodes fail (\key{static
+resilience}) and how well it can use short-latency links (\key{proximity}). The \key{ring} turns out to be the most flexible, so it is the most
+resilient and as good as any for latency: ``why not use rings?''
+\end{keybox}
+
+% ------------------------------------------------------------------
+\section{The question: how should we compare DHTs?}
+
+A DHT gives a hash-table interface over many nodes: \texttt{lookup(key)} finds the node responsible. Dozens of routing algorithms had been
+proposed, each in its own paper, each claiming to be best. Two ways to compare them:
+\begin{itemize}
+  \item \textbf{Bake-off}: run each complete system and measure. This ranks today's systems but teaches little about how to design a better one.
+  \item \textbf{Component analysis} (this paper): split each design into separate choices and ask which choice causes which property.
+\end{itemize}
+
+\textbf{Two kinds of choices}:
+\begin{itemize}
+  \item \key{Routing level}: \key{neighbour selection} (which nodes go in my routing table) and \key{route selection} (which neighbour to forward to).
+  \item \key{System level}: everything else (caching, replication, iterative vs recursive lookups); mostly independent of routing.
+\end{itemize}
+
+\textbf{Algorithm vs geometry}. The \key{algorithm} is the exact rule for neighbours and next hops; tiny changes create a new algorithm. The
+\key{geometry} is the shape behind it (ring, tree, \dots); it constrains what algorithms are possible. Small algorithm tweaks do not change the
+geometry. The paper studies geometry, because there are few geometries but endless algorithms.
+
+\textbf{Why state and hop count do not separate them}: all geometries here give $O(\log n)$ hops with $O(\log n)$ neighbours (the butterfly even
+manages $O(1)$ neighbours). The difference lies in \key{flexibility}: how much freedom the geometry leaves, once fixed, in picking neighbours and routes.
+
+\begin{keybox}[Two kinds of flexibility]
+\begin{itemize}
+  \item \key{Neighbour selection flexibility}: for each routing-table slot, how many nodes are allowed? More choice $\Rightarrow$ you can pick the
+        \emph{nearest} (lowest latency) one.
+  \item \key{Route selection flexibility}: for a given destination, how many of my neighbours make progress? More choice $\Rightarrow$ if one is
+        dead you can use another, or pick the nearest.
+\end{itemize}
+Also important: \key{sequential neighbours}, neighbours that make progress towards \emph{every} destination (Chord's successors, Pastry's leaf set).
+They are the last resort when everything else fails.
+\end{keybox}
+
+% ------------------------------------------------------------------
+\section{The six geometries, with a tiny example}
+
+Assume $n$ nodes with $\log n$-bit IDs, the ID space fully used. Example: $n = 8$, 3-bit IDs \texttt{000}--\texttt{111}; route from
+\texttt{000} to \texttt{111}.
+
+\subsection{Tree (PRR, Tapestry; Pastry's main mode)}
+\textbf{Picture}: IDs are the leaves of a binary tree. Distance between two nodes $=$ height of their smallest common subtree (how many trailing
+bits differ, counted from the first differing bit).
+\textbf{Neighbours}: one neighbour at each distance $i$: a node that shares my prefix up to that level but differs in the next bit.
+\textbf{Routing}: fix the \emph{highest} differing bit first, so the matching prefix grows by one bit per hop.
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Slot for node \texttt{000} & Allowed nodes & Choices\\
+\midrule
+distance 1 (differ in last bit) & \texttt{001} & 1\\
+distance 2 & \texttt{010}, \texttt{011} & 2\\
+distance 3 (differ in first bit) & \texttt{100}, \texttt{101}, \texttt{110}, \texttt{111} & 4\\
+\bottomrule
+\end{tabular}
+\end{center}
+\begin{itemize}
+  \item \textbf{Neighbour flexibility: large}. Slot $i$ has $2^{i-1}$ choices: the low-order bits are free. In total about $n^{(\log n)/2}$ possible tables.
+  \item \textbf{Route flexibility: none}. To reach \texttt{111}, the first bit must be fixed first, and exactly one neighbour (the distance-3 one) does that.
+        If it is dead, routing fails.
+\end{itemize}
+
+\subsection{Hypercube (CAN with $\log n$ dimensions)}
+\textbf{Neighbours}: the $\log n$ nodes that differ from me in exactly one bit. For \texttt{000}: \texttt{100}, \texttt{010}, \texttt{001}.
+\textbf{Routing}: fix any differing bit, \emph{in any order}. A neighbour differs from me in one bit only, so fixing one bit never breaks bits already fixed.
+\begin{itemize}
+  \item \textbf{Neighbour flexibility: none}. Each slot has exactly one allowed node.
+  \item \textbf{Route flexibility: large}. From \texttt{000} to \texttt{111}: 3 choices for the first hop, 2 for the second, 1 for the last, so $3! = 6$
+        shortest paths; in general about $(\log n)!$, all of the same length.
+\end{itemize}
+The tree and the hypercube are opposites: one has only neighbour freedom, the other only route freedom.
+
+\subsection{Butterfly (Viceroy)}
+Nodes are arranged in $\log n$ stages; stage $i$ fixes bit $i$. Viceroy gets $O(\log n)$ hops with only \key{constant} state. But routing goes up to stage 1,
+down the stages, and then uses successor/predecessor links for the last stretch. \textbf{No flexibility} in neighbours or routes. The authors suspect this is the
+price of constant state.
+
+\subsection{Ring (Chord)}
+IDs on a circle; distance $=$ clockwise distance. Chord's rule says finger $i$ is \emph{exactly} the node closest to $a + 2^i$. But nothing in the ring
+geometry needs that exactness: routing still takes $O(\log n)$ hops if finger $i$ is \key{any node in $[a + 2^i, a + 2^{i+1})$}.
+\begin{itemize}
+  \item \textbf{Neighbour flexibility: large}: $2^i$ choices for slot $i$, like the tree.
+  \item \textbf{Route flexibility: large}: the path to a destination at distance $d$ is made of spans $2^i$ for the 1-bits of $d$, and \emph{these spans can be taken in
+        any order}. From 0 to 7 ($d = 111_2$): spans 4, 2, 1 in any order, so 6 paths, all of 3 hops. On top of that, a hop of span $2^i$ can be replaced by two hops
+        of span $2^{i-1}$, giving many \emph{longer} backup paths too.
+  \item \textbf{Sequential neighbours: natural} (successors), since there is one global order around the circle.
+\end{itemize}
+So the ring has \emph{both} kinds of flexibility.
+
+\subsection{XOR (Kademlia)}
+Distance between two IDs $=$ their bitwise XOR, read as a number. Neighbour $i$ is any node at XOR distance in $[2^i, 2^{i+1})$: exactly the same allowed tables as the
+tree, and with no failures greedy routing follows the same paths as the tree (fixing bits from the left). Under failures it is better than the tree: if the
+highest bit cannot be fixed, it can fix a lower bit and still reduce the XOR distance. But a lower bit fixed early may be undone later, so these alternative
+paths are \emph{longer}.
+
+\subsection{Hybrid (Pastry)}
+IDs are both tree leaves and points on a ring. Pastry routes on the tree by default and falls back to the ring (its leaf set) when tree routing fails. Neighbour
+flexibility as the tree; extra routes come only from the fallback and are not always $O(\log n)$ long.
+
+\subsection{Summary table}
+\begin{center}
+\small
+\begin{tabular}{@{}lcccccc@{}}
+\toprule
+Property & Tree & Hypercube & Ring & Butterfly & XOR & Hybrid\\
+\midrule
+Neighbour selection (tables) & $n^{\log n/2}$ & 1 & $n^{\log n/2}$ & 1 & $n^{\log n/2}$ & $n^{\log n/2}$\\
+Route selection, optimal paths & 1 & $c_1(\log n)!$ & $c_1(\log n)!$ & 1 & 1 & 1\\
+Route selection, longer paths & -- & -- & $2c_2(\log n)!$ & -- & $c_2(\log n)!$ & $c_2(\log n)!$\\
+Natural sequential neighbours & no & no & \key{yes} & no & no & fallback only\\
+\bottomrule
+\end{tabular}
+\end{center}
+\textbf{Why the ring and hypercube have twice the route flexibility of XOR and hybrid}: on the ring, for a destination at distance in $[2^i, 2^{i+1})$, \emph{all} of my
+first $i$ neighbours make progress. In XOR/hybrid, my $i$-th neighbour makes progress only if its $i$-th bit matches the destination's, which is true half the time.
+
+% ------------------------------------------------------------------
+\section{Static resilience}
+
+Resilience to failures has three parts:
+\begin{enumerate}
+  \item \textbf{Data replication}: keep copies, so data is not lost (assumed adequate here).
+  \item \textbf{Routing recovery}: algorithms that refill routing tables with live nodes (take time).
+  \item \key{Static resilience}: \emph{before} recovery has done anything, with dead entries simply removed, how much routing still works?
+\end{enumerate}
+Static resilience tells you how fast recovery has to be: a DHT with low static resilience needs very fast recovery.
+
+\textbf{Experiment}: 65,536 nodes, the same table size for every geometry (except the butterfly, whose state is fixed). With no failures the hop counts are similar (about
+7.7 average for all; butterfly 21.4). Then kill a random fraction of nodes, delete them from tables, try to route between every pair of live nodes, and measure
+\% failed paths and \% increase in path length.
+
+\paperfig[0.92]{dg_fig1}{Left: \% of paths that fail as nodes fail. Right: \% increase in hop count of the paths that succeed. (No sequential neighbours.)\label{fig:dgres}}
+
+\textbf{Results at 30\% failed nodes}:
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Geometry & Failed paths & Why\\
+\midrule
+Tree, Butterfly & about \key{90\%} & no route flexibility: one dead hop kills the path\\
+XOR, Hybrid & about \key{20\%} & about half the route flexibility of ring/hypercube\\
+Ring, Hypercube & \key{under 7\%} & the most route flexibility\\
+\bottomrule
+\end{tabular}
+\end{center}
+\begin{itemize}
+  \item \textbf{Path stretch}: the hypercube barely stretches (all its alternatives are equally short); the ring stretches somewhat (it also uses longer alternatives);
+        XOR and hybrid stretch a lot (their alternatives are only the longer kind). The ring is slightly more resilient than the hypercube \emph{because} it also has
+        those longer paths.
+  \item \textbf{Adding 16 sequential neighbours} to every geometry: \key{no path fails} even at 30\% failures. The ring (with natural sequential neighbours) does best, but
+        paths get longer.
+  \item \textbf{Are sequential neighbours better than just more ordinary neighbours?} For the ring, at the same table size, sequential neighbours give a bit more success at
+        high failure rates, but ordinary neighbours give much shorter paths.
+\end{itemize}
+
+\begin{keybox}[Resilience conclusion]
+Static resilience follows \key{route selection flexibility}. The ring has the most, so it is the most resilient; tree and butterfly have none and collapse.
+\end{keybox}
+
+% ------------------------------------------------------------------
+\section{Proximity: path latency}
+
+Hop count is not latency. Each overlay hop may cross an ocean, so an ``efficient'' 7-hop route can be 10 times slower than the direct IP path. Ways to
+use proximity:
+\begin{itemize}
+  \item \key{PNS, Proximity Neighbour Selection}: when filling a routing-table slot, among the allowed nodes pick the \emph{closest} (lowest latency). Needs
+        \emph{neighbour} flexibility (tree, ring, XOR; not hypercube).
+  \item \key{PRS, Proximity Route Selection}: with a fixed table, when forwarding, among neighbours that make progress pick the closest. Needs \emph{route}
+        flexibility (ring, hypercube, XOR; not tree).
+  \item PIS (choose IDs by location): not studied, since it breaks load balance and correlates failures.
+\end{itemize}
+Real PNS cannot check all $2^i$ candidates of a slot, so \key{PNS($K$)} samples $K$ of them and picks the closest.
+
+\textbf{Modelling the Internet's latencies.} Results depend heavily on latencies, and topology generators like GT-ITM assign them arbitrarily. The authors conjecture
+that the \key{latency distribution seen from one typical node} is enough: treat each candidate's latency as a random draw from it. They check this against simulation and
+it matches well. Real measured distributions differ from GT-ITM: in reality at least 10\% of paths are more than twice the median latency; in GT-ITM none are. So results
+from GT-ITM can mislead.
+
+\subsection{Which is better, PNS or PRS?}
+For XOR and ring (which allow both): PRS helps somewhat, \key{PNS helps much more}, and PNS+PRS adds only a little over PNS.
+
+\textbf{Why PNS wins (counting choices).} Route to a destination at distance between $2^i$ and $2^{i+1}$ on a ring:
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+ & What you choose from & Number of options\\
+\midrule
+PNS & the $i$-th neighbour can be \emph{any} of the $2^i$ nodes in its range: pick the nearest & $2^i$ (e.g.\ 1024 for $i = 10$)\\
+PRS & any of my first $i$ neighbours, each fixed in advance & $i$ (e.g.\ 10)\\
+\bottomrule
+\end{tabular}
+\end{center}
+The minimum latency over 1024 random draws is much lower than over 10. And PNS is paid once (at table-building time), not per lookup.
+
+\subsection{Does the geometry matter beyond allowing PNS/PRS?}
+No. PNS Ring $\approx$ PNS Tree; PRS Ring $\approx$ PRS Hypercube; PNS+PRS Ring $\approx$ PNS+PRS XOR. What matters is \emph{whether} the geometry permits PNS.
+So the hypercube, which cannot do PNS, is worse for latency.
+
+\textbf{How good is it in absolute terms?} Median latency (ms) with the Virginia latency distribution (16,384 nodes):
+\begin{center}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+Scheme & Hops & Median latency\\
+\midrule
+Direct Internet path & 1 & 102\\
+Plain XOR & 7 & 1036 (about 10$\times$)\\
+PRS XOR & 8 & 770\\
+PNS XOR & 7 & 139\\
+PNS+PRS XOR & 7 & \key{136 (under 2$\times$)}\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ------------------------------------------------------------------
+\section{Local convergence}
+
+\key{Local convergence}: two messages from \emph{nearby} sources to the same key should meet at a node near the sources, before travelling far. It helps overlay
+multicast (efficient trees), caching along lookup paths (a nearby node's cached copy is found), and server selection.
+
+\textbf{Experiment}: an isolated domain of $m$ nodes, all close to each other and far from the other $n - m$. Every node in the domain looks up the same outside key.
+Count \key{exit points}: domain nodes that forward the message out of the domain. Ideal $= 1$.
+\begin{itemize}
+  \item \textbf{PNS and PNS+PRS} are almost optimal. \textbf{PRS alone} barely helps: with 16 neighbours out of 65,536 nodes, it is unlikely any neighbour is inside the domain,
+        so there is nothing nearby to choose.
+  \item With realistic \textbf{PNS(16)} sampling, PNS alone is about as weak as PRS, and \textbf{PNS(16)+PRS} is clearly better. So PRS matters when PNS can only be approximated.
+  \item PNS Tree, PNS+PRS Ring and PNS+PRS XOR perform about the same: again, the geometry matters only through what it permits.
+\end{itemize}
+
+% ------------------------------------------------------------------
+\section{Conclusions}
+\begin{enumerate}
+  \item \textbf{Analyse components, not whole systems.}
+  \item \textbf{Geometry is fundamental}: it constrains everything else, and there are few geometries, so agreement on geometry can come first.
+  \item \textbf{Flexibility is what differs} between geometries (apart from the butterfly's constant state), and it drives resilience, latency and convergence.
+  \item \textbf{Ring and XOR} are the only geometries that allow both PNS and PRS.
+  \item \textbf{Why not the ring?} Most flexible, natural sequential neighbours, best static resilience, as good as any on latency and convergence. The authors had
+        expected a more complex geometry to win; it did not.
+\end{enumerate}
+
+\begin{keybox}[Exam one-liner]
+All DHT geometries give $O(\log n)$ hops with $O(\log n)$ state, so the paper compares their \emph{flexibility}: freedom in choosing neighbours (tree, ring, XOR: $2^{i}$
+options per slot; hypercube, butterfly: none) and in choosing next hops (hypercube, ring: about $(\log n)!$ routes; tree, butterfly: one). Static resilience follows route
+flexibility (at 30\% failures: tree/butterfly about 90\% of paths fail, ring/hypercube under 7\%; sequential neighbours fix nearly all failures). For latency, Proximity
+Neighbour Selection beats Proximity Route Selection ($2^i$ vs $i$ choices), bringing paths to under 2$\times$ the IP latency, and geometry matters only through whether it
+allows PNS. The ring has both flexibilities plus natural sequential neighbours, so ``why not the ring?''
+\end{keybox}
+
+\section{Revision checklist}
+\begin{itemize}
+  \item Routing level (neighbour/route selection) vs system level; algorithm vs geometry.
+  \item Flexibility definitions; sequential neighbours.
+  \item Tree: neighbour freedom $2^{i-1}$, route freedom 1. Hypercube: neighbour 1, routes $(\log n)!$ (any bit order). Butterfly: none, constant state. Ring: both, spans in
+        any order + longer paths, natural successors. XOR: tree-like table, alternatives longer. Hybrid: tree + ring fallback.
+  \item Why ring/hypercube have 2$\times$ route flexibility of XOR/hybrid.
+  \item Static resilience definition; results at 30\%; stretch; 16 sequential neighbours $\to$ no failures.
+  \item PNS vs PRS vs PIS; PNS($K$); latency-distribution conjecture; GT-ITM caveat.
+  \item PNS $\gg$ PRS ($2^i$ vs $i$); geometry matters only via PNS/PRS support; XOR plain 1036\,ms vs PNS 139\,ms vs IP 102\,ms.
+  \item Local convergence: exit points; PNS near optimal; PRS helps when PNS is sampled (PNS(16)).
+\end{itemize}
