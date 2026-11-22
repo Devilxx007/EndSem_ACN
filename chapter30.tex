@@ -1,0 +1,300 @@
+\chapter{Design and Evaluation of IPFS: A Storage Layer for the Decentralized Web}
+\paperinfo{D. Trautwein, A. Raman, G. Tyson, I. Castro, W. Scott, M. Schubotz, B. Gipp, Y. Psaras (Protocol Labs, U. G\"ottingen, Telefonica Research, HKUST, QMUL, FIZ Karlsruhe)}{ACM SIGCOMM 2022}
+
+\begin{keybox}[The paper in three sentences]
+IPFS (InterPlanetary File System) is a peer-to-peer network for storing and fetching files in which a file is named by the
+\key{hash of its content} (a \key{CID}), not by the server that holds it, so any peer can serve it and the receiver can check it.
+To find who holds a CID, IPFS uses a \key{Kademlia DHT}: the holder publishes a \key{provider record} (CID $\to$ its PeerID) on the 20
+peers whose IDs are closest to the CID, and a requester walks the DHT to find that record, then fetches the data with \key{Bitswap}. The paper
+explains the design and measures the live network: about 200K peers in 152 countries and 2715 ASes, under 2.3\% in clouds, publication about 34\,s,
+retrieval about 3\,s, and much faster through caching \key{HTTP gateways}.
+\end{keybox}
+
+% ------------------------------------------------------------------
+\section{Motivation: the web has become centralised}
+
+Today a new website typically runs on a cloud (AWS), uses a third-party DNS provider, a CDN (Akamai, Cloudflare) and a certificate authority
+(Let's Encrypt). Each is well engineered, but each is a \key{single point of organisational failure}: when AWS, Cloudflare or OVH has an
+outage, large parts of the web go down. The \key{Decentralized Web} movement wants web functions (naming, hosting, delivery) spread across
+many independent operators. The most basic function every web application needs is \textbf{storing and serving objects}; IPFS aims to
+decentralise exactly that, so other applications can be built on top.
+
+\begin{keybox}[Four core ideas of IPFS]
+\begin{enumerate}
+  \item \key{Content addressing}: the name of an object is derived from its content, not its location, so it can be served by any peer.
+  \item \key{Decentralised indexing}: a P2P DHT records who can provide each object; no central directory.
+  \item \key{Immutability and self-certification}: the name \emph{is} a hash, so the receiver verifies data by re-hashing it; no certificates needed.
+  \item \key{Open participation}: anyone can run a node, no permission needed.
+\end{enumerate}
+\end{keybox}
+
+\textbf{HTTP vs IPFS in one line}: \texttt{https://example.com/cat.jpg} means ``ask \emph{that} server for whatever it calls cat.jpg''; \texttt{/ipfs/bafy\dots}
+means ``give me the bytes whose hash is bafy\dots, from \emph{anyone}''.
+
+% ------------------------------------------------------------------
+\section{Building blocks}
+
+\subsection{Content identifiers (CIDs)}
+
+\paperfig[0.6]{ip_fig1}{Structure of a CIDv1: a multibase prefix, then the CID version, a multicodec (how the data is encoded), and a multihash (which hash function,
+its length, and the hash itself).\label{fig:ipcid}}
+
+A CID is \emph{self-describing}: it says how to read itself, so new hash functions or encodings can be added later without breaking old CIDs.
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}lX@{}}
+\toprule
+Field & Meaning (example in Figure~\ref{fig:ipcid})\\
+\midrule
+Multibase prefix & how the binary CID is written as text: \texttt{b} = base32 (24 encodings supported)\\
+CID version & v1 (v0 also exists)\\
+Multicodec & how the data is encoded: \texttt{dag-pb} (protobuf), json, cbor, \dots\\
+Multihash & hash function (\texttt{sha2-256}), digest length (32 bytes), then the digest itself\\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\textbf{How a file becomes a CID}:
+\begin{enumerate}
+  \item Split the file into \key{chunks} (default 256\,kB). Each chunk's CID is the hash of its bytes (plus the metadata above).
+  \item Build a \key{Merkle DAG}: a parent node lists its children's CIDs, and its own CID is the hash of that list. The top node's CID is the \key{root CID}, the name of
+        the whole file.
+\end{enumerate}
+
+\textbf{Example.} A 600\,kB file becomes chunks A (256\,kB), B (256\,kB), C (88\,kB) with CIDs $c_A, c_B, c_C$. The root node contains $[c_A, c_B, c_C]$, and the file's
+name is root $= H([c_A, c_B, c_C])$.
+\begin{itemize}
+  \item \textbf{Verification}: when you receive chunk B, hash it and compare with $c_B$. If any byte was changed, the hash differs. So you can fetch chunks from
+        untrusted strangers.
+  \item \textbf{De-duplication}: a Merkle DAG (unlike a tree) lets a node have several parents. If a second file contains the same chunk B, it just points to $c_B$; B is
+        stored and sent once.
+  \item \textbf{Location independence}: the DAG says nothing about where chunks live, so copying or deleting replicas never changes any CID.
+  \item \textbf{The catch: immutability}. Edit one byte and the root CID changes. For content that changes (a blog's front page) IPFS has \key{IPNS}: a name derived from
+        the publisher's public key, which points to the current CID via a record \emph{signed} with the private key. The publisher updates the record; the name stays the same.
+\end{itemize}
+
+\subsection{Peer identities and Multiaddresses}
+\begin{itemize}
+  \item Each peer generates a public/private key pair. Its \key{PeerID} is the hash of its public key. When two peers open a secure channel, the PeerID proves the other side
+        owns that key.
+  \item A peer's location is a \key{Multiaddress}, a self-describing path of protocol layers, e.g.\ \texttt{/ip4/1.2.3.4/tcp/3333/p2p/QmZyWQ14\dots}: IPv4 address,
+        TCP port, then the PeerID. Why this format: (1) different peers speak different transports (TCP, QUIC, WebSocket), and the address says up front whether you can
+        reach it; (2) addresses can be \emph{stacked} to say ``reach X through relay Y'', which is how browser nodes (which cannot accept connections) are reached.
+\end{itemize}
+
+\subsection{The DHT: Kademlia, as used by IPFS}
+To find who has a CID, IPFS stores mappings in a \key{Kademlia} DHT (the XOR geometry from the DHT-geometry chapter). CIDs and PeerIDs are both hashed with SHA-256 into
+one \textbf{256-bit key space}.
+\begin{itemize}
+  \item \textbf{Distance} between two keys = their bitwise \key{XOR}, read as a number. Smaller XOR = ``closer''.
+  \item \textbf{Routing table}: 256 \key{$k$-buckets}; bucket $i$ holds up to $k = 20$ peers whose distance from me is in $[2^i, 2^{i+1})$. So I know many peers near me and a few
+        in each far region.
+  \item \textbf{Lookup}: iterative. Ask the $\alpha = 3$ closest peers I know; each replies with either the record or closer peers it knows; repeat with the closest new ones.
+\end{itemize}
+\textbf{XOR example (4-bit IDs).} Key $K = 1011$. Peers: $P_1 = 1001$, $P_2 = 0011$, $P_3 = 1010$.
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Peer & $P \oplus K$ & Distance\\
+\midrule
+$P_1 = 1001$ & 0010 & 2\\
+$P_2 = 0011$ & 1000 & 8\\
+$P_3 = 1010$ & 0001 & \textbf{1 (closest)}\\
+\bottomrule
+\end{tabular}
+\end{center}
+Peers that share a long prefix with the key are close. A record for $K$ is stored on the peers with the smallest XOR distance.
+
+\textbf{IPFS's changes to textbook Kademlia}: SHA-256 (256-bit) keys instead of SHA-1 (160-bit), to stay safe as SHA-1 collisions become feasible; $k = 20$ per bucket;
+and TCP/QUIC instead of UDP, which made connection management simpler.
+
+\subsection{DHT servers and DHT clients (Autonat)}
+Many peers sit behind NATs and cannot accept incoming connections. If such a peer were in others' routing tables, every lookup through it would wait for a timeout. So:
+\begin{enumerate}
+  \item A new peer joins as a \key{DHT client}.
+  \item It asks other peers to \emph{dial it back} (\key{Autonat}).
+  \item If \textbf{more than 3} succeed, it is publicly reachable and becomes a \key{DHT server}: it stores and serves records. Otherwise it stays a client: it can make
+        requests, but does not store records and is kept out of routing tables.
+\end{enumerate}
+The authors credit this split (from v0.5) with a large speed-up, since lookups no longer waste time on unreachable peers.
+
+% ------------------------------------------------------------------
+\section{Publishing and retrieving content}
+
+\paperfig[0.55]{ip_fig3}{Publication (steps 1--3) and retrieval (steps 4--6) in IPFS.\label{fig:ipflow}}
+
+\subsection{Publication (steps 1--3)}
+\begin{enumerate}
+  \item[(1)]\textbf{Import}: the provider adds the file to its \emph{local} IPFS node; it is chunked and gets a root CID. Nothing is uploaded anywhere: the data
+        stays on the provider.
+  \item[(2)]\textbf{DHT walk}: find the \key{20 peers whose PeerIDs are closest (by XOR) to the CID's hash}.
+  \item[(3)]\textbf{Store the provider record} (CID $\to$ my PeerID) on those 20 peers, by RPC, ``fire and forget'' (does not wait for every reply).
+\end{enumerate}
+Separately, each peer publishes a \key{peer record} (PeerID $\to$ its Multiaddresses) in the same way, so others can turn a PeerID into an IP address.
+
+\textbf{Record lifetimes}:
+\begin{itemize}
+  \item \textbf{Replication $k = 20$}: peers come and go (churn), so a record on one peer would soon vanish. 20 is a compromise between overhead and the risk of losing the record.
+  \item \textbf{Republish every 12\,h}: if the original 20 holders have left, the provider picks the current 20 closest.
+  \item \textbf{Expire after 24\,h}: if the provider stops republishing (it went offline), its record disappears, so nobody is sent to a dead provider.
+\end{itemize}
+Peers behind NATs cannot serve content, so they pay \key{pinning services} to host and publish it for them. Any peer that downloads content may also announce itself as a
+provider; downloaders do not need to trust it, since they verify the hash.
+
+\subsection{Retrieval (steps 4--6)}
+Four logical phases:
+\begin{enumerate}
+  \item[(4)]\textbf{Opportunistic Bitswap}: first ask all peers I am \emph{already connected to} whether they have the CID. Neighbours often do, and this avoids the DHT.
+        If nobody answers within \key{1\,s}, fall back to the DHT.
+  \item[(5)]\textbf{Content discovery}: a DHT walk to find a provider record for the CID (stops at the first record found).
+  \item[(5b)] \textbf{Peer discovery}: a \emph{second} DHT walk to turn the provider's PeerID into a Multiaddress (skipped if it is in my address book of about 900 recently seen peers).
+  \item[(6)]\textbf{Peer routing and content exchange}: connect, and fetch with \key{Bitswap}: send \texttt{WANT-HAVE} (``do you have this block?''), the peer answers
+        \texttt{HAVE}, then send \texttt{WANT-BLOCK} and receive the block. Verify each block against its CID.
+\end{enumerate}
+
+\textbf{Same CID, two requesters}:
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}lXX@{}}
+\toprule
+Step & Alice (her neighbour already has it) & Bob (no neighbour has it)\\
+\midrule
+Bitswap to neighbours & neighbour says HAVE: fetch, verify, done & silence for 1\,s\\
+DHT walk 1 (provider) & -- & finds record CID $\to$ PeerID$_P$\\
+DHT walk 2 (address) & -- & finds PeerID$_P$ $\to$ /ip4/\dots/tcp/\dots\\
+Connect + Bitswap & -- & fetch, verify\\
+Afterwards & may announce herself as a provider & may announce himself as a provider\\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\subsection{HTTP gateways}
+Most users do not run IPFS. A \key{gateway} is a bridge: one side is a DHT-server IPFS node, the other an nginx web server that accepts
+\texttt{GET https://gateway/ipfs/\{CID\}}. Two caches make it fast:
+\begin{itemize}
+  \item the \key{nginx cache} (LRU) of recently served objects;
+  \item the gateway's own \key{IPFS node store}, holding content \emph{pinned} there (e.g.\ by the web3.storage and nft.storage initiatives).
+\end{itemize}
+Gateways are optional and anyone can run one (107 were known). They are a centralising element, but not a required one.
+
+% ------------------------------------------------------------------
+\section{How the network was measured}
+No one sees all of IPFS, so the authors combine three datasets:
+\begin{enumerate}
+  \item \textbf{Crawler} (active): every 30 minutes, start from the 6 bootstrap peers and recursively ask every peer for all entries of its $k$-buckets until no new peers appear.
+        Map IPs to country and AS. Revisit peers to measure session lengths (probe interval half the observed uptime, between 30\,s and 15\,min).
+  \item \textbf{Gateway logs} (passive): one day of the \texttt{ipfs.io} gateway, 7.1M requests.
+  \item \textbf{Controlled benchmarks}: six AWS VMs (Cape Town, Sydney, Frankfurt, Bahrain, S\~ao Paulo, N.\ California) running IPFS DHT servers in the \emph{public} network.
+        Each round, one publishes a new 0.5\,MB object and the other five retrieve it, then disconnect so the next round cannot use Bitswap and must use the DHT.
+\end{enumerate}
+
+% ------------------------------------------------------------------
+\section{What the network looks like}
+\begin{itemize}
+  \item \textbf{Size}: about \key{199K PeerIDs}, 464K IP addresses, \key{152 countries}; 45.5\% of IPs were never reachable. Top countries: US 28.5\%, China 24.2\%.
+  \item \textbf{Reliable peers} ($>90\%$ uptime) are only 1.4\%, spread evenly by country: no single country could take IPFS down.
+  \item \textbf{Peers per IP}: 92.3\% of IPs host one PeerID, but the top 10 IPs host about 66K PeerIDs between them, a possible risk (a misbehaving host could rotate IDs).
+  \item \textbf{ASes}: \key{2715 ASes}, but concentrated: the top 10 ASes hold 64.9\% of IPs, and two Chinese ASes alone over 30\%.
+  \item \textbf{Cloud}: under \key{2.3\%} of nodes run in cloud providers (compare Mastodon, with 6\% on Amazon alone): most operators run their own hardware.
+  \item \textbf{Churn}: 87.6\% of sessions last under 8\,h; only 2.5\% exceed 24\,h; median uptime in Hong Kong is 24\,min. This is why records are replicated on 20 peers and
+        republished every 12\,h.
+\end{itemize}
+
+% ------------------------------------------------------------------
+\section{Performance}
+
+\subsection{Publication: slow, because of the DHT walk}
+Median \key{33.8\,s}; 90th percentile 112\,s; 95th 138\,s; similar in every region, and independent of file size (only the record is published).
+\begin{itemize}
+  \item The \key{DHT walk} to find the 20 closest peers takes \key{87.9\%} of the time.
+  \item The RPCs to store records show spikes at protocol timeouts: 5\,s (TCP/QUIC dial timeout) and 45\,s (WebSocket handshake timeout), caused by unresponsive peers.
+\end{itemize}
+
+\subsection{Retrieval: seconds}
+100\% of retrievals succeeded. Median \key{2.90\,s}, 90th 4.34\,s, 95th 4.74\,s. By region the median ranges from \key{1.81\,s} (Frankfurt) to 3.75\,s (Cape Town).
+\begin{itemize}
+  \item Every retrieval in this setup includes the \key{1\,s Bitswap timeout} (the experiment ensured neighbours never had the data): a worst case.
+  \item A retrieval DHT walk has median \key{622\,ms}, much faster than a publication walk, because it stops at the first record instead of finding 20 peers. Both walks
+        together are under 2\,s for half the retrievals. (Earlier Kademlia deployments in BitTorrent took over a minute per lookup, mainly because of dead nodes.)
+  \item Fetching the 0.5\,MB itself takes under 1.26\,s in 99\% of cases.
+\end{itemize}
+
+\subsection{The cost of decentralisation: stretch}
+\[
+\text{Stretch} = \frac{\text{IPFS retrieval time}}{\text{HTTPS retrieval time}} = \frac{\text{Discover} + \text{Dial} + \text{Negotiate} + \text{Fetch}}{\text{Dial} + \text{Negotiate} + \text{Fetch}}
+\]
+Dial $\approx$ TCP handshake, Negotiate $\approx$ TLS handshake, Fetch $\approx$ GET and transfer. HTTPS needs no Discover step, because the URL already says where the content is.
+
+\textbf{Example.} Discover $= 1.0$\,s (Bitswap timeout) $+ 1.2$\,s (two DHT walks) $= 2.2$\,s; Dial 0.1\,s; Negotiate 0.1\,s; Fetch 0.4\,s.
+\begin{center}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+ & With Bitswap timeout & Without it\\
+\midrule
+IPFS time & $2.2 + 0.6 = 2.8$\,s & $1.2 + 0.6 = 1.8$\,s\\
+HTTPS time & 0.6\,s & 0.6\,s\\
+Stretch & \textbf{4.7} & \textbf{3.0}\\
+\bottomrule
+\end{tabular}
+\end{center}
+Measured: median stretch \key{4.3}. Without the 1\,s Bitswap wait, Frankfurt gets stretch $< 2$ for 80\% of retrievals. Lesson: \key{run the DHT lookup in parallel with
+Bitswap} instead of after it; this costs extra messages but saves the 1\,s.
+
+\subsection{Gateways: caching makes it fast}
+\begin{center}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Served from & Median latency & Share of requests & Share of bytes\\
+\midrule
+nginx cache & 0\,s & 46.0\% & 46.4\%\\
+gateway's IPFS node store (pinned) & 8\,ms & 40.2\% & 38.0\%\\
+not cached (fetched from IPFS) & 4.04\,s & 13.8\% & 15.6\%\\
+\bottomrule
+\end{tabular}
+\end{center}
+\begin{itemize}
+  \item Combined hit rate is over \key{80\%}, and \key{76\%} of requests are served in under 250\,ms.
+  \item Object size does not predict latency (correlation 0.13): delay comes from size-independent steps like DHT walks. Median object 665\,KB.
+  \item 101K users in one day; 51.8\% of traffic was referred by ordinary websites, many of them video and NFT sites, which store NFT data on IPFS.
+\end{itemize}
+
+% ------------------------------------------------------------------
+\section{Summary comparison}
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}lXX@{}}
+\toprule
+ & HTTP/Web today & \textbf{IPFS}\\
+\midrule
+Name means & a location (server + path) & the content's hash (CID)\\
+Who can serve & that server (or its CDN) & \key{any} peer with the bytes\\
+Integrity & trust the server via TLS certificates & \key{self-certifying}: re-hash and compare\\
+Finding the content & DNS lookup & Bitswap to neighbours, then Kademlia DHT walk(s)\\
+Mutable content & natural & needs IPNS (signed pointer)\\
+Typical latency & sub-second & seconds (median stretch 4.3); gateway cache $<$250\,ms for 76\%\\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{keybox}[Exam one-liner]
+IPFS is a content-addressed P2P storage network: files are chunked (256\,kB) into a Merkle DAG whose root hash is the self-describing CID (multibase, version, multicodec,
+multihash), giving verification, de-duplication and location independence (IPNS handles mutable content). Peers are named by PeerID (hash of public key) and located by
+Multiaddresses. A Kademlia DHT (256-bit XOR space, $k=20$, $\alpha=3$; only publicly reachable peers become DHT servers via Autonat) stores provider records on the 20 closest
+peers (republish 12\,h, expire 24\,h) and peer records. Retrieval: Bitswap to neighbours (1\,s timeout) $\to$ DHT walk for the provider $\to$ DHT walk for its address $\to$ Bitswap
+fetch. Measured: about 200K peers, 152 countries, 2715 ASes, $<$2.3\% cloud, heavy churn; publication about 34\,s (DHT walk 88\%), retrieval about 3\,s (stretch 4.3), gateways with
+caching serve 76\% under 250\,ms.
+\end{keybox}
+
+\section{Revision checklist}
+\begin{itemize}
+  \item Why: centralisation $\to$ single points of organisational failure; four core ideas.
+  \item CID fields; chunking; Merkle DAG; verification, de-duplication, location independence; immutability and IPNS.
+  \item PeerID = hash(public key); Multiaddress layers and relaying.
+  \item Kademlia: XOR distance (do an example), $k$-buckets, iterative lookup with $\alpha = 3$; IPFS changes (SHA-256, $k=20$, TCP/QUIC).
+  \item DHT server vs client via Autonat (more than 3 successful dial-backs).
+  \item Publication: import, DHT walk to 20 closest, store provider record; peer record; republish 12\,h, expire 24\,h; pinning services for NATed users.
+  \item Retrieval: Bitswap first (1\,s), DHT walk for provider, DHT walk for address (address book of 900), Bitswap WANT-HAVE/HAVE/WANT-BLOCK.
+  \item Gateways: nginx LRU cache + pinned node store.
+  \item Measurement: crawler, gateway logs, 6 AWS vantage points.
+  \item Numbers: 199K peers, 152 countries, 2715 ASes (top 10 = 65\%), $<$2.3\% cloud, 2.5\% of sessions $>$24\,h; publication 33.8\,s median; retrieval 2.9\,s median; DHT walk 622\,ms; stretch 4.3; gateway hit rate $>$80\%.
+\end{itemize}
