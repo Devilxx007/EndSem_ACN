@@ -1,0 +1,320 @@
+\chapter{MicroTE: Fine Grained Traffic Engineering for Data Centers}
+\paperinfo{T. Benson, A. Anand, A. Akella (U. Wisconsin--Madison), M. Zhang (Microsoft Research)}{ACM CoNEXT 2011}
+
+\begin{keybox}[The paper in three sentences]
+Data center traffic looks random over minutes, but over \key{1--2 seconds} a good part of it is \key{predictable}: a rack pair
+that sent about 50\,MB in the last second will send about 50\,MB in the next one. MicroTE uses a central OpenFlow controller to
+find these predictable rack pairs every second and \key{route them carefully first} (minimising the most-loaded link). The
+remaining unpredictable traffic is spread with \key{weighted ECMP} over the capacity that is left. When everything is
+predictable MicroTE acts like optimal routing; when nothing is, it falls back to ECMP.
+\end{keybox}
+
+% ------------------------------------------------------------------
+\section{The problem: how should traffic be spread inside a data center?}
+
+A data center network has many paths between any two racks. In a two-tier tree with 2 core switches, a packet from rack A to
+rack B can go up through core 1 or core 2; in a fat-tree there are many more choices. \key{Traffic engineering (TE)} is the job
+of deciding which traffic goes on which path so that no link is overloaded.
+
+The metric the paper uses throughout is the \key{Maximum Link Utilisation (MLU)}: the load on the busiest link divided by its
+capacity. If MLU $> 1$, that link is receiving more than it can carry, so packets are queued and then dropped. A good TE scheme
+keeps MLU low every second.
+
+\paperfig[0.5]{mt_fig1}{MLU each second over a 2-hour trace for Spanning Tree, ECMP and optimal routing on a canonical tree.
+Anything to the right of 1.0 means loss. ECMP is much better than a single tree, but still 15--20\% behind optimal.\label{fig:mtmlu}}
+
+\subsection{What data centers did at the time, and why each falls short}
+
+The authors replayed real traces from two data centers (CLD: a 1500-server cloud cluster running MapReduce jobs; UNV: a university
+data center running 3-tier web services) through a simulator and compared each scheme against an \key{optimal} router. The optimal
+router is an oracle: it knows the exact traffic of the next second and solves a linear program to minimise the MLU.
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}lXX@{}}
+\toprule
+Scheme & How it routes & Why it is not good enough\\
+\midrule
+\key{Spanning Tree} & All traffic follows one loop-free tree. & Most links are never used, so the tree links overload.\\
+\key{ECMP} & Each flow is hashed onto one of the equal-cost paths, at random. & Balances the \emph{number} of flows, not their \emph{bytes}. Two
+bursty rack pairs can be hashed onto the same link and burst together. It never looks at load, so it never fixes this.\\
+\key{Fat-tree flow scheduling} & Every few seconds, each lower switch looks at its own uplinks and moves a few big flows from a busy port to a quiet one. &
+The decision is \emph{local}. Two switches can each move a flow onto the same core switch, which then sends both down the same link. 23\% from optimal.\\
+\key{VL2} & Valiant load balancing, implemented with ECMP per flow. & Inherits ECMP's blindness to load; up to 20\% from optimal.\\
+\key{Hedera} & ECMP for small flows; a central scheduler places flows larger than 100\,MB. & In real traces, the traffic that collides is mostly in flows
+\emph{under} 100\,MB, so Hedera behaves like ECMP.\\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\textbf{A small example of why ECMP fails.} Rack pairs (A$\to$B) and (C$\to$D) each send only 200\,Mb/s \emph{on average}, but in
+bursts of 800\,Mb/s. ECMP hashes both onto the path through core 1. When both burst in the same second, that 1\,Gb/s link needs
+1.6\,Gb/s, so MLU $= 1.6$ and packets are lost, even though the path through core 2 is idle. ECMP will never notice, because it
+never measures load and never moves a flow once it has hashed it.
+
+\begin{keybox}[Three reasons existing TE fails]
+\begin{enumerate}
+  \item \textbf{No multipath} (Spanning Tree): capacity is wasted.
+  \item \textbf{Not load-aware} (ECMP, VL2): flows are spread by count, not by how many bytes they actually send right now.
+  \item \textbf{No global view} (fat-tree's local heuristic): locally sensible moves collide somewhere else.
+\end{enumerate}
+\end{keybox}
+
+\subsection{Why not use ISP-style traffic engineering?}
+ISPs do TE with a central planner that predicts the traffic matrix and computes routes, but they work on time scales of
+\emph{hours} and assume traffic is smooth. Data center traffic is very bursty: earlier measurements showed 80\% of flows last less
+than 10\,s, about 100 new flows arrive every millisecond, and the traffic matrix is \emph{not} predictable over 100\,s or more. A
+route computed for the average of the last hour is useless for the next second. So the question is: is there \emph{any} time scale at
+which data center traffic is predictable?
+
+% ------------------------------------------------------------------
+\section{The key observation: short-term predictability}
+
+The authors look at the traffic matrix between \key{ToR (top-of-rack) switch pairs}, one entry per (source rack, destination rack),
+measured every second. They call an entry \key{predictable} if it changes by less than 20\% from one second to the next.
+
+\paperfig[0.85]{mt_fig2}{(a) For each 1\,s interval, what fraction of all traffic came from ToR pairs whose volume stayed within 20\%. (b) For
+each ToR pair, how long (on average) it stays stable.\label{fig:mtpred}}
+
+What they found (Figure~\ref{fig:mtpred}):
+\begin{itemize}
+  \item \textbf{A large part of the traffic is predictable for the next second.} In CLD, in 80\% of the 1\,s intervals, more than
+        27\% of all bytes came from ToR pairs that stayed stable. In UNV, in over 65\% of intervals, \emph{all} the traffic was stable.
+  \item \textbf{It stays predictable for about 1.5--2.5\,s.} In CLD, 60\% of ToR pairs stay stable for 1.6--2.5\,s on average; in UNV,
+        35\% of pairs stay stable for 1.5--5\,s.
+\end{itemize}
+
+\textbf{Why traffic behaves like this (the applications explain it).}
+\begin{itemize}
+  \item \textbf{CLD (MapReduce).} The master sends small task commands to workers (little traffic), then workers send their results
+        back (lots of traffic). The scheduler tries to put workers in the same rack as the master, but big jobs spill over to other racks.
+        While those remote workers stream results back, the rack-to-rack volume is steady for a couple of seconds: that is the
+        predictable part. Control messages and asynchronous block replication are the unpredictable part.
+  \item \textbf{UNV (3-tier web).} Each rack holds one tier (all web front-ends in one rack, all business-logic servers in another). The
+        front-end only talks to the business tier, which only talks to the database tier, so the same rack pairs keep talking. But the
+        messages are small and depend on user requests, so stability is short.
+\end{itemize}
+
+\begin{keybox}[Design requirements derived from the study]
+\begin{enumerate}
+  \item \textbf{Use multiple paths.}
+  \item \textbf{Coordinate routing with a global view} of traffic, not local decisions.
+  \item \textbf{Exploit short-term predictability and adapt within about a second}; and when traffic is \emph{not} predictable, do
+        no worse than ECMP (otherwise no operator will adopt it).
+\end{enumerate}
+\end{keybox}
+
+% ------------------------------------------------------------------
+\section{MicroTE's idea in one rule}
+
+\begin{keybox}[The one rule]
+Every second: \textbf{route the predictable ToR pairs optimally first}, then \textbf{spread the unpredictable traffic with weighted ECMP
+over whatever capacity is left}.
+\end{keybox}
+
+Why this split makes sense: for a predictable pair we know roughly how many bytes it will send in the next second, so we can place it
+precisely, like a puzzle piece. For an unpredictable pair we do not know its next-second volume, so careful placement would be based on a
+wrong number. The best we can do is spread it out, but we can at least avoid the links that the predictable traffic has already filled.
+
+\textbf{It degrades gracefully}:
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Fraction of traffic predictable & What MicroTE does & Behaves like\\
+\midrule
+almost all & routes nearly everything with full knowledge & optimal routing\\
+some & routes the known part carefully, spreads the rest around it & between ECMP and optimal\\
+none & nothing to route carefully; weights are equal & plain ECMP\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ------------------------------------------------------------------
+\section{Architecture: three components}
+
+\paperfig[0.55]{mt_fig3}{MicroTE architecture. Servers (monitoring component) send flow statistics to the network controller; the routing
+component turns the global view into routes; the controller installs them in the switches.\label{fig:mtarch}}
+
+\begin{enumerate}
+  \item \key{Monitoring component}: a kernel module on every server. It measures how much the server sends to whom, and one server per rack
+        summarises this for the whole rack.
+  \item \key{Network controller}: an OpenFlow (NOX) controller. It collects the rack summaries into one global traffic matrix, learns the
+        topology, and installs flow entries into the switches.
+  \item \key{Routing component}: takes the global view from the controller and computes the routes, using an LP or a fast bin-packing heuristic.
+\end{enumerate}
+
+\subsection{Monitoring: why measure at the servers, not the switches?}
+Two options exist. (1) The controller polls every switch's flow counters via OpenFlow. (2) The servers measure their own traffic and report it.
+MicroTE chooses the servers, for three reasons:
+\begin{itemize}
+  \item \textbf{Proactive, triggered updates.} A server can report the moment its traffic changes. OpenFlow switches at the time could only be
+        \emph{polled}, so the controller would have to ask every switch every second.
+  \item \textbf{Less control traffic.} Polling every switch every second creates a lot of messages in the network.
+  \item \textbf{Moves the work off the switches.} Counting and summarising flows uses the server's CPU (under 4\%) instead of the switch's weak
+        control processor.
+\end{itemize}
+
+\subsection{What the monitoring component does, step by step}
+\begin{enumerate}
+  \item \textbf{Bootstrapping.} When a new server plugs into a ToR switch, the switch tells the controller (a normal OpenFlow event). The
+        controller now knows which rack the server is in. The \emph{first} server to appear in a rack is made the \key{designated server}
+        for that rack. The controller tells each new server where the controller is and who its rack's designated server is.
+  \item \textbf{Measure.} Every server's kernel module records its server-to-server traffic every \key{0.1\,s}, and once per second sends these
+        readings to its rack's designated server.
+  \item \textbf{Summarise.} The designated server knows the server-to-rack mapping (sent by the controller). It adds up all server-to-server
+        bytes into \key{ToR-to-ToR} volumes. This turns a huge matrix into a small one (75 racks instead of 1500 servers in CLD).
+  \item \textbf{Decide predictability.} For each ToR pair, it keeps a running \emph{mean} of recent volumes. If the current volume is within
+        \key{$\delta$ = 20\%} of the mean, the pair is marked \key{predictable}, and its mean is used as the forecast for the next second.
+  \item \textbf{Report only changes.} Instead of resending the whole matrix every second, it sends an update only when the \emph{set} of
+        predictable pairs changes, or when a predictable pair's volume moves by more than $\delta$.
+\end{enumerate}
+
+\textbf{Example of the predictability test} ($\delta = 20\%$), for one ToR pair over a few seconds:
+\begin{center}
+\begin{tabular}{@{}ccccl@{}}
+\toprule
+Second & Volume (MB) & Running mean & Within 20\%? & Status\\
+\midrule
+1 & 50 & 50 & -- & first sample\\
+2 & 54 & 52 & $|54-52|/52 = 4\%$ \checkmark & predictable, forecast 52\,MB\\
+3 & 48 & 50.7 & 5\% \checkmark & predictable\\
+4 & 120 & 68 & 76\% $\times$ & unpredictable $\to$ goes to weighted ECMP\\
+\bottomrule
+\end{tabular}
+\end{center}
+Second 4 also changes the set of predictable pairs, so this triggers an update to the controller.
+
+\subsection{Network controller}
+\begin{itemize}
+  \item \textbf{Global traffic matrix}: built by joining the rack summaries.
+  \item \textbf{Topology}: learned from OpenFlow's link/switch up-and-down messages.
+  \item \textbf{When to recompute}: on any update (new set of predictable pairs, or a predictable pair changing by more than $\delta$), but
+        \key{at most once per second}. This prevents a burst of updates from causing a burst of recomputations.
+  \item \textbf{Install routes}: sends the routing component's paths to the switches as OpenFlow flow entries.
+\end{itemize}
+
+% ------------------------------------------------------------------
+\section{The routing component}
+
+\paperfig[0.48]{mt_fig4}{What the routing component does with each new global view.\label{fig:mtflow}}
+
+Following Figure~\ref{fig:mtflow}, for each new global view:
+\begin{enumerate}
+  \item Separate the ToR pairs into predictable and unpredictable.
+  \item \textbf{Route the predictable pairs} (with the LP or the bin-packing heuristic below), using their forecast volumes.
+  \item \textbf{Weighted ECMP for the rest.} For each unpredictable pair, its flows are spread over the equal-cost paths, with each path's
+        weight proportional to the capacity \emph{left over} after the predictable traffic is placed.
+  \item Save the view in the history (used for the running means).
+  \item If the new routes differ significantly from the installed ones, return them for installation; otherwise do nothing (avoids
+        needless churn in the switches).
+\end{enumerate}
+
+\subsection{Option 1: Linear program (exact)}
+Write $T_{u,v}$ for the forecast volume of ToR pair $(u,v)$, $P_{u,v,k}$ for the links on its $k$-th equal-length path ($1\le k\le K$),
+and $f_{u,v,k}$ for the fraction of the pair's traffic put on path $k$.
+\[
+\text{minimise } util \quad\text{subject to}\quad
+\sum_{k=1}^{K} f_{u,v,k} = 1 \;\;\forall (u,v), \qquad
+\sum_{(u,v,k):\, e \in P_{u,v,k}} T_{u,v}\, f_{u,v,k} \;\le\; util \cdot Cap_e \;\;\forall e.
+\]
+In words: all of each pair's traffic must be placed on its $K$ paths, and every link's load must be at most $util$ times its capacity.
+Minimising $util$ minimises the MLU. The LP may split a pair over several paths.
+
+\textbf{Problem}: it is slow as the network grows. With 100 ToRs and 50\% of pairs predictable it takes 0.6\,s; with 200 ToRs it takes 0.5\,s
+even at 5\% predictable, and 28\,s at 25\%. MicroTE must finish within its 1\,s cycle, so the LP is only usable in small data centers.
+
+\subsection{Option 2: Bin-packing heuristic (fast)}
+\begin{enumerate}
+  \item Sort predictable ToR pairs by forecast volume, \textbf{largest first}.
+  \item For the next pair, look at its $K$ equal-hop paths. The \key{cost of a link} is $1/(\text{remaining capacity})$; a path's cost is the
+        sum over its links. Pick the \textbf{cheapest} path.
+  \item Put the \emph{whole} pair on that path and subtract its volume from the remaining capacity of each link on the path (which makes those
+        links more expensive for later pairs).
+  \item Repeat for the next pair.
+\end{enumerate}
+Big pairs go first because they are the hardest to fit; links that are already full become expensive, so later pairs avoid them.
+
+\textbf{Worked example.} Two ToR pairs from rack A to rack B. There are two paths: via core 1 (links A--C1, C1--B) and via core 2
+(links A--C2, C2--B), every link 10\,Gb/s. The predictable pairs (forecast for the next second) are P1 = 6\,Gb/s and P2 = 5\,Gb/s,
+and there is also an unpredictable pair U of about 3\,Gb/s.
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+Step & Path costs ($\sum 1/\text{remaining}$) & Choice & Remaining capacity after\\
+\midrule
+P1 (6, largest) & core1: $1/10+1/10 = 0.2$; core2: $0.2$ & core 1 (tie) & core1 links: 4; core2 links: 10\\
+P2 (5) & core1: $1/4+1/4 = 0.5$; core2: $0.2$ & core 2 & core1: 4; core2: 5\\
+U (unpredictable) & weights $\propto$ leftover: core1 4, core2 5 & split U's flows 4:5 & core1 $\approx$ 1.3 used; core2 $\approx$ 1.7 used\\
+\bottomrule
+\end{tabular}
+\end{center}
+Final link loads: core 1 path about 7.3\,Gb/s, core 2 path about 6.7\,Gb/s, so MLU $\approx 0.73$.
+
+\textbf{Same input, plain ECMP}: each pair is hashed to a path at random. With probability $1/2$ P1 and P2 land on the same path:
+$6+5 = 11$\,Gb/s on a 10\,Gb/s link, so MLU $\ge 1.1$ and there is loss, while the other path carries only U.
+
+\textbf{Running time}: one shortest-path search per pair, $O(E + N\log N)$, so $O(PN\log N + PE + P\log P)$ for $P$ predictable pairs
+(the last term is the sort). For 200 ToRs and 50\% predictable pairs it takes under 0.25\,s. The price is that it never splits a pair over
+paths, so it is a bit less optimal than the LP.
+
+\textbf{Which to use}: LP for small data centers (about 50 ToRs, or 100 ToRs with few predictable pairs); bin-packing for medium and large ones.
+
+% ------------------------------------------------------------------
+\section{Implementation and overheads}
+\begin{itemize}
+  \item \textbf{Code}: the controller and routing component are C++ modules in NOX; the monitor is a Linux kernel module in C. The switches only need
+        OpenFlow firmware, and the servers need the kernel patch. No new hardware or topology.
+  \item \textbf{Demand reports}: 8 bytes per communicating ToR pair (2\,B source, 2\,B destination, 4\,B volume). Because the traffic matrix is sparse,
+        this is about 4\,MB/s even for 10K servers, under 0.5\% of a server's uplink.
+  \item \textbf{Route installation}: 100\,B per OpenFlow entry, about 50\,MB in total for 10K servers (under 5\% of a link). Installing routes took
+        under 40\,ms with 10 flows per server and under 150\,ms with 80 flows per server, which is fast enough for a 1\,s cycle.
+\end{itemize}
+
+% ------------------------------------------------------------------
+\section{Results in brief}
+\begin{itemize}
+  \item At ToR-pair granularity MicroTE is always better than ECMP, but 1--15\% from optimal. The reason: predictability really comes from
+        individual applications and servers, and grouping them into racks blurs it.
+  \item At \key{server-to-server} granularity, MicroTE gets within \key{1--5\%} of optimal and cuts lost bytes by 65\% compared with ECMP
+        under heavy load. The cost is more control traffic and computation.
+  \item When predictability is low, MicroTE behaves like ECMP; when it is high (and traffic is heavy), ECMP's MLU goes past 1 while MicroTE stays
+        close to optimal.
+\end{itemize}
+
+% ------------------------------------------------------------------
+\section{Summary comparison}
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}lXXXX@{}}
+\toprule
+ & ECMP / VL2 & Fat-tree scheduler & Hedera & \textbf{MicroTE}\\
+\midrule
+Multipath & yes & yes & yes & yes\\
+Load-aware & no & yes, local & only flows $>$100\,MB & \key{yes, per ToR pair}\\
+Global view & no & no & yes for big flows & \key{yes}\\
+Time scale & per flow, fixed & every few s & every few s & \key{every 1\,s}\\
+When traffic is unpredictable & -- & -- & -- & falls back to ECMP\\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{keybox}[Exam one-liner]
+MicroTE is OpenFlow-based traffic engineering for data centers. It relies on the fact that a good part of rack-to-rack traffic is predictable
+for about 1--2\,s. Servers measure their traffic every 0.1\,s; a designated server per rack summarises it into ToR-to-ToR volumes and marks a pair
+predictable if it is within 20\% of its running mean. Every second the controller routes the predictable pairs first (LP for small DCs, greedy
+bin-packing with link cost $1/\text{remaining capacity}$ for large ones), then spreads the rest with ECMP weighted by leftover capacity. Result:
+close to optimal when traffic is predictable, ECMP when it is not.
+\end{keybox}
+
+\section{Revision checklist}
+\begin{itemize}
+  \item MLU = busiest link's load / capacity; $>1$ means loss. Existing schemes are 15--23\% worse than optimal.
+  \item Three failures: no multipath (spanning tree), not load-aware (ECMP, VL2), no global view (fat-tree local moves); Hedera's 100\,MB threshold misses the colliding flows.
+  \item ISP TE works over hours; DC traffic is unpredictable over 100\,s or more, but predictable over 1--2\,s (MapReduce result transfers, tiered web apps).
+  \item Rule: predictable pairs routed optimally first, unpredictable via weighted ECMP on leftover capacity.
+  \item Components: server monitors (0.1\,s readings, designated server per rack, ToR aggregation, 20\% test, send only changes), NOX controller (global TM, topology, recompute at most once per second), routing component.
+  \item Why measure at servers: triggered updates, less polling traffic, off-loads switches.
+  \item LP minimises $util$; exact but slow. Bin-packing: largest first, link cost $1/\text{remaining}$, cheapest of $K$ paths, no splitting; fast.
+  \item Server-to-server granularity brings MicroTE within 1--5\% of optimal.
+\end{itemize}
